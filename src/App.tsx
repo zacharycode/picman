@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
@@ -41,6 +42,10 @@ const THUMBNAIL_PRESETS: Record<
   high: { encoderQuality: 0.78, maxEdge: 360, smoothing: 'high' },
 }
 
+const SCAN_BATCH_EVENT = 'picman-library-scan-batch'
+const SCAN_ERROR_EVENT = 'picman-library-scan-error'
+const SCAN_FINISHED_EVENT = 'picman-library-scan-finished'
+
 type EncodedThumbnail = {
   format: ThumbnailFormat
   height: number
@@ -58,6 +63,29 @@ type ScanLibraryResponse = {
   assets: NativeScannedAsset[]
   libraryName: string
   rootPath: string
+}
+
+type ScanLibraryStartResponse = {
+  libraryName: string
+  rootPath: string
+}
+
+type ScanLibraryBatchPayload = {
+  assets: NativeScannedAsset[]
+  scanId: string
+  total: number
+}
+
+type ScanLibraryFinishedPayload = {
+  libraryName: string
+  rootPath: string
+  scanId: string
+  total: number
+}
+
+type ScanLibraryErrorPayload = {
+  message: string
+  scanId: string
 }
 
 type NativeThumbnailResult = {
@@ -155,6 +183,23 @@ function withCacheToken(url: string, token: string) {
   return `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(token)}`
 }
 
+function createScanId() {
+  return `scan_${Date.now()}_${Math.random().toString(36).slice(2)}`
+}
+
+function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
+  return withAssetSearchText({
+    ...asset,
+    previewUrl: undefined,
+    thumbnailReady: false,
+  })
+}
+
+function libraryNameFromPath(path: string) {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.at(-1) ?? 'Local Library'
+}
+
 async function encodeOptimizedThumbnail(canvas: HTMLCanvasElement, asset: Asset, quality: ThumbnailQuality) {
   const preset = THUMBNAIL_PRESETS[quality]
   const candidates = ['image/webp', asset.kind === 'jpg' ? 'image/jpeg' : 'image/png']
@@ -219,6 +264,7 @@ async function createNativeThumbnail(
 
 export default function App() {
   const folderInputRef = useRef<HTMLInputElement>(null)
+  const activeNativeScanRef = useRef<{ firstSelected: boolean; id: string; libraryName: string } | null>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
   const thumbnailRunRef = useRef(0)
   const visualAssetIdsRef = useRef<string[]>(sampleAssets.map((asset) => asset.id))
@@ -343,6 +389,68 @@ export default function App() {
 
   useEffect(() => {
     return () => revokePreviewUrls(libraryAssetsRef.current)
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    const unlisteners: Array<() => void> = []
+
+    async function registerScanListeners() {
+      const unlistenBatch = await listen<ScanLibraryBatchPayload>(SCAN_BATCH_EVENT, (event) => {
+        const scan = activeNativeScanRef.current
+        if (!scan || scan.id !== event.payload.scanId) return
+
+        const incoming = event.payload.assets.map(nativeAssetToFrontend)
+        if (incoming.length === 0) return
+
+        startTransition(() => {
+          setLibraryAssets((current) => [...current, ...incoming])
+        })
+
+        if (!scan.firstSelected) {
+          scan.firstSelected = true
+          setSelectedIds(new Set([incoming[0].id]))
+          setPrimaryId(incoming[0].id)
+        }
+
+        setStatusMessage(`${scan.libraryName} · 正在扫描 ${event.payload.total} 个素材`)
+      })
+      const unlistenFinished = await listen<ScanLibraryFinishedPayload>(SCAN_FINISHED_EVENT, (event) => {
+        const scan = activeNativeScanRef.current
+        if (!scan || scan.id !== event.payload.scanId) return
+
+        activeNativeScanRef.current = null
+        setLibraryName(event.payload.libraryName)
+        setLibraryRootPath(event.payload.rootPath)
+        setStatusMessage(`${event.payload.libraryName} · ${event.payload.total} 个素材`)
+
+        if (event.payload.total === 0) {
+          setSelectedIds(new Set())
+          setPrimaryId(null)
+        }
+      })
+      const unlistenError = await listen<ScanLibraryErrorPayload>(SCAN_ERROR_EVENT, (event) => {
+        const scan = activeNativeScanRef.current
+        if (!scan || scan.id !== event.payload.scanId) return
+        setStatusMessage(event.payload.message)
+      })
+
+      if (disposed) {
+        unlistenBatch()
+        unlistenFinished()
+        unlistenError()
+        return
+      }
+
+      unlisteners.push(unlistenBatch, unlistenFinished, unlistenError)
+    }
+
+    void registerScanListeners()
+
+    return () => {
+      disposed = true
+      for (const unlisten of unlisteners) unlisten()
+    }
   }, [])
 
   const handleVisualOrderChange = useCallback(
@@ -515,24 +623,21 @@ export default function App() {
   }
 
   async function handleNativeFolderSelection(rootPath: string) {
-    setStatusMessage('正在扫描资源目录...')
-    const scanned = await invoke<ScanLibraryResponse>('scan_library_folder', { rootPath })
-    const assets = scanned.assets.map((asset) =>
-      withAssetSearchText({
-        ...asset,
-        previewUrl: asset.sourcePath ? convertFileSrc(asset.sourcePath) : asset.previewUrl,
-        thumbnailReady: false,
-      }),
-    )
-    const first = assets[0]
+    const scanId = createScanId()
+    const optimisticLibraryName = libraryNameFromPath(rootPath)
 
+    activeNativeScanRef.current = {
+      firstSelected: false,
+      id: scanId,
+      libraryName: optimisticLibraryName,
+    }
     thumbnailRunRef.current += 1
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
-      return assets
+      return []
     })
-    setLibraryRootPath(scanned.rootPath)
-    setLibraryName(scanned.libraryName)
+    setLibraryRootPath(rootPath)
+    setLibraryName(optimisticLibraryName)
     setActiveFolder('/')
     setActiveTag('all')
     setTypeFilter('all')
@@ -546,14 +651,25 @@ export default function App() {
       total: 0,
     })
     setSettingsOpen(false)
-    setStatusMessage(`${scanned.libraryName} · ${assets.length} 个素材`)
+    setSelectedIds(new Set())
+    setPrimaryId(null)
+    setStatusMessage(`${optimisticLibraryName} · 正在启动后台扫描...`)
 
-    if (first) {
-      setSelectedIds(new Set([first.id]))
-      setPrimaryId(first.id)
-    } else {
-      setSelectedIds(new Set())
-      setPrimaryId(null)
+    try {
+      const scan = await invoke<ScanLibraryStartResponse>('scan_library_folder_stream', { rootPath, scanId })
+      const activeScan = activeNativeScanRef.current
+      if (!activeScan || activeScan.id !== scanId) return
+
+      activeScan.libraryName = scan.libraryName
+      setLibraryRootPath(scan.rootPath)
+      setLibraryName(scan.libraryName)
+      setStatusMessage(`${scan.libraryName} · 正在扫描资源目录...`)
+    } catch (error) {
+      if (activeNativeScanRef.current?.id !== scanId) return
+
+      activeNativeScanRef.current = null
+      const message = error instanceof Error ? error.message : '扫描失败'
+      setStatusMessage(`扫描失败：${message}`)
     }
   }
 
@@ -635,12 +751,11 @@ export default function App() {
 
       const merged = scanned.assets.map((asset) => {
         const previous = previousById.get(asset.id)
-        const previewUrl = asset.sourcePath ? convertFileSrc(asset.sourcePath) : asset.previewUrl
 
         if (previous?.thumbnailReady) {
           return withAssetSearchText({
             ...asset,
-            previewUrl,
+            previewUrl: previous.previewUrl,
             thumbnailError: previous.thumbnailError,
             thumbnailFormat: previous.thumbnailFormat,
             thumbnailHeight: previous.thumbnailHeight,
@@ -656,7 +771,7 @@ export default function App() {
 
         return withAssetSearchText({
           ...asset,
-          previewUrl,
+          previewUrl: undefined,
           thumbnailReady: false,
         })
       })

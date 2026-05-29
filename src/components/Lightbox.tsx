@@ -1,4 +1,5 @@
 import { ChevronLeft, ChevronRight, FileImage, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { useEffect, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset } from '../types/library'
@@ -69,9 +70,10 @@ function ZoomStage({ asset }: { asset: Asset }) {
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
   const movedRef = useRef(false)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const sourcePreviewUrl = asset.previewUrl ?? (asset.sourcePath ? convertFileSrc(asset.sourcePath) : undefined)
   const imageUrl =
-    asset.previewUrl && asset.previewUrl !== failedPreviewUrl
-      ? asset.previewUrl
+    sourcePreviewUrl && sourcePreviewUrl !== failedPreviewUrl
+      ? sourcePreviewUrl
       : asset.thumbnailReady
         ? asset.thumbnailUrl
         : undefined
