@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Emitter, State};
@@ -19,6 +20,7 @@ const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
 const SCAN_ERROR_EVENT: &str = "picman-library-scan-error";
 const SCAN_FINISHED_EVENT: &str = "picman-library-scan-finished";
 const THUMBNAIL_BATCH_SIZE: usize = 128;
+const THUMBNAIL_MAX_WORKERS: usize = 3;
 const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
 
@@ -141,9 +143,16 @@ struct ThumbnailBatchPayload {
 #[serde(rename_all = "camelCase")]
 struct ThumbnailFinishedPayload {
     cancelled: bool,
+    completed: usize,
     failed: usize,
     job_id: String,
     total: usize,
+}
+
+struct ThumbnailWorkerResult {
+    current_name: Option<String>,
+    is_failed: bool,
+    update: ThumbnailUpdatePayload,
 }
 
 #[derive(Debug)]
@@ -681,6 +690,19 @@ fn clear_thumbnail_job_if_active(active_job_id: &Arc<Mutex<Option<String>>>, job
     }
 }
 
+fn thumbnail_worker_count(total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+
+    let available = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(2);
+    let conservative_workers = std::cmp::max(1, available / 2);
+
+    total.min(THUMBNAIL_MAX_WORKERS.min(conservative_workers))
+}
+
 fn thumbnail_update_from_result(
     source: &ThumbnailSource,
     result: Result<ThumbnailResult, String>,
@@ -740,45 +762,83 @@ fn generate_thumbnails_stream(
     let thread_job_id = job_id.clone();
 
     thread::spawn(move || {
+        let worker_count = thumbnail_worker_count(total);
         let mut updates = Vec::with_capacity(THUMBNAIL_BATCH_SIZE);
         let mut completed = 0usize;
         let mut failed = 0usize;
-        let mut cancelled = false;
+        let mut last_current_name: Option<String> = None;
 
-        for source in sources {
-            if !is_thumbnail_job_active(&active_job_id, &thread_job_id) {
-                cancelled = true;
-                break;
+        if worker_count > 0 {
+            let sources = Arc::new(sources);
+            let next_index = Arc::new(AtomicUsize::new(0));
+            let (result_tx, result_rx) = mpsc::channel::<ThumbnailWorkerResult>();
+
+            for _ in 0..worker_count {
+                let active_job_id = active_job_id.clone();
+                let result_tx = result_tx.clone();
+                let root = root.clone();
+                let quality = quality.clone();
+                let sources = sources.clone();
+                let next_index = next_index.clone();
+                let worker_job_id = thread_job_id.clone();
+
+                thread::spawn(move || loop {
+                    if !is_thumbnail_job_active(&active_job_id, &worker_job_id) {
+                        break;
+                    }
+
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= sources.len() {
+                        break;
+                    }
+
+                    let source = &sources[index];
+                    let current_name = Path::new(&source.relative_path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .or_else(|| Some(source.relative_path.clone()));
+                    let (update, is_failed) = thumbnail_update_from_result(
+                        source,
+                        generate_thumbnail_result(&root, source, &quality),
+                    );
+
+                    if result_tx
+                        .send(ThumbnailWorkerResult {
+                            current_name,
+                            is_failed,
+                            update,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                });
             }
 
-            let current_name = Path::new(&source.relative_path)
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .or_else(|| Some(source.relative_path.clone()));
-            let (update, is_failed) = thumbnail_update_from_result(
-                &source,
-                generate_thumbnail_result(&root, &source, &quality),
-            );
+            drop(result_tx);
 
-            completed += 1;
-            if is_failed {
-                failed += 1;
-            }
-            updates.push(update);
+            for result in result_rx {
+                completed += 1;
+                if result.is_failed {
+                    failed += 1;
+                }
+                last_current_name = result.current_name.clone();
+                updates.push(result.update);
 
-            if updates.len() >= THUMBNAIL_BATCH_SIZE {
-                let _ = app.emit(
-                    THUMBNAIL_BATCH_EVENT,
-                    ThumbnailBatchPayload {
-                        completed,
-                        current_name,
-                        failed,
-                        job_id: thread_job_id.clone(),
-                        total,
-                        updates: std::mem::take(&mut updates),
-                    },
-                );
-                thread::yield_now();
+                if updates.len() >= THUMBNAIL_BATCH_SIZE {
+                    let _ = app.emit(
+                        THUMBNAIL_BATCH_EVENT,
+                        ThumbnailBatchPayload {
+                            completed,
+                            current_name: last_current_name.clone(),
+                            failed,
+                            job_id: thread_job_id.clone(),
+                            total,
+                            updates: std::mem::take(&mut updates),
+                        },
+                    );
+                    thread::yield_now();
+                }
             }
         }
 
@@ -787,7 +847,7 @@ fn generate_thumbnails_stream(
                 THUMBNAIL_BATCH_EVENT,
                 ThumbnailBatchPayload {
                     completed,
-                    current_name: None,
+                    current_name: last_current_name,
                     failed,
                     job_id: thread_job_id.clone(),
                     total,
@@ -796,12 +856,16 @@ fn generate_thumbnails_stream(
             );
         }
 
+        let cancelled =
+            completed < total && !is_thumbnail_job_active(&active_job_id, &thread_job_id);
+
         clear_thumbnail_job_if_active(&active_job_id, &thread_job_id);
 
         let _ = app.emit(
             THUMBNAIL_FINISHED_EVENT,
             ThumbnailFinishedPayload {
                 cancelled,
+                completed,
                 failed,
                 job_id: thread_job_id,
                 total,

@@ -121,6 +121,7 @@ type NativeThumbnailBatchPayload = {
 
 type NativeThumbnailFinishedPayload = {
   cancelled: boolean
+  completed: number
   failed: number
   jobId: string
   total: number
@@ -984,7 +985,7 @@ export default function App() {
 
         if (event.payload.cancelled) {
           setThumbnailGeneration({
-            completed: event.payload.total,
+            completed: event.payload.completed,
             failed: event.payload.failed,
             quality: job.quality,
             scopeLabel: job.scopeLabel,
@@ -996,7 +997,7 @@ export default function App() {
         }
 
         setThumbnailGeneration({
-          completed: event.payload.total,
+          completed: event.payload.completed,
           failed: event.payload.failed,
           quality: job.quality,
           scopeLabel: job.scopeLabel,
