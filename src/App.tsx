@@ -12,7 +12,7 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { assets as sampleAssets } from './data/mockLibrary'
-import { buildFolders, folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
+import { folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
 import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
 import { sortAssets } from './lib/sort'
 import type {
@@ -20,6 +20,7 @@ import type {
   AssetKind,
   AssetViewMode,
   AppUpdateState,
+  FolderNode,
   SelectionKeyAxis,
   SortDir,
   SortField,
@@ -161,6 +162,20 @@ type ActiveNativeThumbnailJob = {
   scopeLabel: string
   total: number
 }
+
+type LibraryScanStatus = 'idle' | 'open' | 'refresh'
+
+type LibraryDerivedState = {
+  allTags: string[]
+  cacheSize: number
+  folders: FolderNode[]
+  generatedCount: number
+  pendingCount: number
+  sourceSize: number
+  thumbnailFolders: FolderNode[]
+}
+
+const LARGE_SCAN_SORT_THRESHOLD = 2000
 
 function blurActiveElement() {
   const activeElement = document.activeElement
@@ -313,6 +328,44 @@ function libraryNameFromPath(path: string) {
   return parts.at(-1) ?? 'Local Library'
 }
 
+function deriveLibraryState(libraryName: string, assets: Asset[]): LibraryDerivedState {
+  const folderCounts = new Map<string, number>()
+  const tags = new Set<string>()
+  let cacheSize = 0
+  let generatedCount = 0
+  let sourceSize = 0
+
+  folderCounts.set('/', assets.length)
+
+  for (const asset of assets) {
+    folderCounts.set(asset.folder, (folderCounts.get(asset.folder) ?? 0) + 1)
+    sourceSize += asset.sizeKb
+
+    for (const tag of asset.tags) tags.add(tag)
+
+    if (asset.thumbnailReady) {
+      generatedCount += 1
+      cacheSize += asset.thumbnailSizeKb ?? 0
+    }
+  }
+
+  const folderItems = Array.from(folderCounts.entries()).sort(([a], [b]) =>
+    a === '/' ? -1 : b === '/' ? 1 : a.localeCompare(b),
+  )
+
+  return {
+    allTags: Array.from(tags).sort(),
+    cacheSize,
+    folders: folderItems.map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    generatedCount,
+    pendingCount: assets.length - generatedCount,
+    sourceSize,
+    thumbnailFolders: folderItems
+      .filter(([path]) => path !== '/')
+      .map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+  }
+}
+
 async function encodeOptimizedThumbnail(canvas: HTMLCanvasElement, asset: Asset, quality: ThumbnailQuality) {
   const preset = THUMBNAIL_PRESETS[quality]
   const candidates = ['image/webp', asset.kind === 'jpg' ? 'image/jpeg' : 'image/png']
@@ -393,6 +446,7 @@ export default function App() {
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>(sampleAssets)
   const [libraryName, setLibraryName] = useState('DesignAssets')
   const [libraryRootPath, setLibraryRootPath] = useState<string | null>(null)
+  const [libraryScanStatus, setLibraryScanStatus] = useState<LibraryScanStatus>('idle')
   const [lightboxOpen, setLightboxOpen] = useState(false)
   const [primaryId, setPrimaryId] = useState<string | null>(sampleAssets[0].id)
   const [query, setQuery] = useState('')
@@ -425,21 +479,8 @@ export default function App() {
   })
   const [viewMode, setViewMode] = useState<AssetViewMode>('adaptive')
   const deferredQuery = useDeferredValue(query)
-
-  const allTags = useMemo(
-    () => Array.from(new Set(libraryAssets.flatMap((asset) => asset.tags))).sort(),
-    [libraryAssets],
-  )
-  const folders = useMemo(() => buildFolders(libraryName, libraryAssets), [libraryAssets, libraryName])
-  const thumbnailFolders = useMemo(() => {
-    const counts = new Map<string, number>()
-
-    for (const asset of libraryAssets) counts.set(asset.folder, (counts.get(asset.folder) ?? 0) + 1)
-
-    return Array.from(counts.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([path, count]) => ({ path, name: folderName(path, libraryName), count }))
-  }, [libraryAssets, libraryName])
+  const libraryDerived = useMemo(() => deriveLibraryState(libraryName, libraryAssets), [libraryAssets, libraryName])
+  const { allTags, cacheSize, folders, generatedCount, pendingCount, sourceSize, thumbnailFolders } = libraryDerived
 
   const visibleAssets = useMemo(() => {
     const searchQuery = normalizeSearchText(deferredQuery).trim()
@@ -456,8 +497,10 @@ export default function App() {
       return inFolder && inTag && inType && inThumb && inSearch
     })
 
+    if (libraryScanStatus === 'open' && filtered.length > LARGE_SCAN_SORT_THRESHOLD) return filtered
+
     return sortAssets(filtered, sortField, sortDir)
-  }, [activeFolder, activeTag, deferredQuery, libraryAssets, sortDir, sortField, thumbnailState, typeFilter])
+  }, [activeFolder, activeTag, deferredQuery, libraryAssets, libraryScanStatus, sortDir, sortField, thumbnailState, typeFilter])
 
   const visibleAssetIds = useMemo(() => visibleAssets.map((asset) => asset.id), [visibleAssets])
   const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
@@ -472,27 +515,6 @@ export default function App() {
   )
   const primaryAsset = primaryId ? visibleAssetById.get(primaryId) : undefined
   const lightboxIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
-  const libraryStats = useMemo(() => {
-    let generatedCount = 0
-    let sourceSize = 0
-    let cacheSize = 0
-
-    for (const asset of libraryAssets) {
-      sourceSize += asset.sizeKb
-      if (asset.thumbnailReady) {
-        generatedCount += 1
-        cacheSize += asset.thumbnailSizeKb ?? 0
-      }
-    }
-
-    return {
-      cacheSize,
-      generatedCount,
-      pendingCount: libraryAssets.length - generatedCount,
-      sourceSize,
-    }
-  }, [libraryAssets])
-  const { cacheSize, generatedCount, pendingCount, sourceSize } = libraryStats
   const activeFilterCount =
     Number(activeTag !== 'all') +
     Number(typeFilter !== 'all') +
@@ -574,6 +596,7 @@ export default function App() {
       setLibraryAssets(merged.assets)
       setLibraryName(payload.libraryName)
       setLibraryRootPath(payload.rootPath)
+      setLibraryScanStatus('idle')
     })
 
     const survivingSelectedIds = new Set([...currentSelectedIds].filter((id) => merged.idSet.has(id)))
@@ -712,6 +735,7 @@ export default function App() {
 
         flushOpenScanAssets(scan.id)
         disposeActiveNativeScan()
+        setLibraryScanStatus('idle')
         setLibraryName(event.payload.libraryName)
         setLibraryRootPath(event.payload.rootPath)
         setStatusMessage(`${event.payload.libraryName} · ${event.payload.total} 个素材`)
@@ -997,6 +1021,7 @@ export default function App() {
       pendingAssets: [],
     }
     thumbnailRunRef.current += 1
+    setLibraryScanStatus('open')
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
       return []
@@ -1033,6 +1058,7 @@ export default function App() {
       if (activeNativeScanRef.current?.id !== scanId) return
 
       disposeActiveNativeScan()
+      setLibraryScanStatus('idle')
       const message = error instanceof Error ? error.message : '扫描失败'
       setStatusMessage(`扫描失败：${message}`)
     }
@@ -1067,6 +1093,7 @@ export default function App() {
     disposeActiveNativeScan()
     cancelNativeThumbnailGeneration()
     thumbnailRunRef.current += 1
+    setLibraryScanStatus('open')
 
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
@@ -1116,6 +1143,7 @@ export default function App() {
 
     if (activeBrowserScanRef.current !== scanId) return
     activeBrowserScanRef.current = null
+    setLibraryScanStatus('idle')
     setStatusMessage(`${nextLibraryName} · ${scannedTotal || total} 个素材`)
 
     if (total === 0) {
@@ -1135,6 +1163,7 @@ export default function App() {
     disposeActiveNativeScan()
     thumbnailRunRef.current += 1
     cancelNativeThumbnailGeneration()
+    setLibraryScanStatus('refresh')
     activeNativeScanRef.current = {
       collectedAssets: [],
       firstSelected: true,
@@ -1161,6 +1190,7 @@ export default function App() {
       if (activeNativeScanRef.current?.id !== scanId) return
 
       disposeActiveNativeScan()
+      setLibraryScanStatus('idle')
       const message = error instanceof Error ? error.message : '刷新失败'
       setStatusMessage(`刷新失败：${message}`)
     }
