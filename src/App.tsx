@@ -165,14 +165,17 @@ type ActiveNativeThumbnailJob = {
 
 type LibraryScanStatus = 'idle' | 'open' | 'refresh'
 
-type LibraryDerivedState = {
+type LibraryCatalogState = {
   allTags: string[]
-  cacheSize: number
   folders: FolderNode[]
-  generatedCount: number
-  pendingCount: number
   sourceSize: number
   thumbnailFolders: FolderNode[]
+}
+
+type ThumbnailStats = {
+  cacheSize: number
+  generatedCount: number
+  pendingCount: number
 }
 
 const LARGE_SCAN_SORT_THRESHOLD = 2000
@@ -328,11 +331,9 @@ function libraryNameFromPath(path: string) {
   return parts.at(-1) ?? 'Local Library'
 }
 
-function deriveLibraryState(libraryName: string, assets: Asset[]): LibraryDerivedState {
+function deriveLibraryCatalogState(libraryName: string, assets: Asset[]): LibraryCatalogState {
   const folderCounts = new Map<string, number>()
   const tags = new Set<string>()
-  let cacheSize = 0
-  let generatedCount = 0
   let sourceSize = 0
 
   folderCounts.set('/', assets.length)
@@ -342,11 +343,6 @@ function deriveLibraryState(libraryName: string, assets: Asset[]): LibraryDerive
     sourceSize += asset.sizeKb
 
     for (const tag of asset.tags) tags.add(tag)
-
-    if (asset.thumbnailReady) {
-      generatedCount += 1
-      cacheSize += asset.thumbnailSizeKb ?? 0
-    }
   }
 
   const folderItems = Array.from(folderCounts.entries()).sort(([a], [b]) =>
@@ -355,14 +351,29 @@ function deriveLibraryState(libraryName: string, assets: Asset[]): LibraryDerive
 
   return {
     allTags: Array.from(tags).sort(),
-    cacheSize,
     folders: folderItems.map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
-    generatedCount,
-    pendingCount: assets.length - generatedCount,
     sourceSize,
     thumbnailFolders: folderItems
       .filter(([path]) => path !== '/')
       .map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+  }
+}
+
+function deriveThumbnailStats(assets: Asset[]): ThumbnailStats {
+  let cacheSize = 0
+  let generatedCount = 0
+
+  for (const asset of assets) {
+    if (asset.thumbnailReady) {
+      generatedCount += 1
+      cacheSize += asset.thumbnailSizeKb ?? 0
+    }
+  }
+
+  return {
+    cacheSize,
+    generatedCount,
+    pendingCount: assets.length - generatedCount,
   }
 }
 
@@ -444,6 +455,7 @@ export default function App() {
   const [cacheLimit, setCacheLimit] = useState(5)
   const [filtersOpen, setFiltersOpen] = useState(false)
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>(sampleAssets)
+  const [libraryCatalogAssets, setLibraryCatalogAssets] = useState<Asset[]>(sampleAssets)
   const [libraryName, setLibraryName] = useState('DesignAssets')
   const [libraryRootPath, setLibraryRootPath] = useState<string | null>(null)
   const [libraryScanStatus, setLibraryScanStatus] = useState<LibraryScanStatus>('idle')
@@ -479,12 +491,19 @@ export default function App() {
   })
   const [viewMode, setViewMode] = useState<AssetViewMode>('adaptive')
   const deferredQuery = useDeferredValue(query)
-  const libraryDerived = useMemo(() => deriveLibraryState(libraryName, libraryAssets), [libraryAssets, libraryName])
-  const { allTags, cacheSize, folders, generatedCount, pendingCount, sourceSize, thumbnailFolders } = libraryDerived
+  const libraryCatalog = useMemo(
+    () => deriveLibraryCatalogState(libraryName, libraryCatalogAssets),
+    [libraryCatalogAssets, libraryName],
+  )
+  const thumbnailStats = useMemo(() => deriveThumbnailStats(libraryAssets), [libraryAssets])
+  const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
+  const { cacheSize, generatedCount, pendingCount } = thumbnailStats
+  const assetById = useMemo(() => new Map(libraryAssets.map((asset) => [asset.id, asset])), [libraryAssets])
+  const visibleOrderSourceAssets = thumbnailState === 'all' ? libraryCatalogAssets : libraryAssets
 
-  const visibleAssets = useMemo(() => {
+  const visibleAssetIds = useMemo(() => {
     const searchQuery = normalizeSearchText(deferredQuery).trim()
-    const filtered = libraryAssets.filter((asset) => {
+    const filtered = visibleOrderSourceAssets.filter((asset) => {
       const inFolder = activeFolder === '/' || asset.folder === activeFolder
       const inTag = activeTag === 'all' || asset.tags.includes(activeTag)
       const inType = typeFilter === 'all' || asset.kind === typeFilter
@@ -497,23 +516,38 @@ export default function App() {
       return inFolder && inTag && inType && inThumb && inSearch
     })
 
-    if (libraryScanStatus === 'open' && filtered.length > LARGE_SCAN_SORT_THRESHOLD) return filtered
+    const ordered =
+      libraryScanStatus === 'open' && filtered.length > LARGE_SCAN_SORT_THRESHOLD
+        ? filtered
+        : sortAssets(filtered, sortField, sortDir)
 
-    return sortAssets(filtered, sortField, sortDir)
-  }, [activeFolder, activeTag, deferredQuery, libraryAssets, libraryScanStatus, sortDir, sortField, thumbnailState, typeFilter])
+    return ordered.map((asset) => asset.id)
+  }, [
+    activeFolder,
+    activeTag,
+    deferredQuery,
+    libraryScanStatus,
+    sortDir,
+    sortField,
+    thumbnailState,
+    typeFilter,
+    visibleOrderSourceAssets,
+  ])
 
-  const visibleAssetIds = useMemo(() => visibleAssets.map((asset) => asset.id), [visibleAssets])
+  const visibleAssets = useMemo(
+    () => visibleAssetIds.map((id) => assetById.get(id)).filter((asset): asset is Asset => Boolean(asset)),
+    [assetById, visibleAssetIds],
+  )
   const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
-  const visibleAssetById = useMemo(() => new Map(visibleAssets.map((asset) => [asset.id, asset])), [visibleAssets])
   const visibleIndexById = useMemo(
-    () => new Map(visibleAssets.map((asset, index) => [asset.id, index])),
-    [visibleAssets],
+    () => new Map(visibleAssetIds.map((id, index) => [id, index])),
+    [visibleAssetIds],
   )
   const visibleSelectedIds = useMemo(
     () => new Set([...selectedIds].filter((id) => visibleIdSet.has(id))),
     [selectedIds, visibleIdSet],
   )
-  const primaryAsset = primaryId ? visibleAssetById.get(primaryId) : undefined
+  const primaryAsset = primaryId && visibleIdSet.has(primaryId) ? assetById.get(primaryId) : undefined
   const lightboxIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
   const activeFilterCount =
     Number(activeTag !== 'all') +
@@ -565,6 +599,7 @@ export default function App() {
 
       startTransition(() => {
         setLibraryAssets((current) => [...current, ...incoming])
+        setLibraryCatalogAssets((current) => [...current, ...incoming])
       })
 
       if (firstAsset) {
@@ -594,6 +629,7 @@ export default function App() {
 
     startTransition(() => {
       setLibraryAssets(merged.assets)
+      setLibraryCatalogAssets(merged.assets)
       setLibraryName(payload.libraryName)
       setLibraryRootPath(payload.rootPath)
       setLibraryScanStatus('idle')
@@ -942,7 +978,8 @@ export default function App() {
             ? Math.max(0, currentIndex - 1)
             : Math.min(visualIds.length - 1, currentIndex + 1)
         const nextId = visualIds[nextIndex]
-        const nextAsset = visibleAssetById.get(nextId) ?? visibleAssets[nextIndex]
+        const nextAsset = assetById.get(nextId) ?? visibleAssets[nextIndex]
+        if (!nextAsset) return
 
         setSelectedIds(new Set([nextAsset.id]))
         setPrimaryId(nextAsset.id)
@@ -969,7 +1006,7 @@ export default function App() {
     primaryAsset,
     primaryId,
     selectionKeyAxis,
-    visibleAssetById,
+    assetById,
     visibleAssetIds,
     visibleAssets,
   ])
@@ -1026,6 +1063,7 @@ export default function App() {
       revokePreviewUrls(current)
       return []
     })
+    setLibraryCatalogAssets([])
     setLibraryRootPath(rootPath)
     setLibraryName(optimisticLibraryName)
     setActiveFolder('/')
@@ -1099,6 +1137,7 @@ export default function App() {
       revokePreviewUrls(current)
       return []
     })
+    setLibraryCatalogAssets([])
     setLibraryRootPath(null)
     setLibraryName(nextLibraryName)
     setActiveFolder('/')
@@ -1127,6 +1166,7 @@ export default function App() {
 
         startTransition(() => {
           setLibraryAssets((current) => [...current, ...incoming])
+          setLibraryCatalogAssets((current) => [...current, ...incoming])
         })
 
         if (!firstAssetSelected && incoming[0]) {
@@ -1521,6 +1561,11 @@ export default function App() {
         return asset.id === assetId ? withAssetSearchText({ ...asset, tags: [...asset.tags, tag] }) : asset
       }),
     )
+    setLibraryCatalogAssets((current) =>
+      current.map((asset) => {
+        return asset.id === assetId ? withAssetSearchText({ ...asset, tags: [...asset.tags, tag] }) : asset
+      }),
+    )
     setStatusMessage(`已添加标签：${tag}`)
   }
 
@@ -1530,6 +1575,13 @@ export default function App() {
 
     const tagStillUsed = libraryAssets.some((asset) => asset.id !== assetId && asset.tags.includes(tag))
     setLibraryAssets((current) =>
+      current.map((asset) => {
+        return asset.id === assetId
+          ? withAssetSearchText({ ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) })
+          : asset
+      }),
+    )
+    setLibraryCatalogAssets((current) =>
       current.map((asset) => {
         return asset.id === assetId
           ? withAssetSearchText({ ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) })
