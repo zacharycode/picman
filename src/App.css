@@ -2004,6 +2004,22 @@
   padding: 4px 0 22px;
 }
 
+.asset-grid--virtual {
+  display: block;
+  position: relative;
+  min-height: 100%;
+}
+
+.asset-grid--virtual .asset-item {
+  margin: 0;
+  will-change: transform;
+}
+
+.asset-grid--virtual.asset-grid--masonry .asset-item {
+  display: block;
+  margin: 0;
+}
+
 .asset-grid--list .asset-item {
   display: grid;
   grid-template-columns: 56px minmax(0, 1fr) minmax(176px, 0.32fr);

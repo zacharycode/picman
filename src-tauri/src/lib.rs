@@ -339,7 +339,11 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
     };
 
     let normalized_relative_path = normalize_relative_path(relative_path);
-    let (dimensions, width, height) = image_dimensions(path);
+    let (dimensions, width, height) = if kind == "svg" {
+      ("vector".to_string(), None, None)
+    } else {
+      ("unknown".to_string(), None, None)
+    };
     let modified = modified_seconds(&metadata);
 
     assets.push(ScannedAsset {

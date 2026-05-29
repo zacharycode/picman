@@ -1,6 +1,6 @@
 import { FileImage, Heart, Maximize2 } from 'lucide-react'
 import { useState } from 'react'
-import type { KeyboardEvent, MouseEvent } from 'react'
+import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset, AssetViewMode } from '../types/library'
 
@@ -8,6 +8,7 @@ type AssetItemProps = {
   asset: Asset
   primary: boolean
   selected: boolean
+  style?: CSSProperties
   viewMode: AssetViewMode
   onClick: (event: MouseEvent<HTMLDivElement>) => void
   onDoubleClick: () => void
@@ -26,7 +27,7 @@ function getAssetRatio(asset: Asset) {
   return `${width} / ${height}`
 }
 
-export function AssetItem({ asset, primary, selected, viewMode, onClick, onDoubleClick }: AssetItemProps) {
+export function AssetItem({ asset, primary, selected, style, viewMode, onClick, onDoubleClick }: AssetItemProps) {
   const isList = viewMode === 'list'
   const [failedThumbnailKey, setFailedThumbnailKey] = useState<string | null>(null)
   const thumbnailKey = `${asset.thumbnailUrl ?? ''}:${asset.thumbnailQuality ?? 'none'}:${asset.thumbnailReady}`
@@ -46,6 +47,7 @@ export function AssetItem({ asset, primary, selected, viewMode, onClick, onDoubl
       }`}
       data-asset-id={asset.id}
       role="button"
+      style={style}
       tabIndex={0}
       onClick={onClick}
       onDoubleClick={onDoubleClick}

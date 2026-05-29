@@ -1,6 +1,6 @@
 [package]
 name = "picman"
-version = "0.1.1"
+version = "0.1.2"
 description = "File-first image asset manager"
 authors = ["Picman"]
 license = ""

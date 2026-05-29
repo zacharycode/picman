@@ -10,7 +10,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { SORT_LABELS } from '../lib/sort'
 import type { Asset, AssetKind, AssetViewMode, SortDir, SortField, ThumbnailState } from '../types/library'
@@ -21,6 +21,22 @@ import { SortDropdown } from './SortDropdown'
 
 const INSPECTOR_MIN = 176
 const INSPECTOR_MAX = 340
+const ADAPTIVE_GAP_X = 16
+const ADAPTIVE_GAP_Y = 30
+const ADAPTIVE_PADDING_X = 12
+const ADAPTIVE_PADDING_TOP = 8
+const ADAPTIVE_PADDING_BOTTOM = 22
+const ADAPTIVE_TEXT_HEIGHT = 42
+const LIST_ROW_HEIGHT = 66
+const LIST_PADDING_TOP = 4
+const LIST_PADDING_BOTTOM = 22
+const MASONRY_GAP_X = 18
+const MASONRY_GAP_Y = 26
+const MASONRY_PADDING_X = 16
+const MASONRY_PADDING_TOP = 12
+const MASONRY_PADDING_BOTTOM = 28
+const MASONRY_TEXT_HEIGHT = 42
+const VIRTUAL_OVERSCAN_PX = 900
 const VIEW_MODE_LABELS: Record<AssetViewMode, string> = {
   adaptive: '自适应',
   masonry: '瀑布流',
@@ -31,8 +47,208 @@ type AssetGridStyle = CSSProperties & {
   '--asset-thumb-size'?: string
 }
 
+type ViewportState = {
+  height: number
+  scrollTop: number
+  width: number
+}
+
+type VirtualAssetItem = {
+  asset: Asset
+  style: CSSProperties
+}
+
+type VirtualLayout = {
+  items: VirtualAssetItem[]
+  positionById: Map<string, { height: number; top: number }>
+  totalHeight: number
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
+}
+
+function getAssetNumberRatio(asset: Asset) {
+  if (asset.width && asset.height) return asset.width / asset.height
+  if (asset.thumbnailWidth && asset.thumbnailHeight) return asset.thumbnailWidth / asset.thumbnailHeight
+
+  const match = asset.dimensions.match(/(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)/i)
+  if (!match) return 16 / 10
+
+  const width = Number(match[1])
+  const height = Number(match[2])
+
+  return width > 0 && height > 0 ? width / height : 16 / 10
+}
+
+function createAdaptiveLayout(assets: Asset[], viewport: ViewportState, thumbSize: number): VirtualLayout {
+  const viewportWidth = Math.max(1, viewport.width || 960)
+  const viewportHeight = Math.max(1, viewport.height || 620)
+  const contentWidth = Math.max(1, viewportWidth - ADAPTIVE_PADDING_X * 2)
+  const minColumnWidth = Math.max(178, thumbSize + 34)
+  const columns = Math.max(1, Math.floor((contentWidth + ADAPTIVE_GAP_X) / (minColumnWidth + ADAPTIVE_GAP_X)))
+  const itemWidth = Math.floor((contentWidth - ADAPTIVE_GAP_X * (columns - 1)) / columns)
+  const thumbHeight = itemWidth * 0.75
+  const itemHeight = thumbHeight + ADAPTIVE_TEXT_HEIGHT
+  const rowPitch = itemHeight + ADAPTIVE_GAP_Y
+  const rowCount = Math.ceil(assets.length / columns)
+  const totalHeight =
+    ADAPTIVE_PADDING_TOP +
+    Math.max(0, rowCount * rowPitch - ADAPTIVE_GAP_Y) +
+    ADAPTIVE_PADDING_BOTTOM
+  const firstRow = Math.max(0, Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / rowPitch))
+  const lastRow = Math.min(
+    rowCount - 1,
+    Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / rowPitch),
+  )
+  const startIndex = firstRow * columns
+  const endIndex = Math.min(assets.length, (lastRow + 1) * columns)
+  const items: VirtualAssetItem[] = []
+  const positionById = new Map<string, { height: number; top: number }>()
+
+  for (let index = 0; index < assets.length; index += 1) {
+    const row = Math.floor(index / columns)
+    const top = ADAPTIVE_PADDING_TOP + row * rowPitch
+    positionById.set(assets[index].id, { height: itemHeight, top })
+  }
+
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const asset = assets[index]
+    const row = Math.floor(index / columns)
+    const column = index % columns
+    items.push({
+      asset,
+      style: {
+        height: itemHeight,
+        left: ADAPTIVE_PADDING_X + column * (itemWidth + ADAPTIVE_GAP_X),
+        position: 'absolute',
+        top: ADAPTIVE_PADDING_TOP + row * rowPitch,
+        width: itemWidth,
+      },
+    })
+  }
+
+  return {
+    items,
+    positionById,
+    totalHeight,
+  }
+}
+
+function createListLayout(assets: Asset[], viewport: ViewportState): VirtualLayout {
+  const viewportHeight = Math.max(1, viewport.height || 620)
+  const totalHeight = LIST_PADDING_TOP + assets.length * LIST_ROW_HEIGHT + LIST_PADDING_BOTTOM
+  const firstIndex = Math.max(
+    0,
+    Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
+  )
+  const lastIndex = Math.min(
+    assets.length - 1,
+    Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
+  )
+  const items: VirtualAssetItem[] = []
+  const positionById = new Map<string, { height: number; top: number }>()
+
+  for (let index = 0; index < assets.length; index += 1) {
+    const top = LIST_PADDING_TOP + index * LIST_ROW_HEIGHT
+    positionById.set(assets[index].id, { height: LIST_ROW_HEIGHT, top })
+  }
+
+  for (let index = firstIndex; index <= lastIndex; index += 1) {
+    const asset = assets[index]
+    items.push({
+      asset,
+      style: {
+        height: LIST_ROW_HEIGHT,
+        left: 0,
+        position: 'absolute',
+        right: 0,
+        top: LIST_PADDING_TOP + index * LIST_ROW_HEIGHT,
+      },
+    })
+  }
+
+  return {
+    items,
+    positionById,
+    totalHeight,
+  }
+}
+
+function createMasonryLayout(assets: Asset[], viewport: ViewportState, thumbSize: number): VirtualLayout {
+  const viewportWidth = Math.max(1, viewport.width || 960)
+  const viewportHeight = Math.max(1, viewport.height || 620)
+  const contentWidth = Math.max(1, viewportWidth - MASONRY_PADDING_X * 2)
+  const minColumnWidth = Math.max(124, thumbSize)
+  const columns = Math.max(1, Math.floor((contentWidth + MASONRY_GAP_X) / (minColumnWidth + MASONRY_GAP_X)))
+  const columnWidth = Math.floor((contentWidth - MASONRY_GAP_X * (columns - 1)) / columns)
+  const columnHeights = Array.from({ length: columns }, () => MASONRY_PADDING_TOP)
+  const allItems: VirtualAssetItem[] = []
+  const positionById = new Map<string, { height: number; top: number }>()
+
+  for (const asset of assets) {
+    let column = 0
+    for (let index = 1; index < columnHeights.length; index += 1) {
+      if (columnHeights[index] < columnHeights[column]) column = index
+    }
+
+    const ratio = clamp(getAssetNumberRatio(asset), 0.18, 6)
+    const thumbHeight = columnWidth / ratio
+    const itemHeight = thumbHeight + MASONRY_TEXT_HEIGHT
+    const top = columnHeights[column]
+    const left = MASONRY_PADDING_X + column * (columnWidth + MASONRY_GAP_X)
+
+    allItems.push({
+      asset,
+      style: {
+        left,
+        position: 'absolute',
+        top,
+        width: columnWidth,
+      },
+    })
+    positionById.set(asset.id, { height: itemHeight, top })
+    columnHeights[column] += itemHeight + MASONRY_GAP_Y
+  }
+
+  const minTop = viewport.scrollTop - VIRTUAL_OVERSCAN_PX
+  const maxTop = viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX
+  const items = allItems.filter((item) => {
+    const position = positionById.get(item.asset.id)
+    return position ? position.top + position.height >= minTop && position.top <= maxTop : false
+  })
+  return {
+    items,
+    positionById,
+    totalHeight: Math.max(MASONRY_PADDING_TOP + MASONRY_PADDING_BOTTOM, Math.max(...columnHeights) - MASONRY_GAP_Y + MASONRY_PADDING_BOTTOM),
+  }
+}
+
+function createMasonryVisualIds(assets: Asset[], viewportWidth: number, thumbSize: number) {
+  const width = Math.max(1, viewportWidth || 960)
+  const contentWidth = Math.max(1, width - MASONRY_PADDING_X * 2)
+  const minColumnWidth = Math.max(124, thumbSize)
+  const columns = Math.max(1, Math.floor((contentWidth + MASONRY_GAP_X) / (minColumnWidth + MASONRY_GAP_X)))
+  const columnWidth = Math.floor((contentWidth - MASONRY_GAP_X * (columns - 1)) / columns)
+  const columnHeights = Array.from({ length: columns }, () => MASONRY_PADDING_TOP)
+
+  return assets
+    .map((asset, index) => {
+      let column = 0
+      for (let columnIndex = 1; columnIndex < columnHeights.length; columnIndex += 1) {
+        if (columnHeights[columnIndex] < columnHeights[column]) column = columnIndex
+      }
+
+      const ratio = clamp(getAssetNumberRatio(asset), 0.18, 6)
+      const itemHeight = columnWidth / ratio + MASONRY_TEXT_HEIGHT
+      const top = columnHeights[column]
+      const left = MASONRY_PADDING_X + column * (columnWidth + MASONRY_GAP_X)
+      columnHeights[column] += itemHeight + MASONRY_GAP_Y
+
+      return { id: asset.id, index, left, top }
+    })
+    .sort((a, b) => a.top - b.top || a.left - b.left || a.index - b.index)
+    .map((item) => item.id)
 }
 
 type LibraryViewProps = {
@@ -72,6 +288,7 @@ type LibraryViewProps = {
   onSetThumbSize: (size: number) => void
   onSetTypeFilter: (type: 'all' | AssetKind) => void
   onSetViewMode: (mode: AssetViewMode) => void
+  onVisualOrderChange: (ids: string[]) => void
 }
 
 export function LibraryView({
@@ -111,10 +328,13 @@ export function LibraryView({
   onSetThumbSize,
   onSetTypeFilter,
   onSetViewMode,
+  onVisualOrderChange,
 }: LibraryViewProps) {
   const [inspectorWidth, setInspectorWidth] = useState(202)
   const [searchText, setSearchText] = useState(query)
+  const [viewport, setViewport] = useState<ViewportState>({ height: 620, scrollTop: 0, width: 960 })
   const searchComposingRef = useRef(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const libraryGridColumns = inspectorVisible ? `minmax(0, 1fr) 5px ${inspectorWidth}px` : 'minmax(0, 1fr)'
   const fixedThumbSize = `${thumbSize}px`
   const adaptiveMinSize = `${Math.max(178, thumbSize + 34)}px`
@@ -127,22 +347,83 @@ export function LibraryView({
             gridTemplateColumns: `repeat(auto-fit, minmax(${adaptiveMinSize}, 1fr))`,
           }
         : { '--asset-thumb-size': fixedThumbSize }
+  const virtualLayout = useMemo(() => {
+    if (viewMode === 'list') return createListLayout(visibleAssets, viewport)
+    if (viewMode === 'masonry') return createMasonryLayout(visibleAssets, viewport, thumbSize)
+    return createAdaptiveLayout(visibleAssets, viewport, thumbSize)
+  }, [thumbSize, viewMode, viewport, visibleAssets])
+  const visualAssetIds = useMemo(() => {
+    if (viewMode === 'masonry') return createMasonryVisualIds(visibleAssets, viewport.width, thumbSize)
+    return visibleAssets.map((asset) => asset.id)
+  }, [thumbSize, viewMode, viewport.width, visibleAssets])
 
   useEffect(() => {
     if (!searchComposingRef.current) setSearchText(query)
   }, [query])
 
+  useEffect(() => {
+    onVisualOrderChange(visualAssetIds)
+  }, [onVisualOrderChange, visualAssetIds])
+
+  useLayoutEffect(() => {
+    const container = scrollRef.current
+    if (!container) return
+
+    let frameId = 0
+    const measure = () => {
+      frameId = 0
+      setViewport((current) => {
+        const next = {
+          height: container.clientHeight,
+          scrollTop: container.scrollTop,
+          width: container.clientWidth,
+        }
+
+        return current.height === next.height && current.scrollTop === next.scrollTop && current.width === next.width
+          ? current
+          : next
+      })
+    }
+    const scheduleMeasure = () => {
+      if (frameId) return
+      frameId = window.requestAnimationFrame(measure)
+    }
+    const resizeObserver = new ResizeObserver(scheduleMeasure)
+
+    resizeObserver.observe(container)
+    container.addEventListener('scroll', scheduleMeasure, { passive: true })
+    measure()
+
+    return () => {
+      if (frameId) window.cancelAnimationFrame(frameId)
+      resizeObserver.disconnect()
+      container.removeEventListener('scroll', scheduleMeasure)
+    }
+  }, [])
+
   useLayoutEffect(() => {
     if (!keyboardScrollTargetId) return
 
-    const container = document.querySelector<HTMLElement>('.assets-scroll')
+    const container = scrollRef.current
     if (!container) return
 
     const scrollKeyboardTargetIntoView = () => {
       const selected = Array.from(container.querySelectorAll<HTMLElement>('.asset-item')).find(
         (item) => item.dataset.assetId === keyboardScrollTargetId,
       )
-      if (!selected) return
+      if (!selected) {
+        const virtualPosition = virtualLayout.positionById.get(keyboardScrollTargetId)
+        if (!virtualPosition) return
+
+        const edgePadding = Math.min(56, Math.max(24, container.clientHeight * 0.1))
+        const maxScroll = container.scrollHeight - container.clientHeight
+        const targetScrollTop = clamp(virtualPosition.top - edgePadding, 0, maxScroll)
+
+        if (Math.abs(targetScrollTop - container.scrollTop) > 0.5) {
+          container.scrollTo({ top: targetScrollTop, behavior: 'auto' })
+        }
+        return
+      }
 
       const containerBox = container.getBoundingClientRect()
       const selectedBox = selected.getBoundingClientRect()
@@ -177,7 +458,7 @@ export function LibraryView({
       window.cancelAnimationFrame(frameId)
       window.cancelAnimationFrame(secondFrameId)
     }
-  }, [keyboardScrollTargetId, keyboardScrollVersion, viewMode])
+  }, [keyboardScrollTargetId, keyboardScrollVersion, viewMode, virtualLayout.positionById])
 
   function startInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
     event.preventDefault()
@@ -358,14 +639,18 @@ export function LibraryView({
             </button>
           </div>
         ) : (
-          <div className="assets-scroll">
-            <div className={`asset-grid asset-grid--${viewMode}`} style={assetGridStyle}>
-              {visibleAssets.map((asset) => (
+          <div ref={scrollRef} className="assets-scroll">
+            <div
+              className={`asset-grid asset-grid--${viewMode} asset-grid--virtual`}
+              style={{ ...assetGridStyle, height: virtualLayout.totalHeight }}
+            >
+              {virtualLayout.items.map(({ asset, style }) => (
                 <AssetItem
                   key={asset.id}
                   asset={asset}
                   primary={primaryAsset?.id === asset.id}
                   selected={selectedIds.has(asset.id)}
+                  style={style}
                   viewMode={viewMode}
                   onClick={(event) => onAssetClick(asset, event)}
                   onDoubleClick={() => onAssetDoubleClick(asset)}

@@ -14,6 +14,7 @@ export type Asset = {
   tags: string[]
   favorite: boolean
   note: string
+  searchText?: string
   thumbnailError?: string
   thumbnailFormat?: ThumbnailFormat
   thumbnailReady: boolean

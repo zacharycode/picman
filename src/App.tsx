@@ -12,7 +12,7 @@ import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { assets as sampleAssets } from './data/mockLibrary'
 import { buildFolders, folderName, revokePreviewUrls, revokeThumbnailUrls, scanFiles } from './lib/library'
-import { normalizeSearchText } from './lib/search'
+import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
 import { sortAssets } from './lib/sort'
 import type {
   Asset,
@@ -75,31 +75,6 @@ function blurActiveElement() {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
-}
-
-function getVisualAssetIds(assets: Asset[]) {
-  const fallbackIds = assets.map((asset) => asset.id)
-  const items = Array.from(document.querySelectorAll<HTMLElement>('.assets-scroll .asset-item[data-asset-id]'))
-  if (items.length === 0) return fallbackIds
-
-  const assetIdSet = new Set(fallbackIds)
-  const rowSnap = 14
-  const visualIds = items
-    .map((item, index) => {
-      const box = item.getBoundingClientRect()
-
-      return {
-        id: item.dataset.assetId ?? '',
-        index,
-        left: box.left,
-        top: Math.round(box.top / rowSnap) * rowSnap,
-      }
-    })
-    .filter((item) => item.id && assetIdSet.has(item.id))
-    .sort((a, b) => a.top - b.top || a.left - b.left || a.index - b.index)
-    .map((item) => item.id)
-
-  return visualIds.length === fallbackIds.length ? visualIds : fallbackIds
 }
 
 function loadPreviewImage(url: string) {
@@ -246,6 +221,7 @@ export default function App() {
   const folderInputRef = useRef<HTMLInputElement>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
   const thumbnailRunRef = useRef(0)
+  const visualAssetIdsRef = useRef<string[]>(sampleAssets.map((asset) => asset.id))
 
   const [activeFolder, setActiveFolder] = useState('/')
   const [activeTag, setActiveTag] = useState('all')
@@ -311,29 +287,48 @@ export default function App() {
         thumbnailState === 'all' ||
         (thumbnailState === 'generated' && asset.thumbnailReady) ||
         (thumbnailState === 'pending' && !asset.thumbnailReady)
-      const text = `${asset.name} ${asset.folder} ${asset.relativePath} ${asset.tags.join(' ')} ${asset.note}`
+      const inSearch = !searchQuery || (asset.searchText ?? createAssetSearchText(asset)).includes(searchQuery)
 
-      return inFolder && inTag && inType && inThumb && normalizeSearchText(text).includes(searchQuery)
+      return inFolder && inTag && inType && inThumb && inSearch
     })
 
     return sortAssets(filtered, sortField, sortDir)
   }, [activeFolder, activeTag, libraryAssets, query, sortDir, sortField, thumbnailState, typeFilter])
 
-  const visibleIdSet = useMemo(() => new Set(visibleAssets.map((asset) => asset.id)), [visibleAssets])
+  const visibleAssetIds = useMemo(() => visibleAssets.map((asset) => asset.id), [visibleAssets])
+  const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
+  const visibleAssetById = useMemo(() => new Map(visibleAssets.map((asset) => [asset.id, asset])), [visibleAssets])
+  const visibleIndexById = useMemo(
+    () => new Map(visibleAssets.map((asset, index) => [asset.id, index])),
+    [visibleAssets],
+  )
   const visibleSelectedIds = useMemo(
     () => new Set([...selectedIds].filter((id) => visibleIdSet.has(id))),
     [selectedIds, visibleIdSet],
   )
-  const primaryAsset = primaryId ? visibleAssets.find((asset) => asset.id === primaryId) : undefined
-  const lightboxIndex = primaryId ? visibleAssets.findIndex((asset) => asset.id === primaryId) : -1
-  const generatedCount = libraryAssets.filter((asset) => asset.thumbnailReady).length
-  const pendingCount = libraryAssets.length - generatedCount
-  const sourceSize = libraryAssets.reduce((total, asset) => total + asset.sizeKb, 0)
-  const cacheSize = libraryAssets.reduce((total, asset) => {
-    if (!asset.thumbnailReady) return total
+  const primaryAsset = primaryId ? visibleAssetById.get(primaryId) : undefined
+  const lightboxIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
+  const libraryStats = useMemo(() => {
+    let generatedCount = 0
+    let sourceSize = 0
+    let cacheSize = 0
 
-    return total + (asset.thumbnailSizeKb ?? 0)
-  }, 0)
+    for (const asset of libraryAssets) {
+      sourceSize += asset.sizeKb
+      if (asset.thumbnailReady) {
+        generatedCount += 1
+        cacheSize += asset.thumbnailSizeKb ?? 0
+      }
+    }
+
+    return {
+      cacheSize,
+      generatedCount,
+      pendingCount: libraryAssets.length - generatedCount,
+      sourceSize,
+    }
+  }, [libraryAssets])
+  const { cacheSize, generatedCount, pendingCount, sourceSize } = libraryStats
   const activeFilterCount =
     Number(activeTag !== 'all') +
     Number(typeFilter !== 'all') +
@@ -350,6 +345,18 @@ export default function App() {
     return () => revokePreviewUrls(libraryAssetsRef.current)
   }, [])
 
+  const handleVisualOrderChange = useCallback(
+    (ids: string[]) => {
+      visualAssetIdsRef.current = ids.length === visibleAssets.length ? ids : visibleAssetIds
+    },
+    [visibleAssetIds, visibleAssets.length],
+  )
+
+  const getCurrentVisualIds = useCallback(() => {
+    const visualIds = visualAssetIdsRef.current
+    return visualIds.length === visibleAssets.length ? visualIds : visibleAssetIds
+  }, [visibleAssetIds, visibleAssets.length])
+
   useEffect(() => {
     if (!sortOpen) return
 
@@ -365,7 +372,7 @@ export default function App() {
     (dir: 'prev' | 'next') => {
       if (visibleAssets.length === 0) return
 
-      const currentIndex = visibleAssets.findIndex((asset) => asset.id === primaryId)
+      const currentIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
       const current = currentIndex === -1 ? 0 : currentIndex
       const nextIndex =
         dir === 'prev' ? Math.max(0, current - 1) : Math.min(visibleAssets.length - 1, current + 1)
@@ -375,7 +382,7 @@ export default function App() {
       setSelectedIds(new Set([nextAsset.id]))
       blurActiveElement()
     },
-    [primaryId, visibleAssets],
+    [primaryId, visibleAssets, visibleIndexById],
   )
 
   useEffect(() => {
@@ -384,9 +391,8 @@ export default function App() {
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
 
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') {
-        const ids = visibleAssets.map((asset) => asset.id)
-        setSelectedIds(new Set(ids))
-        setPrimaryId(ids[0] ?? null)
+        setSelectedIds(new Set(visibleAssetIds))
+        setPrimaryId(visibleAssetIds[0] ?? null)
         event.preventDefault()
         return
       }
@@ -434,7 +440,7 @@ export default function App() {
       if (isSelectionKey) {
         if (visibleAssets.length === 0) return
 
-        const visualIds = getVisualAssetIds(visibleAssets)
+        const visualIds = getCurrentVisualIds()
         const currentIndex = primaryId ? visualIds.indexOf(primaryId) : -1
         const isPrevKey = selectionKeyAxis === 'horizontal' ? event.key === 'ArrowLeft' : event.key === 'ArrowUp'
 
@@ -445,7 +451,7 @@ export default function App() {
             ? Math.max(0, currentIndex - 1)
             : Math.min(visualIds.length - 1, currentIndex + 1)
         const nextId = visualIds[nextIndex]
-        const nextAsset = visibleAssets.find((asset) => asset.id === nextId) ?? visibleAssets[nextIndex]
+        const nextAsset = visibleAssetById.get(nextId) ?? visibleAssets[nextIndex]
 
         setSelectedIds(new Set([nextAsset.id]))
         setPrimaryId(nextAsset.id)
@@ -465,7 +471,17 @@ export default function App() {
 
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [lightboxOpen, navigateLightbox, primaryAsset, primaryId, selectionKeyAxis, visibleAssets])
+  }, [
+    getCurrentVisualIds,
+    lightboxOpen,
+    navigateLightbox,
+    primaryAsset,
+    primaryId,
+    selectionKeyAxis,
+    visibleAssetById,
+    visibleAssetIds,
+    visibleAssets,
+  ])
 
   function handleAssetClick(asset: Asset, event: MouseEvent<HTMLDivElement>) {
     if (event.metaKey || event.ctrlKey) {
@@ -479,13 +495,12 @@ export default function App() {
       }
       setSelectedIds(next)
     } else if (event.shiftKey) {
-      const ids = visibleAssets.map((visibleAsset) => visibleAsset.id)
-      const startIndex = primaryId ? ids.indexOf(primaryId) : -1
-      const endIndex = ids.indexOf(asset.id)
+      const startIndex = primaryId ? visibleAssetIds.indexOf(primaryId) : -1
+      const endIndex = visibleAssetIds.indexOf(asset.id)
       const safeStart = startIndex === -1 ? endIndex : startIndex
       const [from, to] = safeStart <= endIndex ? [safeStart, endIndex] : [endIndex, safeStart]
 
-      setSelectedIds(new Set(ids.slice(from, to + 1)))
+      setSelectedIds(new Set(visibleAssetIds.slice(from, to + 1)))
       setPrimaryId(asset.id)
     } else {
       setSelectedIds(new Set([asset.id]))
@@ -500,12 +515,15 @@ export default function App() {
   }
 
   async function handleNativeFolderSelection(rootPath: string) {
+    setStatusMessage('正在扫描资源目录...')
     const scanned = await invoke<ScanLibraryResponse>('scan_library_folder', { rootPath })
-    const assets = scanned.assets.map((asset) => ({
-      ...asset,
-      previewUrl: asset.sourcePath ? convertFileSrc(asset.sourcePath) : asset.previewUrl,
-      thumbnailReady: false,
-    }))
+    const assets = scanned.assets.map((asset) =>
+      withAssetSearchText({
+        ...asset,
+        previewUrl: asset.sourcePath ? convertFileSrc(asset.sourcePath) : asset.previewUrl,
+        thumbnailReady: false,
+      }),
+    )
     const first = assets[0]
 
     thumbnailRunRef.current += 1
@@ -562,7 +580,8 @@ export default function App() {
   async function handleFolderSelection(files: FileList | null) {
     if (!files?.length) return
 
-    const scanned = await scanFiles(files)
+    setStatusMessage('正在扫描资源目录...')
+    const scanned = (await scanFiles(files)).map(withAssetSearchText)
     const nextLibraryName = files[0].webkitRelativePath?.split('/')[0] || 'Local Library'
     const first = scanned[0]
     thumbnailRunRef.current += 1
@@ -619,7 +638,7 @@ export default function App() {
         const previewUrl = asset.sourcePath ? convertFileSrc(asset.sourcePath) : asset.previewUrl
 
         if (previous?.thumbnailReady) {
-          return {
+          return withAssetSearchText({
             ...asset,
             previewUrl,
             thumbnailError: previous.thumbnailError,
@@ -632,14 +651,14 @@ export default function App() {
             thumbnailUrl: previous.thumbnailUrl,
             thumbnailVersion: previous.thumbnailVersion,
             thumbnailWidth: previous.thumbnailWidth,
-          }
+          })
         }
 
-        return {
+        return withAssetSearchText({
           ...asset,
           previewUrl,
           thumbnailReady: false,
-        }
+        })
       })
       const mergedSourcePaths = new Set(
         merged.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
@@ -692,7 +711,9 @@ export default function App() {
     const quality = thumbnailQuality
     const targetIds = new Set(targetAssets.map((asset) => asset.id))
     const firstName = targetAssets[0]?.name
+    const pendingAssetUpdates = new Map<string, Partial<Asset>>()
     let failedCount = 0
+    let lastProgressAt = 0
 
     revokeThumbnailUrls(libraryAssetsRef.current.filter((asset) => targetIds.has(asset.id)))
     setLibraryAssets((current) =>
@@ -723,6 +744,35 @@ export default function App() {
     })
     setStatusMessage(`正在生成缩略图：${scopeLabel}`)
 
+    const flushAssetUpdates = () => {
+      if (pendingAssetUpdates.size === 0) return
+
+      const updates = new Map(pendingAssetUpdates)
+      pendingAssetUpdates.clear()
+      setLibraryAssets((current) =>
+        current.map((currentAsset) => {
+          const update = updates.get(currentAsset.id)
+          return update ? { ...currentAsset, ...update } : currentAsset
+        }),
+      )
+    }
+
+    const updateGenerationProgress = (index: number, asset: Asset, force = false) => {
+      const now = window.performance.now()
+      if (!force && now - lastProgressAt < 160) return
+
+      lastProgressAt = now
+      setThumbnailGeneration({
+        completed: index + 1,
+        currentName: targetAssets[index + 1]?.name ?? asset.name,
+        failed: failedCount,
+        quality,
+        scopeLabel,
+        status: 'running',
+        total: targetAssets.length,
+      })
+    }
+
     for (let index = 0; index < targetAssets.length; index += 1) {
       const asset = targetAssets[index]
       let thumbnail: EncodedThumbnail | undefined
@@ -744,38 +794,25 @@ export default function App() {
         return
       }
 
-      setLibraryAssets((current) =>
-        current.map((currentAsset) => {
-          if (currentAsset.id !== asset.id) return currentAsset
-
-          return {
-            ...currentAsset,
-            thumbnailError,
-            thumbnailFormat: thumbnail?.format,
-            thumbnailHeight: thumbnail?.height,
-            thumbnailPath: thumbnail?.path,
-            thumbnailQuality: quality,
-            thumbnailReady: Boolean(thumbnail),
-            thumbnailSizeKb: thumbnail?.sizeKb,
-            thumbnailUrl: thumbnail?.url,
-            thumbnailVersion: thumbnail ? `${runId}-${index}` : undefined,
-            thumbnailWidth: thumbnail?.width,
-          }
-        }),
-      )
-      setThumbnailGeneration({
-        completed: index + 1,
-        currentName: targetAssets[index + 1]?.name ?? asset.name,
-        failed: failedCount,
-        quality,
-        scopeLabel,
-        status: 'running',
-        total: targetAssets.length,
+      pendingAssetUpdates.set(asset.id, {
+        thumbnailError,
+        thumbnailFormat: thumbnail?.format,
+        thumbnailHeight: thumbnail?.height,
+        thumbnailPath: thumbnail?.path,
+        thumbnailQuality: quality,
+        thumbnailReady: Boolean(thumbnail),
+        thumbnailSizeKb: thumbnail?.sizeKb,
+        thumbnailUrl: thumbnail?.url,
+        thumbnailVersion: thumbnail ? `${runId}-${index}` : undefined,
+        thumbnailWidth: thumbnail?.width,
       })
+      if (pendingAssetUpdates.size >= 80) flushAssetUpdates()
+      updateGenerationProgress(index, asset, index === targetAssets.length - 1)
     }
 
     if (thumbnailRunRef.current !== runId) return
 
+    flushAssetUpdates()
     setThumbnailGeneration({
       completed: targetAssets.length,
       failed: failedCount,
@@ -922,7 +959,7 @@ export default function App() {
 
     setLibraryAssets((current) =>
       current.map((asset) => {
-        return asset.id === assetId ? { ...asset, tags: [...asset.tags, tag] } : asset
+        return asset.id === assetId ? withAssetSearchText({ ...asset, tags: [...asset.tags, tag] }) : asset
       }),
     )
     setStatusMessage(`已添加标签：${tag}`)
@@ -936,7 +973,7 @@ export default function App() {
     setLibraryAssets((current) =>
       current.map((asset) => {
         return asset.id === assetId
-          ? { ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) }
+          ? withAssetSearchText({ ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) })
           : asset
       }),
     )
@@ -1040,6 +1077,7 @@ export default function App() {
             onSetThumbSize={setThumbSize}
             onSetTypeFilter={setTypeFilter}
             onSetViewMode={setViewMode}
+            onVisualOrderChange={handleVisualOrderChange}
           />
         </div>
       </div>
