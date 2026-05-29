@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v1";
@@ -17,6 +18,14 @@ const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
 const SCAN_ERROR_EVENT: &str = "picman-library-scan-error";
 const SCAN_FINISHED_EVENT: &str = "picman-library-scan-finished";
+const THUMBNAIL_BATCH_SIZE: usize = 64;
+const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
+const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
+
+#[derive(Clone, Default)]
+struct ThumbnailJobState {
+    active_job_id: Arc<Mutex<Option<String>>>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +97,7 @@ struct ThumbnailSource {
     source_path: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailResult {
     format: String,
@@ -96,6 +105,45 @@ struct ThumbnailResult {
     path: String,
     size_kb: u64,
     width: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailJobStartResponse {
+    job_id: String,
+    total: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailUpdatePayload {
+    asset_id: String,
+    error: Option<String>,
+    format: Option<String>,
+    height: Option<u32>,
+    path: Option<String>,
+    size_kb: Option<u64>,
+    width: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailBatchPayload {
+    completed: usize,
+    current_name: Option<String>,
+    failed: usize,
+    job_id: String,
+    total: usize,
+    updates: Vec<ThumbnailUpdatePayload>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailFinishedPayload {
+    cancelled: bool,
+    failed: usize,
+    job_id: String,
+    total: usize,
 }
 
 #[derive(Debug)]
@@ -520,18 +568,26 @@ fn generate_thumbnail(
     quality: String,
 ) -> Result<ThumbnailResult, String> {
     let root = PathBuf::from(&library_root);
+    generate_thumbnail_result(&root, &source, &quality)
+}
+
+fn generate_thumbnail_result(
+    root: &Path,
+    source: &ThumbnailSource,
+    quality: &str,
+) -> Result<ThumbnailResult, String> {
     let source_path = PathBuf::from(&source.source_path);
-    ensure_inside(&root, &source_path)?;
+    ensure_inside(root, &source_path)?;
 
     let metadata =
         fs::metadata(&source_path).map_err(|error| format!("无法读取源文件：{error}"))?;
-    let preset = thumbnail_preset(&quality);
-    let hash = cache_hash(&root, &source, &quality, &metadata);
+    let preset = thumbnail_preset(quality);
+    let hash = cache_hash(root, source, quality, &metadata);
     let cache_dir = root
         .join(".picman")
         .join("cache")
         .join("thumbnails")
-        .join(&quality);
+        .join(quality);
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建缩略图缓存目录：{error}"))?;
 
     if source.kind == "svg"
@@ -610,8 +666,179 @@ fn generate_thumbnail(
     })
 }
 
+fn is_thumbnail_job_active(active_job_id: &Arc<Mutex<Option<String>>>, job_id: &str) -> bool {
+    active_job_id
+        .lock()
+        .map(|active| active.as_deref() == Some(job_id))
+        .unwrap_or(false)
+}
+
+fn clear_thumbnail_job_if_active(active_job_id: &Arc<Mutex<Option<String>>>, job_id: &str) {
+    if let Ok(mut active) = active_job_id.lock() {
+        if active.as_deref() == Some(job_id) {
+            *active = None;
+        }
+    }
+}
+
+fn thumbnail_update_from_result(
+    source: &ThumbnailSource,
+    result: Result<ThumbnailResult, String>,
+) -> (ThumbnailUpdatePayload, bool) {
+    match result {
+        Ok(thumbnail) => (
+            ThumbnailUpdatePayload {
+                asset_id: source.id.clone(),
+                error: None,
+                format: Some(thumbnail.format),
+                height: Some(thumbnail.height),
+                path: Some(thumbnail.path),
+                size_kb: Some(thumbnail.size_kb),
+                width: Some(thumbnail.width),
+            },
+            false,
+        ),
+        Err(error) => (
+            ThumbnailUpdatePayload {
+                asset_id: source.id.clone(),
+                error: Some(error),
+                format: None,
+                height: None,
+                path: None,
+                size_kb: None,
+                width: None,
+            },
+            true,
+        ),
+    }
+}
+
 #[tauri::command]
-fn clear_thumbnail_cache(library_root: String) -> Result<(), String> {
+fn generate_thumbnails_stream(
+    app: AppHandle,
+    state: State<ThumbnailJobState>,
+    library_root: String,
+    sources: Vec<ThumbnailSource>,
+    quality: String,
+    job_id: String,
+) -> Result<ThumbnailJobStartResponse, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let total = sources.len();
+    let active_job_id = state.active_job_id.clone();
+
+    {
+        let mut active = active_job_id
+            .lock()
+            .map_err(|_| "缩略图任务状态不可用".to_string())?;
+        *active = Some(job_id.clone());
+    }
+
+    let thread_job_id = job_id.clone();
+
+    thread::spawn(move || {
+        let mut updates = Vec::with_capacity(THUMBNAIL_BATCH_SIZE);
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        let mut cancelled = false;
+
+        for source in sources {
+            if !is_thumbnail_job_active(&active_job_id, &thread_job_id) {
+                cancelled = true;
+                break;
+            }
+
+            let current_name = Path::new(&source.relative_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .or_else(|| Some(source.relative_path.clone()));
+            let (update, is_failed) = thumbnail_update_from_result(
+                &source,
+                generate_thumbnail_result(&root, &source, &quality),
+            );
+
+            completed += 1;
+            if is_failed {
+                failed += 1;
+            }
+            updates.push(update);
+
+            if updates.len() >= THUMBNAIL_BATCH_SIZE {
+                let _ = app.emit(
+                    THUMBNAIL_BATCH_EVENT,
+                    ThumbnailBatchPayload {
+                        completed,
+                        current_name,
+                        failed,
+                        job_id: thread_job_id.clone(),
+                        total,
+                        updates: std::mem::take(&mut updates),
+                    },
+                );
+                thread::yield_now();
+            }
+        }
+
+        if !updates.is_empty() {
+            let _ = app.emit(
+                THUMBNAIL_BATCH_EVENT,
+                ThumbnailBatchPayload {
+                    completed,
+                    current_name: None,
+                    failed,
+                    job_id: thread_job_id.clone(),
+                    total,
+                    updates,
+                },
+            );
+        }
+
+        clear_thumbnail_job_if_active(&active_job_id, &thread_job_id);
+
+        let _ = app.emit(
+            THUMBNAIL_FINISHED_EVENT,
+            ThumbnailFinishedPayload {
+                cancelled,
+                failed,
+                job_id: thread_job_id,
+                total,
+            },
+        );
+    });
+
+    Ok(ThumbnailJobStartResponse { job_id, total })
+}
+
+#[tauri::command]
+fn cancel_thumbnail_generation(
+    state: State<ThumbnailJobState>,
+    job_id: Option<String>,
+) -> Result<(), String> {
+    let mut active = state
+        .active_job_id
+        .lock()
+        .map_err(|_| "缩略图任务状态不可用".to_string())?;
+
+    if job_id
+        .as_deref()
+        .map(|id| active.as_deref() == Some(id))
+        .unwrap_or(true)
+    {
+        *active = None;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_thumbnail_cache(
+    state: State<ThumbnailJobState>,
+    library_root: String,
+) -> Result<(), String> {
+    let _ = cancel_thumbnail_generation(state, None);
     let root = PathBuf::from(&library_root);
     if !root.is_dir() {
         return Err("资源目录无效".to_string());
@@ -631,9 +858,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(ThumbnailJobState::default())
         .invoke_handler(tauri::generate_handler![
+            cancel_thumbnail_generation,
             clear_thumbnail_cache,
             generate_thumbnail,
+            generate_thumbnails_stream,
             scan_library_folder,
             scan_library_folder_stream
         ])

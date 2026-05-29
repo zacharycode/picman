@@ -45,6 +45,8 @@ const THUMBNAIL_PRESETS: Record<
 const SCAN_BATCH_EVENT = 'picman-library-scan-batch'
 const SCAN_ERROR_EVENT = 'picman-library-scan-error'
 const SCAN_FINISHED_EVENT = 'picman-library-scan-finished'
+const THUMBNAIL_BATCH_EVENT = 'picman-thumbnail-batch'
+const THUMBNAIL_FINISHED_EVENT = 'picman-thumbnail-finished'
 
 type EncodedThumbnail = {
   format: ThumbnailFormat
@@ -90,6 +92,37 @@ type NativeThumbnailResult = {
   width: number
 }
 
+type NativeThumbnailJobStartResponse = {
+  jobId: string
+  total: number
+}
+
+type NativeThumbnailUpdate = {
+  assetId: string
+  error?: string | null
+  format?: ThumbnailFormat | null
+  height?: number | null
+  path?: string | null
+  sizeKb?: number | null
+  width?: number | null
+}
+
+type NativeThumbnailBatchPayload = {
+  completed: number
+  currentName?: string | null
+  failed: number
+  jobId: string
+  total: number
+  updates: NativeThumbnailUpdate[]
+}
+
+type NativeThumbnailFinishedPayload = {
+  cancelled: boolean
+  failed: number
+  jobId: string
+  total: number
+}
+
 type NativeScanMode = 'open' | 'refresh'
 
 type ActiveNativeScan = {
@@ -108,6 +141,13 @@ type RefreshMergeResult = {
   idSet: Set<string>
   removed: number
   removedAssets: Asset[]
+}
+
+type ActiveNativeThumbnailJob = {
+  id: string
+  quality: ThumbnailQuality
+  scopeLabel: string
+  total: number
 }
 
 function blurActiveElement() {
@@ -199,6 +239,10 @@ function withCacheToken(url: string, token: string) {
 
 function createScanId() {
   return `scan_${Date.now()}_${Math.random().toString(36).slice(2)}`
+}
+
+function createThumbnailJobId(runId: number) {
+  return `thumb_${runId}_${Date.now()}_${Math.random().toString(36).slice(2)}`
 }
 
 function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
@@ -322,6 +366,7 @@ async function createNativeThumbnail(
 export default function App() {
   const folderInputRef = useRef<HTMLInputElement>(null)
   const activeNativeScanRef = useRef<ActiveNativeScan | null>(null)
+  const activeNativeThumbnailJobRef = useRef<ActiveNativeThumbnailJob | null>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
   const primaryIdRef = useRef<string | null>(sampleAssets[0].id)
   const selectedIdsRef = useRef<Set<string>>(new Set([sampleAssets[0].id]))
@@ -534,6 +579,58 @@ export default function App() {
     setStatusMessage(summary)
   }, [])
 
+  const cancelNativeThumbnailGeneration = useCallback((jobId?: string | null) => {
+    const activeJobId = jobId ?? activeNativeThumbnailJobRef.current?.id ?? null
+    activeNativeThumbnailJobRef.current = null
+    void invoke('cancel_thumbnail_generation', { jobId: activeJobId }).catch(() => undefined)
+  }, [])
+
+  const applyNativeThumbnailBatch = useCallback((job: ActiveNativeThumbnailJob, payload: NativeThumbnailBatchPayload) => {
+    const updates = new Map(
+      payload.updates.map((update) => {
+        const thumbnailPath = update.path ?? undefined
+        const thumbnailUrl = thumbnailPath
+          ? withCacheToken(convertFileSrc(thumbnailPath), `${payload.jobId}-${payload.completed}-${update.assetId}`)
+          : undefined
+
+        return [
+          update.assetId,
+          {
+            thumbnailError: update.error ?? undefined,
+            thumbnailFormat: update.format ?? undefined,
+            thumbnailHeight: update.height ?? undefined,
+            thumbnailPath,
+            thumbnailQuality: job.quality,
+            thumbnailReady: Boolean(thumbnailPath && !update.error),
+            thumbnailSizeKb: update.sizeKb ?? undefined,
+            thumbnailUrl,
+            thumbnailVersion: thumbnailPath ? `${payload.jobId}-${payload.completed}` : undefined,
+            thumbnailWidth: update.width ?? undefined,
+          } satisfies Partial<Asset>,
+        ]
+      }),
+    )
+
+    startTransition(() => {
+      setLibraryAssets((current) =>
+        current.map((asset) => {
+          const update = updates.get(asset.id)
+          return update ? { ...asset, ...update } : asset
+        }),
+      )
+    })
+
+    setThumbnailGeneration({
+      completed: payload.completed,
+      currentName: payload.currentName ?? undefined,
+      failed: payload.failed,
+      quality: job.quality,
+      scopeLabel: job.scopeLabel,
+      status: 'running',
+      total: payload.total,
+    })
+  }, [])
+
   useEffect(() => {
     let disposed = false
     const unlisteners: Array<() => void> = []
@@ -600,6 +697,70 @@ export default function App() {
       for (const unlisten of unlisteners) unlisten()
     }
   }, [disposeActiveNativeScan, finishRefreshScan, flushOpenScanAssets, scheduleOpenScanFlush])
+
+  useEffect(() => {
+    let disposed = false
+    const unlisteners: Array<() => void> = []
+
+    async function registerThumbnailListeners() {
+      const unlistenBatch = await listen<NativeThumbnailBatchPayload>(THUMBNAIL_BATCH_EVENT, (event) => {
+        const job = activeNativeThumbnailJobRef.current
+        if (!job || job.id !== event.payload.jobId) return
+
+        applyNativeThumbnailBatch(job, event.payload)
+        setStatusMessage(`正在生成缩略图：${job.scopeLabel} · ${event.payload.completed}/${event.payload.total}`)
+      })
+      const unlistenFinished = await listen<NativeThumbnailFinishedPayload>(THUMBNAIL_FINISHED_EVENT, (event) => {
+        const job = activeNativeThumbnailJobRef.current
+        if (!job || job.id !== event.payload.jobId) return
+
+        activeNativeThumbnailJobRef.current = null
+
+        if (event.payload.cancelled) {
+          setThumbnailGeneration({
+            completed: event.payload.total,
+            failed: event.payload.failed,
+            quality: job.quality,
+            scopeLabel: job.scopeLabel,
+            status: 'idle',
+            total: event.payload.total,
+          })
+          setStatusMessage(`缩略图生成已取消：${job.scopeLabel}`)
+          return
+        }
+
+        setThumbnailGeneration({
+          completed: event.payload.total,
+          failed: event.payload.failed,
+          quality: job.quality,
+          scopeLabel: job.scopeLabel,
+          status: 'completed',
+          total: event.payload.total,
+        })
+        setStatusMessage(
+          event.payload.failed > 0
+            ? `缩略图已生成：${job.scopeLabel} · 失败 ${event.payload.failed} 个`
+            : `缩略图已生成：${job.scopeLabel} · ${event.payload.total} 个素材`,
+        )
+      })
+
+      if (disposed) {
+        unlistenBatch()
+        unlistenFinished()
+        return
+      }
+
+      unlisteners.push(unlistenBatch, unlistenFinished)
+    }
+
+    void registerThumbnailListeners()
+
+    return () => {
+      disposed = true
+      activeNativeThumbnailJobRef.current = null
+      for (const unlisten of unlisteners) unlisten()
+    }
+  }, [applyNativeThumbnailBatch])
 
   const handleVisualOrderChange = useCallback(
     (ids: string[]) => {
@@ -775,6 +936,7 @@ export default function App() {
     const optimisticLibraryName = libraryNameFromPath(rootPath)
 
     disposeActiveNativeScan()
+    cancelNativeThumbnailGeneration()
     activeNativeScanRef.current = {
       collectedAssets: [],
       firstSelected: false,
@@ -849,6 +1011,7 @@ export default function App() {
     if (!files?.length) return
 
     disposeActiveNativeScan()
+    cancelNativeThumbnailGeneration()
     setStatusMessage('正在扫描资源目录...')
     const scanned = (await scanFiles(files)).map(withAssetSearchText)
     const nextLibraryName = files[0].webkitRelativePath?.split('/')[0] || 'Local Library'
@@ -894,6 +1057,8 @@ export default function App() {
     const scanId = createScanId()
     const optimisticLibraryName = libraryNameFromPath(libraryRootPath)
     disposeActiveNativeScan()
+    thumbnailRunRef.current += 1
+    cancelNativeThumbnailGeneration()
     activeNativeScanRef.current = {
       collectedAssets: [],
       firstSelected: true,
@@ -968,6 +1133,61 @@ export default function App() {
       total: targetAssets.length,
     })
     setStatusMessage(`正在生成缩略图：${scopeLabel}`)
+
+    if (libraryRootPath && targetAssets.every((asset) => asset.sourcePath)) {
+      const jobId = createThumbnailJobId(runId)
+      activeNativeThumbnailJobRef.current = {
+        id: jobId,
+        quality,
+        scopeLabel,
+        total: targetAssets.length,
+      }
+
+      try {
+        const started = await invoke<NativeThumbnailJobStartResponse>('generate_thumbnails_stream', {
+          jobId,
+          libraryRoot: libraryRootPath,
+          quality,
+          sources: targetAssets.map((asset) => ({
+            id: asset.id,
+            kind: asset.kind,
+            relativePath: asset.relativePath,
+            sourcePath: asset.sourcePath,
+          })),
+        })
+
+        const activeJob = activeNativeThumbnailJobRef.current
+        if (!activeJob || activeJob.id !== jobId) return
+
+        activeJob.total = started.total
+        setThumbnailGeneration({
+          completed: 0,
+          currentName: firstName,
+          failed: 0,
+          quality,
+          scopeLabel,
+          status: 'running',
+          total: started.total,
+        })
+      } catch (error) {
+        const activeJob = activeNativeThumbnailJobRef.current
+        if (!activeJob || activeJob.id !== jobId) return
+
+        activeNativeThumbnailJobRef.current = null
+        const message = error instanceof Error ? error.message : '缩略图生成失败'
+        setThumbnailGeneration({
+          completed: 0,
+          failed: targetAssets.length,
+          quality,
+          scopeLabel,
+          status: 'idle',
+          total: targetAssets.length,
+        })
+        setStatusMessage(`缩略图生成失败：${message}`)
+      }
+
+      return
+    }
 
     const flushAssetUpdates = () => {
       if (pendingAssetUpdates.size === 0) return
@@ -1070,6 +1290,7 @@ export default function App() {
 
   function clearThumbnailCache() {
     thumbnailRunRef.current += 1
+    cancelNativeThumbnailGeneration()
     revokeThumbnailUrls(libraryAssetsRef.current)
     if (libraryRootPath) {
       void invoke('clear_thumbnail_cache', { libraryRoot: libraryRootPath }).catch(() => undefined)
