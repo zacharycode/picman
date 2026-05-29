@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">
+  <rect width="400" height="400" fill="#1a1f2e"/>
+  <!-- Phone frame -->
+  <rect x="120" y="20" width="160" height="360" rx="24" fill="#252d3d" stroke="#3a4560" stroke-width="2"/>
+  <!-- Notch -->
+  <rect x="160" y="20" width="80" height="22" rx="0" fill="#252d3d"/>
+  <rect x="170" y="20" width="60" height="18" rx="0" fill="#252d3d"/>
+  <rect x="163" y="26" width="74" height="12" rx="6" fill="#1a1f2e"/>
+  <!-- Camera -->
+  <circle cx="200" cy="32" r="5" fill="#1a1c26"/>
+  <circle cx="200" cy="32" r="3" fill="#2e3850"/>
+  <!-- Status bar -->
+  <text x="136" y="56" fill="#7a8aaa" font-size="9" font-family="monospace">9:41</text>
+  <rect x="244" y="50" width="20" height="8" rx="2" fill="none" stroke="#7a8aaa" stroke-width="1.2"/>
+  <rect x="245" y="51" width="14" height="6" rx="1" fill="#55c070"/>
+  <!-- Illustration area -->
+  <rect x="136" y="70" width="128" height="110" rx="8" fill="#1e2535"/>
+  <!-- Illustration: abstract welcome graphic -->
+  <circle cx="200" cy="105" r="28" fill="#2e3850"/>
+  <circle cx="200" cy="95" r="14" fill="#4b8af4" opacity="0.8"/>
+  <ellipse cx="200" cy="120" rx="20" ry="10" fill="#4b8af4" opacity="0.5"/>
+  <!-- Stars -->
+  <circle cx="155" cy="82" r="2" fill="#4b8af4" opacity="0.6"/>
+  <circle cx="248" cy="90" r="2" fill="#4b8af4" opacity="0.5"/>
+  <circle cx="145" cy="110" r="1.5" fill="#7a8aaa" opacity="0.7"/>
+  <circle cx="252" cy="118" r="1.5" fill="#7a8aaa" opacity="0.6"/>
+  <!-- Heading -->
+  <rect x="148" y="194" width="104" height="11" rx="4" fill="#c4c9da"/>
+  <!-- Sub text -->
+  <rect x="156" y="212" width="88" height="7" rx="3" fill="#4a556a"/>
+  <rect x="162" y="224" width="76" height="7" rx="3" fill="#4a556a"/>
+  <!-- CTA button -->
+  <rect x="148" y="244" width="104" height="28" rx="8" fill="#4b8af4"/>
+  <rect x="168" y="254" width="64" height="8" rx="3" fill="white" opacity="0.8"/>
+  <!-- Secondary link -->
+  <rect x="172" y="280" width="56" height="6" rx="2" fill="#4a556a"/>
+  <!-- Dots indicator -->
+  <circle cx="192" cy="304" r="4" fill="#4b8af4"/>
+  <circle cx="204" cy="304" r="3" fill="#2e3850"/>
+  <circle cx="214" cy="304" r="3" fill="#2e3850"/>
+  <!-- Bottom bar -->
+  <rect x="136" y="320" width="128" height="1" fill="#2e3850"/>
+  <!-- Bottom nav icons -->
+  <rect x="148" y="332" width="16" height="14" rx="3" fill="#4b8af4"/>
+  <rect x="180" y="332" width="16" height="14" rx="3" fill="#3a4358"/>
+  <rect x="212" y="332" width="16" height="14" rx="3" fill="#3a4358"/>
+  <rect x="244" y="332" width="16" height="14" rx="3" fill="#3a4358"/>
+  <!-- Home indicator -->
+  <rect x="170" y="364" width="60" height="4" rx="2" fill="#3a4358"/>
+</svg>

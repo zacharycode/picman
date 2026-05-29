@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">
+  <rect width="400" height="400" fill="#1a1f2e"/>
+  <!-- Main search modal -->
+  <rect x="60" y="80" width="280" height="240" rx="14" fill="#252d3d"/>
+  <rect x="60" y="80" width="280" height="240" rx="14" fill="none" stroke="#3a4560" stroke-width="1.5"/>
+  <!-- Search bar -->
+  <rect x="76" y="100" width="248" height="40" rx="8" fill="#1e2535"/>
+  <rect x="76" y="100" width="248" height="40" rx="8" fill="none" stroke="#4b8af4" stroke-width="1.5"/>
+  <!-- Search icon -->
+  <circle cx="102" cy="120" r="9" fill="none" stroke="#6b7a99" stroke-width="2"/>
+  <line x1="108" y1="126" x2="115" y2="133" stroke="#6b7a99" stroke-width="2" stroke-linecap="round"/>
+  <!-- Search text cursor -->
+  <rect x="120" y="113" width="80" height="14" rx="3" fill="#4a556a"/>
+  <rect x="202" y="113" width="2" height="14" rx="1" fill="#4b8af4"/>
+  <!-- Kbd hint -->
+  <rect x="296" y="111" width="16" height="18" rx="4" fill="#2e3850"/>
+  <text x="304" y="124" text-anchor="middle" fill="#7a8aaa" font-size="10" font-family="monospace">⌘</text>
+  <!-- Results -->
+  <rect x="76" y="156" width="248" height="6" rx="2" fill="#2e3850"/>
+  <!-- Result rows -->
+  <rect x="88" y="170" width="16" height="16" rx="4" fill="#4b8af4" opacity="0.3"/>
+  <rect x="113" y="173" width="90" height="8" rx="3" fill="#4a556a"/>
+  <rect x="113" y="184" width="60" height="6" rx="2" fill="#3a4358" opacity="0.6"/>
+  <rect x="88" y="198" width="16" height="16" rx="4" fill="#55c070" opacity="0.3"/>
+  <rect x="113" y="201" width="110" height="8" rx="3" fill="#4a556a"/>
+  <rect x="113" y="212" width="70" height="6" rx="2" fill="#3a4358" opacity="0.6"/>
+  <rect x="88" y="226" width="16" height="16" rx="4" fill="#e0a855" opacity="0.3"/>
+  <rect x="113" y="229" width="75" height="8" rx="3" fill="#4a556a"/>
+  <rect x="113" y="240" width="50" height="6" rx="2" fill="#3a4358" opacity="0.6"/>
+  <!-- Highlighted row bg -->
+  <rect x="80" y="196" width="240" height="28" rx="6" fill="#2d3a56" opacity="0.7"/>
+  <!-- Footer -->
+  <rect x="76" y="300" width="248" height="1" fill="#2e3850"/>
+  <rect x="88" y="309" width="40" height="8" rx="3" fill="#3a4358"/>
+  <rect x="136" y="309" width="40" height="8" rx="3" fill="#3a4358"/>
+</svg>
