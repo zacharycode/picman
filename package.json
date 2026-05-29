@@ -13,6 +13,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "stress:audit": "node scripts/performance-audit.mjs",
     "stress:create": "node scripts/create-stress-library.mjs"
   },
   "dependencies": {
