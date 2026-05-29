@@ -177,7 +177,101 @@ type ThumbnailMetrics = {
   generatedCount: number
 }
 
+type AssetStore = {
+  byId: Map<string, Asset>
+  version: number
+}
+
 const LARGE_SCAN_SORT_THRESHOLD = 2000
+
+function createAssetMap(assets: Asset[]): Map<string, Asset> {
+  const assetMap = new Map<string, Asset>()
+  for (const asset of assets) assetMap.set(asset.id, asset)
+  return assetMap
+}
+
+function createAssetIndexMap(assets: Asset[]): Map<string, number> {
+  const indexById = new Map<string, number>()
+  for (let index = 0; index < assets.length; index += 1) {
+    indexById.set(assets[index].id, index)
+  }
+  return indexById
+}
+
+function appendAssetsToAssetMap(assetMap: Map<string, Asset>, incoming: Asset[]) {
+  for (const asset of incoming) assetMap.set(asset.id, asset)
+}
+
+function appendAssetIndexes(indexById: Map<string, number>, startIndex: number, incoming: Asset[]) {
+  for (let index = 0; index < incoming.length; index += 1) {
+    indexById.set(incoming[index].id, startIndex + index)
+  }
+}
+
+function applyAssetUpdatesToArray(
+  assets: Asset[],
+  updates: Map<string, Partial<Asset>>,
+  indexById: Map<string, number>,
+) {
+  if (updates.size === 0) return assets
+
+  let next: Asset[] | undefined
+
+  for (const [assetId, update] of updates) {
+    const index = indexById.get(assetId)
+    if (index === undefined) continue
+
+    next ??= assets.slice()
+    next[index] = { ...next[index], ...update }
+  }
+
+  return next ?? assets
+}
+
+function applyAssetUpdatesToMap(assetMap: Map<string, Asset>, updates: Map<string, Partial<Asset>>) {
+  for (const [assetId, update] of updates) {
+    const asset = assetMap.get(assetId)
+    if (!asset) continue
+
+    assetMap.set(assetId, { ...asset, ...update })
+  }
+}
+
+function buildThumbnailClearUpdates(assets: Asset[]) {
+  const updates = new Map<string, Partial<Asset>>()
+
+  for (const asset of assets) {
+    updates.set(asset.id, {
+      thumbnailError: undefined,
+      thumbnailFormat: undefined,
+      thumbnailHeight: undefined,
+      thumbnailPath: undefined,
+      thumbnailQuality: undefined,
+      thumbnailReady: false,
+      thumbnailSizeKb: undefined,
+      thumbnailUrl: undefined,
+      thumbnailVersion: undefined,
+      thumbnailWidth: undefined,
+    })
+  }
+
+  return updates
+}
+
+function updateAssetStore(store: AssetStore, update: (assetMap: Map<string, Asset>) => void): AssetStore {
+  update(store.byId)
+  return {
+    byId: store.byId,
+    version: store.version + 1,
+  }
+}
+
+function replaceAssetStore(store: AssetStore, assets: Asset[]): AssetStore {
+  return {
+    byId: createAssetMap(assets),
+    version: store.version + 1,
+  }
+}
 
 function blurActiveElement() {
   const activeElement = document.activeElement
@@ -474,6 +568,8 @@ export default function App() {
   const activeNativeScanRef = useRef<ActiveNativeScan | null>(null)
   const activeNativeThumbnailJobRef = useRef<ActiveNativeThumbnailJob | null>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
+  const assetByIdRef = useRef<Map<string, Asset>>(createAssetMap(sampleAssets))
+  const libraryAssetIndexByIdRef = useRef<Map<string, number>>(createAssetIndexMap(sampleAssets))
   const primaryIdRef = useRef<string | null>(sampleAssets[0].id)
   const selectedIdsRef = useRef<Set<string>>(new Set([sampleAssets[0].id]))
   const thumbnailRunRef = useRef(0)
@@ -484,6 +580,10 @@ export default function App() {
   const [cacheLimit, setCacheLimit] = useState(5)
   const [filtersOpen, setFiltersOpen] = useState(false)
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>(sampleAssets)
+  const [assetStore, setAssetStore] = useState<AssetStore>(() => ({
+    byId: createAssetMap(sampleAssets),
+    version: 0,
+  }))
   const [libraryCatalogAssets, setLibraryCatalogAssets] = useState<Asset[]>(sampleAssets)
   const [libraryName, setLibraryName] = useState('DesignAssets')
   const [libraryRootPath, setLibraryRootPath] = useState<string | null>(null)
@@ -523,15 +623,17 @@ export default function App() {
   })
   const [viewMode, setViewMode] = useState<AssetViewMode>('adaptive')
   const deferredQuery = useDeferredValue(query)
+  const assetById = assetStore.byId
   const libraryCatalog = useMemo(
     () => deriveLibraryCatalogState(libraryName, libraryCatalogAssets),
     [libraryCatalogAssets, libraryName],
   )
+  const catalogAssetById = useMemo(() => createAssetMap(libraryCatalogAssets), [libraryCatalogAssets])
   const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
   const { cacheSize, generatedCount } = thumbnailMetrics
   const pendingCount = Math.max(0, libraryAssets.length - generatedCount)
-  const assetById = useMemo(() => new Map(libraryAssets.map((asset) => [asset.id, asset])), [libraryAssets])
   const visibleOrderSourceAssets = thumbnailState === 'all' ? libraryCatalogAssets : libraryAssets
+  const layoutAssetById = thumbnailState === 'all' ? catalogAssetById : assetById
 
   const visibleAssetIds = useMemo(() => {
     const searchQuery = normalizeSearchText(deferredQuery).trim()
@@ -566,13 +668,16 @@ export default function App() {
     visibleOrderSourceAssets,
   ])
 
-  const visibleAssets = useMemo(
-    () => visibleAssetIds.map((id) => assetById.get(id)).filter((asset): asset is Asset => Boolean(asset)),
-    [assetById, visibleAssetIds],
-  )
+  const visibleCount = visibleAssetIds.length
   const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
   const visibleIndexById = useMemo(
-    () => new Map(visibleAssetIds.map((id, index) => [id, index])),
+    () => {
+      const indexById = new Map<string, number>()
+      for (let index = 0; index < visibleAssetIds.length; index += 1) {
+        indexById.set(visibleAssetIds[index], index)
+      }
+      return indexById
+    },
     [visibleAssetIds],
   )
   const visibleSelectedIds = useMemo(
@@ -592,6 +697,10 @@ export default function App() {
   useEffect(() => {
     libraryAssetsRef.current = libraryAssets
   }, [libraryAssets])
+
+  useEffect(() => {
+    assetByIdRef.current = assetStore.byId
+  }, [assetStore])
 
   useEffect(() => {
     primaryIdRef.current = primaryId
@@ -629,7 +738,9 @@ export default function App() {
       const firstAsset = scan.firstSelected ? undefined : incoming[0]
       if (firstAsset) scan.firstSelected = true
 
+      appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
       startTransition(() => {
+        setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
         setLibraryAssets((current) => [...current, ...incoming])
         setLibraryCatalogAssets((current) => [...current, ...incoming])
       })
@@ -658,8 +769,10 @@ export default function App() {
     const currentSelectedIds = selectedIdsRef.current
 
     revokePreviewUrls(merged.removedAssets)
+    libraryAssetIndexByIdRef.current = createAssetIndexMap(merged.assets)
 
     startTransition(() => {
+      setAssetStore((current) => replaceAssetStore(current, merged.assets))
       setLibraryAssets(merged.assets)
       setLibraryCatalogAssets(merged.assets)
       setLibraryName(payload.libraryName)
@@ -707,11 +820,11 @@ export default function App() {
     if (updates.size > 0) {
       const generated = thumbnailMetricsFromUpdates(updates.values())
       startTransition(() => {
+        setAssetStore((current) =>
+          updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+        )
         setLibraryAssets((current) =>
-          current.map((asset) => {
-            const update = updates.get(asset.id)
-            return update ? { ...asset, ...update } : asset
-          }),
+          applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
         )
         if (generated.generatedCount > 0 || generated.cacheSize > 0) {
           setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
@@ -911,15 +1024,15 @@ export default function App() {
 
   const handleVisualOrderChange = useCallback(
     (ids: string[]) => {
-      visualAssetIdsRef.current = ids.length === visibleAssets.length ? ids : visibleAssetIds
+      visualAssetIdsRef.current = ids.length === visibleCount ? ids : visibleAssetIds
     },
-    [visibleAssetIds, visibleAssets.length],
+    [visibleAssetIds, visibleCount],
   )
 
   const getCurrentVisualIds = useCallback(() => {
     const visualIds = visualAssetIdsRef.current
-    return visualIds.length === visibleAssets.length ? visualIds : visibleAssetIds
-  }, [visibleAssetIds, visibleAssets.length])
+    return visualIds.length === visibleCount ? visualIds : visibleAssetIds
+  }, [visibleAssetIds, visibleCount])
 
   useEffect(() => {
     if (!sortOpen) return
@@ -932,21 +1045,29 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handler)
   }, [sortOpen])
 
+  const getVisibleAssetAt = useCallback(
+    (index: number) => {
+      const assetId = visibleAssetIds[index]
+      return assetId ? assetByIdRef.current.get(assetId) : undefined
+    },
+    [visibleAssetIds],
+  )
+
   const navigateLightbox = useCallback(
     (dir: 'prev' | 'next') => {
-      if (visibleAssets.length === 0) return
+      if (visibleCount === 0) return
 
       const currentIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
       const current = currentIndex === -1 ? 0 : currentIndex
-      const nextIndex =
-        dir === 'prev' ? Math.max(0, current - 1) : Math.min(visibleAssets.length - 1, current + 1)
-      const nextAsset = visibleAssets[nextIndex]
+      const nextIndex = dir === 'prev' ? Math.max(0, current - 1) : Math.min(visibleCount - 1, current + 1)
+      const nextAsset = getVisibleAssetAt(nextIndex)
+      if (!nextAsset) return
 
       setPrimaryId(nextAsset.id)
       setSelectedIds(new Set([nextAsset.id]))
       blurActiveElement()
     },
-    [primaryId, visibleAssets, visibleIndexById],
+    [getVisibleAssetAt, primaryId, visibleCount, visibleIndexById],
   )
 
   useEffect(() => {
@@ -1002,7 +1123,7 @@ export default function App() {
       }
 
       if (isSelectionKey) {
-        if (visibleAssets.length === 0) return
+        if (visibleCount === 0) return
 
         const visualIds = getCurrentVisualIds()
         const currentIndex = primaryId ? visualIds.indexOf(primaryId) : -1
@@ -1015,7 +1136,7 @@ export default function App() {
             ? Math.max(0, currentIndex - 1)
             : Math.min(visualIds.length - 1, currentIndex + 1)
         const nextId = visualIds[nextIndex]
-        const nextAsset = assetById.get(nextId) ?? visibleAssets[nextIndex]
+        const nextAsset = assetByIdRef.current.get(nextId) ?? getVisibleAssetAt(nextIndex)
         if (!nextAsset) return
 
         setSelectedIds(new Set([nextAsset.id]))
@@ -1024,10 +1145,13 @@ export default function App() {
         setKeyboardScrollVersion((version) => version + 1)
         blurActiveElement()
         event.preventDefault()
-      } else if (event.key === ' ' && visibleAssets.length > 0) {
+      } else if (event.key === ' ' && visibleCount > 0) {
         if (!primaryAsset) {
-          setPrimaryId(visibleAssets[0].id)
-          setSelectedIds(new Set([visibleAssets[0].id]))
+          const firstAsset = getVisibleAssetAt(0)
+          if (firstAsset) {
+            setPrimaryId(firstAsset.id)
+            setSelectedIds(new Set([firstAsset.id]))
+          }
         }
         setLightboxOpen(true)
         event.preventDefault()
@@ -1038,14 +1162,14 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [
     getCurrentVisualIds,
+    getVisibleAssetAt,
     lightboxOpen,
     navigateLightbox,
     primaryAsset,
     primaryId,
     selectionKeyAxis,
-    assetById,
     visibleAssetIds,
-    visibleAssets,
+    visibleCount,
   ])
 
   function handleAssetClick(asset: Asset, event: MouseEvent<HTMLDivElement>) {
@@ -1097,6 +1221,8 @@ export default function App() {
     thumbnailRunRef.current += 1
     setLibraryScanStatus('open')
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
+    libraryAssetIndexByIdRef.current = new Map<string, number>()
+    setAssetStore((current) => replaceAssetStore(current, []))
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
       return []
@@ -1171,6 +1297,8 @@ export default function App() {
     thumbnailRunRef.current += 1
     setLibraryScanStatus('open')
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
+    libraryAssetIndexByIdRef.current = new Map<string, number>()
+    setAssetStore((current) => replaceAssetStore(current, []))
 
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
@@ -1203,7 +1331,9 @@ export default function App() {
         const incoming = batch.map(withAssetSearchText)
         scannedTotal = scanned
 
+        appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
         startTransition(() => {
+          setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
           setLibraryAssets((current) => [...current, ...incoming])
           setLibraryCatalogAssets((current) => [...current, ...incoming])
         })
@@ -1292,23 +1422,13 @@ export default function App() {
     let lastProgressAt = 0
 
     revokeThumbnailUrls(libraryAssetsRef.current.filter((asset) => targetIds.has(asset.id)))
+    const clearedUpdates = buildThumbnailClearUpdates(targetAssets)
     setThumbnailMetrics((current) => subtractThumbnailMetrics(current, clearedThumbnailMetrics))
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
+    )
     setLibraryAssets((current) =>
-      current.map((asset) => {
-        if (!targetIds.has(asset.id)) return asset
-
-        return {
-          ...asset,
-          thumbnailError: undefined,
-          thumbnailFormat: undefined,
-          thumbnailHeight: undefined,
-          thumbnailQuality: undefined,
-          thumbnailReady: false,
-          thumbnailSizeKb: undefined,
-          thumbnailUrl: undefined,
-          thumbnailWidth: undefined,
-        }
-      }),
+      applyAssetUpdatesToArray(current, clearedUpdates, libraryAssetIndexByIdRef.current),
     )
     setThumbnailGeneration({
       completed: 0,
@@ -1389,11 +1509,11 @@ export default function App() {
       const updates = new Map(pendingAssetUpdates)
       pendingAssetUpdates.clear()
       const generated = thumbnailMetricsFromUpdates(updates.values())
+      setAssetStore((current) =>
+        updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+      )
       setLibraryAssets((current) =>
-        current.map((currentAsset) => {
-          const update = updates.get(currentAsset.id)
-          return update ? { ...currentAsset, ...update } : currentAsset
-        }),
+        applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
       )
       if (generated.generatedCount > 0 || generated.cacheSize > 0) {
         setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
@@ -1494,20 +1614,12 @@ export default function App() {
     if (libraryRootPath) {
       void invoke('clear_thumbnail_cache', { libraryRoot: libraryRootPath }).catch(() => undefined)
     }
+    const clearedUpdates = buildThumbnailClearUpdates(libraryAssetsRef.current)
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
+    )
     setLibraryAssets((current) =>
-      current.map((asset) => ({
-        ...asset,
-        thumbnailError: undefined,
-        thumbnailFormat: undefined,
-        thumbnailHeight: undefined,
-        thumbnailPath: undefined,
-        thumbnailQuality: undefined,
-        thumbnailReady: false,
-        thumbnailSizeKb: undefined,
-        thumbnailUrl: undefined,
-        thumbnailVersion: undefined,
-        thumbnailWidth: undefined,
-      })),
+      applyAssetUpdatesToArray(current, clearedUpdates, libraryAssetIndexByIdRef.current),
     )
     setThumbnailGeneration({
       completed: 0,
@@ -1596,42 +1708,47 @@ export default function App() {
     const tag = rawTag.trim().replace(/\s+/g, ' ')
     if (!tag) return
 
-    const target = libraryAssets.find((asset) => asset.id === assetId)
+    const target = assetByIdRef.current.get(assetId)
     if (!target || target.tags.includes(tag)) {
       setStatusMessage(`标签已存在：${tag}`)
       return
     }
 
+    const updatedAsset = withAssetSearchText({ ...target, tags: [...target.tags, tag] })
+    const updates = new Map<string, Partial<Asset>>([[assetId, updatedAsset]])
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+    )
     setLibraryAssets((current) =>
-      current.map((asset) => {
-        return asset.id === assetId ? withAssetSearchText({ ...asset, tags: [...asset.tags, tag] }) : asset
-      }),
+      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
     )
     setLibraryCatalogAssets((current) =>
       current.map((asset) => {
-        return asset.id === assetId ? withAssetSearchText({ ...asset, tags: [...asset.tags, tag] }) : asset
+        return asset.id === assetId ? updatedAsset : asset
       }),
     )
     setStatusMessage(`已添加标签：${tag}`)
   }
 
   function removeAssetTag(assetId: string, tag: string) {
-    const target = libraryAssets.find((asset) => asset.id === assetId)
+    const target = assetByIdRef.current.get(assetId)
     if (!target?.tags.includes(tag)) return
 
     const tagStillUsed = libraryAssets.some((asset) => asset.id !== assetId && asset.tags.includes(tag))
+    const updatedAsset = withAssetSearchText({
+      ...target,
+      tags: target.tags.filter((assetTag) => assetTag !== tag),
+    })
+    const updates = new Map<string, Partial<Asset>>([[assetId, updatedAsset]])
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+    )
     setLibraryAssets((current) =>
-      current.map((asset) => {
-        return asset.id === assetId
-          ? withAssetSearchText({ ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) })
-          : asset
-      }),
+      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
     )
     setLibraryCatalogAssets((current) =>
       current.map((asset) => {
-        return asset.id === assetId
-          ? withAssetSearchText({ ...asset, tags: asset.tags.filter((assetTag) => assetTag !== tag) })
-          : asset
+        return asset.id === assetId ? updatedAsset : asset
       }),
     )
     if (activeTag === tag && !tagStillUsed) setActiveTag('all')
@@ -1701,11 +1818,13 @@ export default function App() {
             activeTag={activeTag}
             activeFilterCount={activeFilterCount}
             allTags={allTags}
+            assetById={assetById}
             breadcrumb={breadcrumb}
             filtersOpen={filtersOpen}
             inspectorVisible={inspectorVisible}
             keyboardScrollTargetId={keyboardScrollTargetId}
             keyboardScrollVersion={keyboardScrollVersion}
+            layoutAssetById={layoutAssetById}
             primaryAsset={primaryAsset}
             query={query}
             selectedIds={visibleSelectedIds}
@@ -1717,7 +1836,7 @@ export default function App() {
             thumbSize={thumbSize}
             typeFilter={typeFilter}
             viewMode={viewMode}
-            visibleAssets={visibleAssets}
+            visibleAssetIds={visibleAssetIds}
             onAddAssetTag={addAssetTag}
             onAssetClick={handleAssetClick}
             onAssetDoubleClick={handleAssetDoubleClick}
@@ -1767,10 +1886,10 @@ export default function App() {
       {lightboxOpen && primaryAsset && (
         <Lightbox
           asset={primaryAsset}
-          hasNext={lightboxIndex < visibleAssets.length - 1}
+          hasNext={lightboxIndex < visibleCount - 1}
           hasPrev={lightboxIndex > 0}
           index={lightboxIndex}
-          total={visibleAssets.length}
+          total={visibleCount}
           onClose={() => setLightboxOpen(false)}
           onNext={() => navigateLightbox('next')}
           onPrev={() => navigateLightbox('prev')}

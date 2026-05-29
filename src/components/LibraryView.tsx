@@ -54,7 +54,7 @@ type ViewportState = {
 }
 
 type VirtualAssetItem = {
-  asset: Asset
+  assetId: string
   style: CSSProperties
 }
 
@@ -93,7 +93,8 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
 }
 
-function getAssetNumberRatio(asset: Asset) {
+function getAssetNumberRatio(asset?: Asset) {
+  if (!asset) return 16 / 10
   if (asset.width && asset.height) return asset.width / asset.height
   if (asset.thumbnailWidth && asset.thumbnailHeight) return asset.thumbnailWidth / asset.thumbnailHeight
 
@@ -138,26 +139,30 @@ function getAdaptivePosition(index: number, metrics: AdaptiveLayoutMetrics): Vir
   }
 }
 
-function createAdaptiveLayout(assets: Asset[], viewport: ViewportState, metrics: AdaptiveLayoutMetrics): VirtualLayout {
+function createAdaptiveLayout(
+  assetIds: string[],
+  viewport: ViewportState,
+  metrics: AdaptiveLayoutMetrics,
+): VirtualLayout {
   const viewportHeight = Math.max(1, viewport.height || 620)
   const firstRow = Math.max(
     0,
     Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
   )
   const lastRow = Math.min(
-    Math.ceil(assets.length / metrics.columns) - 1,
+    Math.ceil(assetIds.length / metrics.columns) - 1,
     Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
   )
   const startIndex = firstRow * metrics.columns
-  const endIndex = Math.min(assets.length, (lastRow + 1) * metrics.columns)
+  const endIndex = Math.min(assetIds.length, (lastRow + 1) * metrics.columns)
   const items: VirtualAssetItem[] = []
 
   for (let index = startIndex; index < endIndex; index += 1) {
-    const asset = assets[index]
+    const assetId = assetIds[index]
     const row = Math.floor(index / metrics.columns)
     const column = index % metrics.columns
     items.push({
-      asset,
+      assetId,
       style: {
         height: metrics.itemHeight,
         left: ADAPTIVE_PADDING_X + column * (metrics.itemWidth + ADAPTIVE_GAP_X),
@@ -181,23 +186,23 @@ function getListPosition(index: number): VirtualPosition {
   }
 }
 
-function createListLayout(assets: Asset[], viewport: ViewportState): VirtualLayout {
+function createListLayout(assetIds: string[], viewport: ViewportState): VirtualLayout {
   const viewportHeight = Math.max(1, viewport.height || 620)
-  const totalHeight = LIST_PADDING_TOP + assets.length * LIST_ROW_HEIGHT + LIST_PADDING_BOTTOM
+  const totalHeight = LIST_PADDING_TOP + assetIds.length * LIST_ROW_HEIGHT + LIST_PADDING_BOTTOM
   const firstIndex = Math.max(
     0,
     Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
   )
   const lastIndex = Math.min(
-    assets.length - 1,
+    assetIds.length - 1,
     Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
   )
   const items: VirtualAssetItem[] = []
 
   for (let index = firstIndex; index <= lastIndex; index += 1) {
-    const asset = assets[index]
+    const assetId = assetIds[index]
     items.push({
-      asset,
+      assetId,
       style: {
         height: LIST_ROW_HEIGHT,
         left: 0,
@@ -214,7 +219,12 @@ function createListLayout(assets: Asset[], viewport: ViewportState): VirtualLayo
   }
 }
 
-function createMasonryLayoutData(assets: Asset[], viewportWidth: number, thumbSize: number): MasonryLayoutData {
+function createMasonryLayoutData(
+  assetIds: string[],
+  assetById: ReadonlyMap<string, Asset>,
+  viewportWidth: number,
+  thumbSize: number,
+): MasonryLayoutData {
   const width = Math.max(1, viewportWidth || 960)
   const contentWidth = Math.max(1, width - MASONRY_PADDING_X * 2)
   const minColumnWidth = Math.max(124, thumbSize)
@@ -225,20 +235,20 @@ function createMasonryLayoutData(assets: Asset[], viewportWidth: number, thumbSi
   const positionById = new Map<string, VirtualPosition>()
   let maxItemHeight = 0
 
-  for (const asset of assets) {
+  for (const assetId of assetIds) {
     let column = 0
     for (let index = 1; index < columnHeights.length; index += 1) {
       if (columnHeights[index] < columnHeights[column]) column = index
     }
 
-    const ratio = clamp(getAssetNumberRatio(asset), 0.18, 6)
+    const ratio = clamp(getAssetNumberRatio(assetById.get(assetId)), 0.18, 6)
     const thumbHeight = columnWidth / ratio
     const itemHeight = thumbHeight + MASONRY_TEXT_HEIGHT
     const top = columnHeights[column]
     const left = MASONRY_PADDING_X + column * (columnWidth + MASONRY_GAP_X)
 
     items.push({
-      asset,
+      assetId,
       height: itemHeight,
       style: {
         left,
@@ -248,7 +258,7 @@ function createMasonryLayoutData(assets: Asset[], viewportWidth: number, thumbSi
       },
       top,
     })
-    positionById.set(asset.id, { height: itemHeight, top })
+    positionById.set(assetId, { height: itemHeight, top })
     maxItemHeight = Math.max(maxItemHeight, itemHeight)
     columnHeights[column] += itemHeight + MASONRY_GAP_Y
   }
@@ -262,7 +272,7 @@ function createMasonryLayoutData(assets: Asset[], viewportWidth: number, thumbSi
     MASONRY_PADDING_TOP + MASONRY_PADDING_BOTTOM,
     Math.max(...columnHeights) - MASONRY_GAP_Y + MASONRY_PADDING_BOTTOM,
   )
-  const visualIds = sortedItems.map((item) => item.asset.id)
+  const visualIds = sortedItems.map((item) => item.assetId)
 
   return {
     items: sortedItems,
@@ -296,7 +306,7 @@ function createMasonryLayout(layoutData: MasonryLayoutData, viewport: ViewportSt
   for (let index = startIndex; index < layoutData.items.length; index += 1) {
     const item = layoutData.items[index]
     if (item.top > maxTop) break
-    if (item.top + item.height >= minTop) items.push({ asset: item.asset, style: item.style })
+    if (item.top + item.height >= minTop) items.push({ assetId: item.assetId, style: item.style })
   }
 
   return {
@@ -309,11 +319,13 @@ type LibraryViewProps = {
   activeTag: string
   activeFilterCount: number
   allTags: string[]
+  assetById: ReadonlyMap<string, Asset>
   breadcrumb: string
   filtersOpen: boolean
   inspectorVisible: boolean
   keyboardScrollTargetId: string | null
   keyboardScrollVersion: number
+  layoutAssetById: ReadonlyMap<string, Asset>
   primaryAsset?: Asset
   query: string
   selectedIds: Set<string>
@@ -325,7 +337,7 @@ type LibraryViewProps = {
   thumbSize: number
   typeFilter: 'all' | AssetKind
   viewMode: AssetViewMode
-  visibleAssets: Asset[]
+  visibleAssetIds: string[]
   onAddAssetTag: (assetId: string, tag: string) => void
   onAssetClick: (asset: Asset, event: MouseEvent<HTMLDivElement>) => void
   onAssetDoubleClick: (asset: Asset) => void
@@ -349,11 +361,13 @@ export function LibraryView({
   activeTag,
   activeFilterCount,
   allTags,
+  assetById,
   breadcrumb,
   filtersOpen,
   inspectorVisible,
   keyboardScrollTargetId,
   keyboardScrollVersion,
+  layoutAssetById,
   primaryAsset,
   query,
   selectedIds,
@@ -365,7 +379,7 @@ export function LibraryView({
   thumbSize,
   typeFilter,
   viewMode,
-  visibleAssets,
+  visibleAssetIds,
   onAddAssetTag,
   onAssetClick,
   onAssetDoubleClick,
@@ -402,19 +416,28 @@ export function LibraryView({
           }
         : { '--asset-thumb-size': fixedThumbSize }
   const assetIndexById = useMemo(
-    () => new Map(visibleAssets.map((asset, index) => [asset.id, index])),
-    [visibleAssets],
+    () => {
+      const indexById = new Map<string, number>()
+      for (let index = 0; index < visibleAssetIds.length; index += 1) {
+        indexById.set(visibleAssetIds[index], index)
+      }
+      return indexById
+    },
+    [visibleAssetIds],
   )
   const adaptiveMetrics = useMemo(
-    () => createAdaptiveMetrics(visibleAssets.length, viewport.width, thumbSize),
-    [thumbSize, viewport.width, visibleAssets.length],
+    () => createAdaptiveMetrics(visibleAssetIds.length, viewport.width, thumbSize),
+    [thumbSize, viewport.width, visibleAssetIds.length],
   )
   const masonryLayoutData = useMemo(
-    () => (viewMode === 'masonry' ? createMasonryLayoutData(visibleAssets, viewport.width, thumbSize) : undefined),
-    [thumbSize, viewMode, viewport.width, visibleAssets],
+    () =>
+      viewMode === 'masonry'
+        ? createMasonryLayoutData(visibleAssetIds, layoutAssetById, viewport.width, thumbSize)
+        : undefined,
+    [layoutAssetById, thumbSize, viewMode, viewport.width, visibleAssetIds],
   )
   const virtualLayout = useMemo(() => {
-    if (viewMode === 'list') return createListLayout(visibleAssets, viewport)
+    if (viewMode === 'list') return createListLayout(visibleAssetIds, viewport)
     if (viewMode === 'masonry') {
       return masonryLayoutData
         ? createMasonryLayout(masonryLayoutData, viewport)
@@ -423,12 +446,12 @@ export function LibraryView({
             totalHeight: 0,
           }
     }
-    return createAdaptiveLayout(visibleAssets, viewport, adaptiveMetrics)
-  }, [adaptiveMetrics, masonryLayoutData, viewMode, viewport, visibleAssets])
+    return createAdaptiveLayout(visibleAssetIds, viewport, adaptiveMetrics)
+  }, [adaptiveMetrics, masonryLayoutData, viewMode, viewport, visibleAssetIds])
   const visualAssetIds = useMemo(() => {
     if (viewMode === 'masonry') return masonryLayoutData?.visualIds ?? []
-    return visibleAssets.map((asset) => asset.id)
-  }, [masonryLayoutData, viewMode, visibleAssets])
+    return visibleAssetIds
+  }, [masonryLayoutData, viewMode, visibleAssetIds])
   const getVirtualPosition = useCallback(
     (assetId: string): VirtualPosition | undefined => {
       const index = assetIndexById.get(assetId)
@@ -713,7 +736,7 @@ export function LibraryView({
           </div>
         )}
 
-        {visibleAssets.length === 0 ? (
+        {visibleAssetIds.length === 0 ? (
           <div className="empty-state">
             <FolderOpen size={44} color="var(--muted)" />
             <h2>这里还没有素材</h2>
@@ -728,25 +751,30 @@ export function LibraryView({
               className={`asset-grid asset-grid--${viewMode} asset-grid--virtual`}
               style={{ ...assetGridStyle, height: virtualLayout.totalHeight }}
             >
-              {virtualLayout.items.map(({ asset, style }) => (
-                <AssetItem
-                  key={asset.id}
-                  asset={asset}
-                  primary={primaryAsset?.id === asset.id}
-                  selected={selectedIds.has(asset.id)}
-                  style={style}
-                  viewMode={viewMode}
-                  onClick={(event) => onAssetClick(asset, event)}
-                  onDoubleClick={() => onAssetDoubleClick(asset)}
-                />
-              ))}
+              {virtualLayout.items.map(({ assetId, style }) => {
+                const asset = assetById.get(assetId)
+                if (!asset) return null
+
+                return (
+                  <AssetItem
+                    key={asset.id}
+                    asset={asset}
+                    primary={primaryAsset?.id === asset.id}
+                    selected={selectedIds.has(asset.id)}
+                    style={style}
+                    viewMode={viewMode}
+                    onClick={(event) => onAssetClick(asset, event)}
+                    onDoubleClick={() => onAssetDoubleClick(asset)}
+                  />
+                )
+              })}
             </div>
           </div>
         )}
 
         <div className="assets-statusbar">
           <span>
-            {visibleAssets.length} 个素材{selectedIds.size > 0 ? ` · 已选择 ${selectedIds.size} 个` : ''}
+            {visibleAssetIds.length} 个素材{selectedIds.size > 0 ? ` · 已选择 ${selectedIds.size} 个` : ''}
           </span>
           <span>
             {VIEW_MODE_LABELS[viewMode]} · {statusMessage}
