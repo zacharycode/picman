@@ -258,6 +258,10 @@ function buildThumbnailClearUpdates(assets: Asset[]) {
   return updates
 }
 
+function getLiveAssets(sourceAssets: Asset[], assetById: Map<string, Asset>) {
+  return sourceAssets.map((asset) => assetById.get(asset.id) ?? asset)
+}
+
 function updateAssetStore(store: AssetStore, update: (assetMap: Map<string, Asset>) => void): AssetStore {
   update(store.byId)
   return {
@@ -631,20 +635,22 @@ export default function App() {
   const catalogAssetById = useMemo(() => createAssetMap(libraryCatalogAssets), [libraryCatalogAssets])
   const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
   const { cacheSize, generatedCount } = thumbnailMetrics
-  const pendingCount = Math.max(0, libraryAssets.length - generatedCount)
-  const visibleOrderSourceAssets = thumbnailState === 'all' ? libraryCatalogAssets : libraryAssets
+  const pendingCount = Math.max(0, libraryCatalogAssets.length - generatedCount)
+  const thumbnailFilterVersion = thumbnailState === 'all' ? 0 : assetStore.version
   const layoutAssetById = thumbnailState === 'all' ? catalogAssetById : assetById
 
   const visibleAssetIds = useMemo(() => {
     const searchQuery = normalizeSearchText(deferredQuery).trim()
-    const filtered = visibleOrderSourceAssets.filter((asset) => {
+    const shouldUseLiveThumbnailState = thumbnailState !== 'all' && thumbnailFilterVersion >= 0
+    const filtered = libraryCatalogAssets.filter((asset) => {
       const inFolder = activeFolder === '/' || asset.folder === activeFolder
       const inTag = activeTag === 'all' || asset.tags.includes(activeTag)
       const inType = typeFilter === 'all' || asset.kind === typeFilter
+      const liveAsset = shouldUseLiveThumbnailState ? (assetById.get(asset.id) ?? asset) : asset
       const inThumb =
         thumbnailState === 'all' ||
-        (thumbnailState === 'generated' && asset.thumbnailReady) ||
-        (thumbnailState === 'pending' && !asset.thumbnailReady)
+        (thumbnailState === 'generated' && liveAsset.thumbnailReady) ||
+        (thumbnailState === 'pending' && !liveAsset.thumbnailReady)
       const inSearch = !searchQuery || (asset.searchText ?? createAssetSearchText(asset)).includes(searchQuery)
 
       return inFolder && inTag && inType && inThumb && inSearch
@@ -659,13 +665,15 @@ export default function App() {
   }, [
     activeFolder,
     activeTag,
+    assetById,
     deferredQuery,
+    libraryCatalogAssets,
     libraryScanStatus,
     sortDir,
     sortField,
     thumbnailState,
+    thumbnailFilterVersion,
     typeFilter,
-    visibleOrderSourceAssets,
   ])
 
   const visibleCount = visibleAssetIds.length
@@ -764,7 +772,10 @@ export default function App() {
   )
 
   const finishRefreshScan = useCallback((scan: ActiveNativeScan, payload: ScanLibraryFinishedPayload) => {
-    const merged = mergeRefreshedAssets(scan.collectedAssets, libraryAssetsRef.current)
+    const merged = mergeRefreshedAssets(
+      scan.collectedAssets,
+      getLiveAssets(libraryAssetsRef.current, assetByIdRef.current),
+    )
     const currentPrimaryId = primaryIdRef.current
     const currentSelectedIds = selectedIdsRef.current
 
@@ -822,9 +833,6 @@ export default function App() {
       startTransition(() => {
         setAssetStore((current) =>
           updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
-        )
-        setLibraryAssets((current) =>
-          applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
         )
         if (generated.generatedCount > 0 || generated.cacheSize > 0) {
           setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
@@ -1421,14 +1429,12 @@ export default function App() {
     let failedCount = 0
     let lastProgressAt = 0
 
-    revokeThumbnailUrls(libraryAssetsRef.current.filter((asset) => targetIds.has(asset.id)))
+    const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
+    revokeThumbnailUrls(liveAssets.filter((asset) => targetIds.has(asset.id)))
     const clearedUpdates = buildThumbnailClearUpdates(targetAssets)
     setThumbnailMetrics((current) => subtractThumbnailMetrics(current, clearedThumbnailMetrics))
     setAssetStore((current) =>
       updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
-    )
-    setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(current, clearedUpdates, libraryAssetIndexByIdRef.current),
     )
     setThumbnailGeneration({
       completed: 0,
@@ -1512,9 +1518,6 @@ export default function App() {
       setAssetStore((current) =>
         updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
       )
-      setLibraryAssets((current) =>
-        applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
-      )
       if (generated.generatedCount > 0 || generated.cacheSize > 0) {
         setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
       }
@@ -1592,12 +1595,14 @@ export default function App() {
   }
 
   function generateAllThumbnails() {
-    void generateThumbnailAssets(libraryAssets, '全部素材')
+    void generateThumbnailAssets(getLiveAssets(libraryAssetsRef.current, assetByIdRef.current), '全部素材')
   }
 
   function generateFolderThumbnails(folderPaths: string[]) {
     const selectedFolders = new Set(folderPaths)
-    const selectedAssets = libraryAssets.filter((asset) => selectedFolders.has(asset.folder))
+    const selectedAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current).filter((asset) =>
+      selectedFolders.has(asset.folder),
+    )
     const label =
       folderPaths.length === 1
         ? folderName(folderPaths[0], libraryName)
@@ -1609,17 +1614,15 @@ export default function App() {
   function clearThumbnailCache() {
     thumbnailRunRef.current += 1
     cancelNativeThumbnailGeneration()
-    revokeThumbnailUrls(libraryAssetsRef.current)
+    const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
+    revokeThumbnailUrls(liveAssets)
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     if (libraryRootPath) {
       void invoke('clear_thumbnail_cache', { libraryRoot: libraryRootPath }).catch(() => undefined)
     }
-    const clearedUpdates = buildThumbnailClearUpdates(libraryAssetsRef.current)
+    const clearedUpdates = buildThumbnailClearUpdates(liveAssets)
     setAssetStore((current) =>
       updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
-    )
-    setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(current, clearedUpdates, libraryAssetIndexByIdRef.current),
     )
     setThumbnailGeneration({
       completed: 0,
