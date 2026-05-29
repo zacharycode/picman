@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -59,12 +59,6 @@ type NativeScannedAsset = Omit<Asset, 'kind'> & {
   kind: AssetKind
 }
 
-type ScanLibraryResponse = {
-  assets: NativeScannedAsset[]
-  libraryName: string
-  rootPath: string
-}
-
 type ScanLibraryStartResponse = {
   libraryName: string
   rootPath: string
@@ -94,6 +88,26 @@ type NativeThumbnailResult = {
   path: string
   sizeKb: number
   width: number
+}
+
+type NativeScanMode = 'open' | 'refresh'
+
+type ActiveNativeScan = {
+  collectedAssets: Asset[]
+  firstSelected: boolean
+  flushTimer?: number
+  id: string
+  libraryName: string
+  mode: NativeScanMode
+  pendingAssets: Asset[]
+}
+
+type RefreshMergeResult = {
+  added: number
+  assets: Asset[]
+  idSet: Set<string>
+  removed: number
+  removedAssets: Asset[]
 }
 
 function blurActiveElement() {
@@ -195,6 +209,49 @@ function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
   })
 }
 
+function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): RefreshMergeResult {
+  const previousById = new Map(previousAssets.map((asset) => [asset.id, asset]))
+  const previousSourcePaths = new Set(
+    previousAssets.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
+  )
+  const scannedSourcePaths = new Set(
+    scannedAssets.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
+  )
+  const idSet = new Set(scannedAssets.map((asset) => asset.id))
+  const assets = scannedAssets.map((asset) => {
+    const previous = previousById.get(asset.id)
+
+    if (previous?.thumbnailReady) {
+      return {
+        ...asset,
+        previewUrl: previous.previewUrl,
+        thumbnailError: previous.thumbnailError,
+        thumbnailFormat: previous.thumbnailFormat,
+        thumbnailHeight: previous.thumbnailHeight,
+        thumbnailPath: previous.thumbnailPath,
+        thumbnailQuality: previous.thumbnailQuality,
+        thumbnailReady: true,
+        thumbnailSizeKb: previous.thumbnailSizeKb,
+        thumbnailUrl: previous.thumbnailUrl,
+        thumbnailVersion: previous.thumbnailVersion,
+        thumbnailWidth: previous.thumbnailWidth,
+      }
+    }
+
+    return asset
+  })
+  const removedAssets = previousAssets.filter((asset) => asset.sourcePath && !scannedSourcePaths.has(asset.sourcePath))
+  const added = scannedAssets.filter((asset) => asset.sourcePath && !previousSourcePaths.has(asset.sourcePath)).length
+
+  return {
+    added,
+    assets,
+    idSet,
+    removed: removedAssets.length,
+    removedAssets,
+  }
+}
+
 function libraryNameFromPath(path: string) {
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
   return parts.at(-1) ?? 'Local Library'
@@ -264,8 +321,10 @@ async function createNativeThumbnail(
 
 export default function App() {
   const folderInputRef = useRef<HTMLInputElement>(null)
-  const activeNativeScanRef = useRef<{ firstSelected: boolean; id: string; libraryName: string } | null>(null)
+  const activeNativeScanRef = useRef<ActiveNativeScan | null>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
+  const primaryIdRef = useRef<string | null>(sampleAssets[0].id)
+  const selectedIdsRef = useRef<Set<string>>(new Set([sampleAssets[0].id]))
   const thumbnailRunRef = useRef(0)
   const visualAssetIdsRef = useRef<string[]>(sampleAssets.map((asset) => asset.id))
 
@@ -307,6 +366,7 @@ export default function App() {
     status: 'idle',
   })
   const [viewMode, setViewMode] = useState<AssetViewMode>('adaptive')
+  const deferredQuery = useDeferredValue(query)
 
   const allTags = useMemo(
     () => Array.from(new Set(libraryAssets.flatMap((asset) => asset.tags))).sort(),
@@ -324,7 +384,7 @@ export default function App() {
   }, [libraryAssets, libraryName])
 
   const visibleAssets = useMemo(() => {
-    const searchQuery = normalizeSearchText(query).trim()
+    const searchQuery = normalizeSearchText(deferredQuery).trim()
     const filtered = libraryAssets.filter((asset) => {
       const inFolder = activeFolder === '/' || asset.folder === activeFolder
       const inTag = activeTag === 'all' || asset.tags.includes(activeTag)
@@ -339,7 +399,7 @@ export default function App() {
     })
 
     return sortAssets(filtered, sortField, sortDir)
-  }, [activeFolder, activeTag, libraryAssets, query, sortDir, sortField, thumbnailState, typeFilter])
+  }, [activeFolder, activeTag, deferredQuery, libraryAssets, sortDir, sortField, thumbnailState, typeFilter])
 
   const visibleAssetIds = useMemo(() => visibleAssets.map((asset) => asset.id), [visibleAssets])
   const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
@@ -388,7 +448,90 @@ export default function App() {
   }, [libraryAssets])
 
   useEffect(() => {
+    primaryIdRef.current = primaryId
+  }, [primaryId])
+
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds
+  }, [selectedIds])
+
+  useEffect(() => {
     return () => revokePreviewUrls(libraryAssetsRef.current)
+  }, [])
+
+  const clearScanFlushTimer = useCallback((scan: ActiveNativeScan | null) => {
+    if (!scan?.flushTimer) return
+
+    window.clearTimeout(scan.flushTimer)
+    scan.flushTimer = undefined
+  }, [])
+
+  const disposeActiveNativeScan = useCallback(() => {
+    clearScanFlushTimer(activeNativeScanRef.current)
+    activeNativeScanRef.current = null
+  }, [clearScanFlushTimer])
+
+  const flushOpenScanAssets = useCallback(
+    (scanId: string) => {
+      const scan = activeNativeScanRef.current
+      if (!scan || scan.id !== scanId || scan.mode !== 'open') return
+
+      clearScanFlushTimer(scan)
+      const incoming = scan.pendingAssets.splice(0)
+      if (incoming.length === 0) return
+
+      const firstAsset = scan.firstSelected ? undefined : incoming[0]
+      if (firstAsset) scan.firstSelected = true
+
+      startTransition(() => {
+        setLibraryAssets((current) => [...current, ...incoming])
+      })
+
+      if (firstAsset) {
+        setSelectedIds(new Set([firstAsset.id]))
+        setPrimaryId(firstAsset.id)
+      }
+    },
+    [clearScanFlushTimer],
+  )
+
+  const scheduleOpenScanFlush = useCallback(
+    (scanId: string) => {
+      const scan = activeNativeScanRef.current
+      if (!scan || scan.id !== scanId || scan.mode !== 'open' || scan.flushTimer) return
+
+      scan.flushTimer = window.setTimeout(() => flushOpenScanAssets(scanId), 80)
+    },
+    [flushOpenScanAssets],
+  )
+
+  const finishRefreshScan = useCallback((scan: ActiveNativeScan, payload: ScanLibraryFinishedPayload) => {
+    const merged = mergeRefreshedAssets(scan.collectedAssets, libraryAssetsRef.current)
+    const currentPrimaryId = primaryIdRef.current
+    const currentSelectedIds = selectedIdsRef.current
+
+    revokePreviewUrls(merged.removedAssets)
+
+    startTransition(() => {
+      setLibraryAssets(merged.assets)
+      setLibraryName(payload.libraryName)
+      setLibraryRootPath(payload.rootPath)
+    })
+
+    const survivingSelectedIds = new Set([...currentSelectedIds].filter((id) => merged.idSet.has(id)))
+    if (survivingSelectedIds.size === 0 && merged.assets.length > 0) {
+      setSelectedIds(new Set([merged.assets[0].id]))
+      setPrimaryId(merged.assets[0].id)
+    } else {
+      setSelectedIds(survivingSelectedIds)
+      setPrimaryId(currentPrimaryId && merged.idSet.has(currentPrimaryId) ? currentPrimaryId : null)
+    }
+
+    const summary =
+      merged.added === 0 && merged.removed === 0
+        ? `已刷新 · ${merged.assets.length} 个素材`
+        : `已刷新 · ${merged.assets.length} 个素材（新增 ${merged.added} · 移除 ${merged.removed}）`
+    setStatusMessage(summary)
   }, [])
 
   useEffect(() => {
@@ -403,23 +546,27 @@ export default function App() {
         const incoming = event.payload.assets.map(nativeAssetToFrontend)
         if (incoming.length === 0) return
 
-        startTransition(() => {
-          setLibraryAssets((current) => [...current, ...incoming])
-        })
-
-        if (!scan.firstSelected) {
-          scan.firstSelected = true
-          setSelectedIds(new Set([incoming[0].id]))
-          setPrimaryId(incoming[0].id)
+        if (scan.mode === 'refresh') {
+          scan.collectedAssets.push(...incoming)
+          setStatusMessage(`${scan.libraryName} · 正在后台刷新 ${event.payload.total} 个素材`)
+        } else {
+          scan.pendingAssets.push(...incoming)
+          scheduleOpenScanFlush(scan.id)
+          setStatusMessage(`${scan.libraryName} · 正在扫描 ${event.payload.total} 个素材`)
         }
-
-        setStatusMessage(`${scan.libraryName} · 正在扫描 ${event.payload.total} 个素材`)
       })
       const unlistenFinished = await listen<ScanLibraryFinishedPayload>(SCAN_FINISHED_EVENT, (event) => {
         const scan = activeNativeScanRef.current
         if (!scan || scan.id !== event.payload.scanId) return
 
-        activeNativeScanRef.current = null
+        if (scan.mode === 'refresh') {
+          finishRefreshScan(scan, event.payload)
+          disposeActiveNativeScan()
+          return
+        }
+
+        flushOpenScanAssets(scan.id)
+        disposeActiveNativeScan()
         setLibraryName(event.payload.libraryName)
         setLibraryRootPath(event.payload.rootPath)
         setStatusMessage(`${event.payload.libraryName} · ${event.payload.total} 个素材`)
@@ -449,9 +596,10 @@ export default function App() {
 
     return () => {
       disposed = true
+      disposeActiveNativeScan()
       for (const unlisten of unlisteners) unlisten()
     }
-  }, [])
+  }, [disposeActiveNativeScan, finishRefreshScan, flushOpenScanAssets, scheduleOpenScanFlush])
 
   const handleVisualOrderChange = useCallback(
     (ids: string[]) => {
@@ -626,10 +774,14 @@ export default function App() {
     const scanId = createScanId()
     const optimisticLibraryName = libraryNameFromPath(rootPath)
 
+    disposeActiveNativeScan()
     activeNativeScanRef.current = {
+      collectedAssets: [],
       firstSelected: false,
       id: scanId,
       libraryName: optimisticLibraryName,
+      mode: 'open',
+      pendingAssets: [],
     }
     thumbnailRunRef.current += 1
     setLibraryAssets((current) => {
@@ -667,7 +819,7 @@ export default function App() {
     } catch (error) {
       if (activeNativeScanRef.current?.id !== scanId) return
 
-      activeNativeScanRef.current = null
+      disposeActiveNativeScan()
       const message = error instanceof Error ? error.message : '扫描失败'
       setStatusMessage(`扫描失败：${message}`)
     }
@@ -696,6 +848,7 @@ export default function App() {
   async function handleFolderSelection(files: FileList | null) {
     if (!files?.length) return
 
+    disposeActiveNativeScan()
     setStatusMessage('正在扫描资源目录...')
     const scanned = (await scanFiles(files)).map(withAssetSearchText)
     const nextLibraryName = files[0].webkitRelativePath?.split('/')[0] || 'Local Library'
@@ -738,78 +891,35 @@ export default function App() {
       return
     }
 
+    const scanId = createScanId()
+    const optimisticLibraryName = libraryNameFromPath(libraryRootPath)
+    disposeActiveNativeScan()
+    activeNativeScanRef.current = {
+      collectedAssets: [],
+      firstSelected: true,
+      id: scanId,
+      libraryName: libraryName || optimisticLibraryName,
+      mode: 'refresh',
+      pendingAssets: [],
+    }
+    setStatusMessage(`${libraryName || optimisticLibraryName} · 正在启动后台刷新...`)
+
     try {
-      const scanned = await invoke<ScanLibraryResponse>('scan_library_folder', {
+      const scan = await invoke<ScanLibraryStartResponse>('scan_library_folder_stream', {
         rootPath: libraryRootPath,
+        scanId,
       })
-      const previousById = new Map(libraryAssetsRef.current.map((asset) => [asset.id, asset]))
-      const previousSourcePaths = new Set(
-        libraryAssetsRef.current.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
-      )
-      const previousPrimaryId = primaryId
-      const previousSelectedIds = selectedIds
+      const activeScan = activeNativeScanRef.current
+      if (!activeScan || activeScan.id !== scanId) return
 
-      const merged = scanned.assets.map((asset) => {
-        const previous = previousById.get(asset.id)
-
-        if (previous?.thumbnailReady) {
-          return withAssetSearchText({
-            ...asset,
-            previewUrl: previous.previewUrl,
-            thumbnailError: previous.thumbnailError,
-            thumbnailFormat: previous.thumbnailFormat,
-            thumbnailHeight: previous.thumbnailHeight,
-            thumbnailPath: previous.thumbnailPath,
-            thumbnailQuality: previous.thumbnailQuality,
-            thumbnailReady: true,
-            thumbnailSizeKb: previous.thumbnailSizeKb,
-            thumbnailUrl: previous.thumbnailUrl,
-            thumbnailVersion: previous.thumbnailVersion,
-            thumbnailWidth: previous.thumbnailWidth,
-          })
-        }
-
-        return withAssetSearchText({
-          ...asset,
-          previewUrl: undefined,
-          thumbnailReady: false,
-        })
-      })
-      const mergedSourcePaths = new Set(
-        merged.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
-      )
-      const mergedIdSet = new Set(merged.map((asset) => asset.id))
-
-      // Only revoke blob URLs for assets that are gone, so existing previews don't flicker.
-      revokePreviewUrls(
-        libraryAssetsRef.current.filter(
-          (asset) => asset.sourcePath && !mergedSourcePaths.has(asset.sourcePath),
-        ),
-      )
-
-      const added = merged.filter((asset) => asset.sourcePath && !previousSourcePaths.has(asset.sourcePath)).length
-      const removed = libraryAssetsRef.current.filter(
-        (asset) => asset.sourcePath && !mergedSourcePaths.has(asset.sourcePath),
-      ).length
-
-      setLibraryAssets(merged)
-      setLibraryName(scanned.libraryName)
-
-      const survivingSelectedIds = new Set([...previousSelectedIds].filter((id) => mergedIdSet.has(id)))
-      if (survivingSelectedIds.size === 0 && merged.length > 0) {
-        setSelectedIds(new Set([merged[0].id]))
-        setPrimaryId(merged[0].id)
-      } else {
-        setSelectedIds(survivingSelectedIds)
-        setPrimaryId(previousPrimaryId && mergedIdSet.has(previousPrimaryId) ? previousPrimaryId : null)
-      }
-
-      const summary =
-        added === 0 && removed === 0
-          ? `已刷新 · ${merged.length} 个素材`
-          : `已刷新 · ${merged.length} 个素材（新增 ${added} · 移除 ${removed}）`
-      setStatusMessage(summary)
+      activeScan.libraryName = scan.libraryName
+      setLibraryRootPath(scan.rootPath)
+      setLibraryName(scan.libraryName)
+      setStatusMessage(`${scan.libraryName} · 正在后台刷新资源目录...`)
     } catch (error) {
+      if (activeNativeScanRef.current?.id !== scanId) return
+
+      disposeActiveNativeScan()
       const message = error instanceof Error ? error.message : '刷新失败'
       setStatusMessage(`刷新失败：${message}`)
     }
