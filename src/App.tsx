@@ -172,10 +172,9 @@ type LibraryCatalogState = {
   thumbnailFolders: FolderNode[]
 }
 
-type ThumbnailStats = {
+type ThumbnailMetrics = {
   cacheSize: number
   generatedCount: number
-  pendingCount: number
 }
 
 const LARGE_SCAN_SORT_THRESHOLD = 2000
@@ -359,7 +358,7 @@ function deriveLibraryCatalogState(libraryName: string, assets: Asset[]): Librar
   }
 }
 
-function deriveThumbnailStats(assets: Asset[]): ThumbnailStats {
+function deriveThumbnailMetrics(assets: Asset[]): ThumbnailMetrics {
   let cacheSize = 0
   let generatedCount = 0
 
@@ -373,7 +372,37 @@ function deriveThumbnailStats(assets: Asset[]): ThumbnailStats {
   return {
     cacheSize,
     generatedCount,
-    pendingCount: assets.length - generatedCount,
+  }
+}
+
+function addThumbnailMetrics(a: ThumbnailMetrics, b: ThumbnailMetrics): ThumbnailMetrics {
+  return {
+    cacheSize: a.cacheSize + b.cacheSize,
+    generatedCount: a.generatedCount + b.generatedCount,
+  }
+}
+
+function subtractThumbnailMetrics(a: ThumbnailMetrics, b: ThumbnailMetrics): ThumbnailMetrics {
+  return {
+    cacheSize: Math.max(0, a.cacheSize - b.cacheSize),
+    generatedCount: Math.max(0, a.generatedCount - b.generatedCount),
+  }
+}
+
+function thumbnailMetricsFromUpdates(updates: Iterable<Partial<Asset>>): ThumbnailMetrics {
+  let cacheSize = 0
+  let generatedCount = 0
+
+  for (const update of updates) {
+    if (update.thumbnailReady) {
+      generatedCount += 1
+      cacheSize += update.thumbnailSizeKb ?? 0
+    }
+  }
+
+  return {
+    cacheSize,
+    generatedCount,
   }
 }
 
@@ -473,6 +502,9 @@ export default function App() {
   const [sortField, setSortField] = useState<SortField>('name')
   const [sortOpen, setSortOpen] = useState(false)
   const [statusMessage, setStatusMessage] = useState('示例资源库已加载')
+  const [thumbnailMetrics, setThumbnailMetrics] = useState<ThumbnailMetrics>(() =>
+    deriveThumbnailMetrics(sampleAssets),
+  )
   const [thumbnailGeneration, setThumbnailGeneration] = useState<ThumbnailGenerationState>({
     completed: 0,
     failed: 0,
@@ -495,9 +527,9 @@ export default function App() {
     () => deriveLibraryCatalogState(libraryName, libraryCatalogAssets),
     [libraryCatalogAssets, libraryName],
   )
-  const thumbnailStats = useMemo(() => deriveThumbnailStats(libraryAssets), [libraryAssets])
   const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
-  const { cacheSize, generatedCount, pendingCount } = thumbnailStats
+  const { cacheSize, generatedCount } = thumbnailMetrics
+  const pendingCount = Math.max(0, libraryAssets.length - generatedCount)
   const assetById = useMemo(() => new Map(libraryAssets.map((asset) => [asset.id, asset])), [libraryAssets])
   const visibleOrderSourceAssets = thumbnailState === 'all' ? libraryCatalogAssets : libraryAssets
 
@@ -633,6 +665,7 @@ export default function App() {
       setLibraryName(payload.libraryName)
       setLibraryRootPath(payload.rootPath)
       setLibraryScanStatus('idle')
+      setThumbnailMetrics(deriveThumbnailMetrics(merged.assets))
     })
 
     const survivingSelectedIds = new Set([...currentSelectedIds].filter((id) => merged.idSet.has(id)))
@@ -672,6 +705,7 @@ export default function App() {
     job.pendingUpdates.clear()
 
     if (updates.size > 0) {
+      const generated = thumbnailMetricsFromUpdates(updates.values())
       startTransition(() => {
         setLibraryAssets((current) =>
           current.map((asset) => {
@@ -679,6 +713,9 @@ export default function App() {
             return update ? { ...asset, ...update } : asset
           }),
         )
+        if (generated.generatedCount > 0 || generated.cacheSize > 0) {
+          setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
+        }
       })
     }
 
@@ -1059,6 +1096,7 @@ export default function App() {
     }
     thumbnailRunRef.current += 1
     setLibraryScanStatus('open')
+    setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
       return []
@@ -1132,6 +1170,7 @@ export default function App() {
     cancelNativeThumbnailGeneration()
     thumbnailRunRef.current += 1
     setLibraryScanStatus('open')
+    setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
 
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
@@ -1246,12 +1285,14 @@ export default function App() {
     thumbnailRunRef.current = runId
     const quality = thumbnailQuality
     const targetIds = new Set(targetAssets.map((asset) => asset.id))
+    const clearedThumbnailMetrics = deriveThumbnailMetrics(targetAssets)
     const firstName = targetAssets[0]?.name
     const pendingAssetUpdates = new Map<string, Partial<Asset>>()
     let failedCount = 0
     let lastProgressAt = 0
 
     revokeThumbnailUrls(libraryAssetsRef.current.filter((asset) => targetIds.has(asset.id)))
+    setThumbnailMetrics((current) => subtractThumbnailMetrics(current, clearedThumbnailMetrics))
     setLibraryAssets((current) =>
       current.map((asset) => {
         if (!targetIds.has(asset.id)) return asset
@@ -1347,12 +1388,16 @@ export default function App() {
 
       const updates = new Map(pendingAssetUpdates)
       pendingAssetUpdates.clear()
+      const generated = thumbnailMetricsFromUpdates(updates.values())
       setLibraryAssets((current) =>
         current.map((currentAsset) => {
           const update = updates.get(currentAsset.id)
           return update ? { ...currentAsset, ...update } : currentAsset
         }),
       )
+      if (generated.generatedCount > 0 || generated.cacheSize > 0) {
+        setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
+      }
     }
 
     const updateGenerationProgress = (index: number, asset: Asset, force = false) => {
@@ -1445,6 +1490,7 @@ export default function App() {
     thumbnailRunRef.current += 1
     cancelNativeThumbnailGeneration()
     revokeThumbnailUrls(libraryAssetsRef.current)
+    setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     if (libraryRootPath) {
       void invoke('clear_thumbnail_cache', { libraryRoot: libraryRootPath }).catch(() => undefined)
     }

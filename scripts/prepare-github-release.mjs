@@ -22,8 +22,26 @@ async function listFiles(dirPath) {
   }
 }
 
+function versionParts(value) {
+  const match = value.match(/v?(\d+(?:\.\d+){1,3})/)
+  return match ? match[1].split('.').map((part) => Number(part)) : []
+}
+
+function compareVersions(a, b) {
+  const aParts = versionParts(a)
+  const bParts = versionParts(b)
+  const length = Math.max(aParts.length, bParts.length)
+
+  for (let index = 0; index < length; index += 1) {
+    const diff = (aParts[index] ?? 0) - (bParts[index] ?? 0)
+    if (diff !== 0) return diff
+  }
+
+  return a.localeCompare(b)
+}
+
 function newest(files) {
-  return files.sort((a, b) => a.localeCompare(b)).at(-1)
+  return [...files].sort(compareVersions).at(-1)
 }
 
 function tauriPlatformKey() {
