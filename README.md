@@ -20,6 +20,12 @@ npm run build
 npm run lint
 ```
 
+Large local-library stress tests can be generated without extra dependencies:
+
+```bash
+npm run stress:create -- --count=25000 --folders=120 --output=/tmp/picman-stress-25000 --clean
+```
+
 Desktop commands are available after Rust is installed:
 
 ```bash

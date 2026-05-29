@@ -12,7 +12,7 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { assets as sampleAssets } from './data/mockLibrary'
-import { buildFolders, folderName, revokePreviewUrls, revokeThumbnailUrls, scanFiles } from './lib/library'
+import { buildFolders, folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
 import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
 import { sortAssets } from './lib/sort'
 import type {
@@ -377,6 +377,7 @@ async function createNativeThumbnail(
 
 export default function App() {
   const folderInputRef = useRef<HTMLInputElement>(null)
+  const activeBrowserScanRef = useRef<string | null>(null)
   const activeNativeScanRef = useRef<ActiveNativeScan | null>(null)
   const activeNativeThumbnailJobRef = useRef<ActiveNativeThumbnailJob | null>(null)
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
@@ -984,6 +985,7 @@ export default function App() {
     const scanId = createScanId()
     const optimisticLibraryName = libraryNameFromPath(rootPath)
 
+    activeBrowserScanRef.current = null
     disposeActiveNativeScan()
     cancelNativeThumbnailGeneration()
     activeNativeScanRef.current = {
@@ -1059,17 +1061,16 @@ export default function App() {
   async function handleFolderSelection(files: FileList | null) {
     if (!files?.length) return
 
+    const scanId = createScanId()
+    const nextLibraryName = files[0].webkitRelativePath?.split('/')[0] || 'Local Library'
+    activeBrowserScanRef.current = scanId
     disposeActiveNativeScan()
     cancelNativeThumbnailGeneration()
-    setStatusMessage('正在扫描资源目录...')
-    const scanned = (await scanFiles(files)).map(withAssetSearchText)
-    const nextLibraryName = files[0].webkitRelativePath?.split('/')[0] || 'Local Library'
-    const first = scanned[0]
     thumbnailRunRef.current += 1
 
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
-      return scanned
+      return []
     })
     setLibraryRootPath(null)
     setLibraryName(nextLibraryName)
@@ -1086,12 +1087,38 @@ export default function App() {
       total: 0,
     })
     setSettingsOpen(false)
-    setStatusMessage(`${nextLibraryName} · ${scanned.length} 个素材`)
+    setStatusMessage(`${nextLibraryName} · 正在分批扫描资源目录...`)
 
-    if (first) {
-      setSelectedIds(new Set([first.id]))
-      setPrimaryId(first.id)
-    } else {
+    let firstAssetSelected = false
+    let scannedTotal = 0
+
+    const total = await scanFilesInBatches(
+      files,
+      (batch, scanned) => {
+        const incoming = batch.map(withAssetSearchText)
+        scannedTotal = scanned
+
+        startTransition(() => {
+          setLibraryAssets((current) => [...current, ...incoming])
+        })
+
+        if (!firstAssetSelected && incoming[0]) {
+          firstAssetSelected = true
+          setSelectedIds(new Set([incoming[0].id]))
+          setPrimaryId(incoming[0].id)
+        }
+
+        setStatusMessage(`${nextLibraryName} · 正在扫描 ${scanned} 个素材`)
+      },
+      500,
+      () => activeBrowserScanRef.current === scanId,
+    )
+
+    if (activeBrowserScanRef.current !== scanId) return
+    activeBrowserScanRef.current = null
+    setStatusMessage(`${nextLibraryName} · ${scannedTotal || total} 个素材`)
+
+    if (total === 0) {
       setSelectedIds(new Set())
       setPrimaryId(null)
     }

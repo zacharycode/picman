@@ -12,7 +12,8 @@
     "release:publish": "npm run release:github && node scripts/publish-github-release.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "stress:create": "node scripts/create-stress-library.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

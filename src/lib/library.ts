@@ -116,7 +116,71 @@ export async function getImageDimensions(url: string, kind: AssetKind, file?: Fi
   return loadImageDimensions(url)
 }
 
+function isSupportedImageFile(file: File) {
+  const ext = file.name.split('.').pop()?.toLowerCase()
+  return ext ? imageExtensions.has(ext) : file.type.startsWith('image/')
+}
+
+function fileToAsset(file: File, index: number): Asset {
+  const relativePath = file.webkitRelativePath || file.name
+  const kind = getKind(file.name)
+
+  return {
+    id: `local_${index}_${file.name}_${file.lastModified}`,
+    name: file.name,
+    folder: normalizeFolder(relativePath),
+    relativePath,
+    sourcePath: undefined,
+    kind,
+    sizeKb: Math.max(1, Math.round(file.size / 1024)),
+    dimensions: 'unknown',
+    tags: [],
+    favorite: false,
+    note: 'Imported from local folder.',
+    thumbnailReady: false,
+    modifiedAt: new Date(file.lastModified).toISOString().slice(0, 10),
+    swatch: swatches[index % swatches.length],
+    previewUrl: URL.createObjectURL(file),
+  }
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve())
+  })
+}
+
 export async function scanFiles(files: FileList) {
+  return Array.from(files)
+    .filter(isSupportedImageFile)
+    .map((file, index) => fileToAsset(file, index))
+}
+
+export async function scanFilesInBatches(
+  files: FileList,
+  onBatch: (assets: Asset[], scanned: number, total: number) => void,
+  batchSize = 500,
+  shouldContinue?: () => boolean,
+) {
+  const picked = Array.from(files).filter(isSupportedImageFile)
+
+  for (let index = 0; index < picked.length; index += batchSize) {
+    if (shouldContinue && !shouldContinue()) return index
+
+    const batch = picked
+      .slice(index, index + batchSize)
+      .map((file, offset) => fileToAsset(file, index + offset))
+
+    onBatch(batch, Math.min(index + batch.length, picked.length), picked.length)
+    await nextFrame()
+
+    if (shouldContinue && !shouldContinue()) return Math.min(index + batch.length, picked.length)
+  }
+
+  return picked.length
+}
+
+export async function scanFilesWithDimensions(files: FileList) {
   const picked = Array.from(files).filter((file) => {
     const ext = file.name.split('.').pop()?.toLowerCase()
     return ext ? imageExtensions.has(ext) : file.type.startsWith('image/')
