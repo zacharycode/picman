@@ -47,6 +47,8 @@ const SCAN_ERROR_EVENT = 'picman-library-scan-error'
 const SCAN_FINISHED_EVENT = 'picman-library-scan-finished'
 const THUMBNAIL_BATCH_EVENT = 'picman-thumbnail-batch'
 const THUMBNAIL_FINISHED_EVENT = 'picman-thumbnail-finished'
+const THUMBNAIL_UPDATE_FLUSH_MS = 180
+const THUMBNAIL_UPDATE_FLUSH_THRESHOLD = 256
 
 type EncodedThumbnail = {
   format: ThumbnailFormat
@@ -143,8 +145,18 @@ type RefreshMergeResult = {
   removedAssets: Asset[]
 }
 
+type NativeThumbnailProgressSnapshot = {
+  completed: number
+  currentName?: string
+  failed: number
+  total: number
+}
+
 type ActiveNativeThumbnailJob = {
+  flushTimer?: number
   id: string
+  pendingUpdates: Map<string, Partial<Asset>>
+  progress: NativeThumbnailProgressSnapshot
   quality: ThumbnailQuality
   scopeLabel: string
   total: number
@@ -581,19 +593,63 @@ export default function App() {
 
   const cancelNativeThumbnailGeneration = useCallback((jobId?: string | null) => {
     const activeJobId = jobId ?? activeNativeThumbnailJobRef.current?.id ?? null
+    const activeJob = activeNativeThumbnailJobRef.current
+    if (activeJob?.flushTimer) window.clearTimeout(activeJob.flushTimer)
     activeNativeThumbnailJobRef.current = null
     void invoke('cancel_thumbnail_generation', { jobId: activeJobId }).catch(() => undefined)
   }, [])
 
-  const applyNativeThumbnailBatch = useCallback((job: ActiveNativeThumbnailJob, payload: NativeThumbnailBatchPayload) => {
-    const updates = new Map(
-      payload.updates.map((update) => {
+  const flushNativeThumbnailUpdates = useCallback((jobId: string) => {
+    const job = activeNativeThumbnailJobRef.current
+    if (!job || job.id !== jobId) return
+
+    if (job.flushTimer) {
+      window.clearTimeout(job.flushTimer)
+      job.flushTimer = undefined
+    }
+
+    const updates = new Map(job.pendingUpdates)
+    job.pendingUpdates.clear()
+
+    if (updates.size > 0) {
+      startTransition(() => {
+        setLibraryAssets((current) =>
+          current.map((asset) => {
+            const update = updates.get(asset.id)
+            return update ? { ...asset, ...update } : asset
+          }),
+        )
+      })
+    }
+
+    setThumbnailGeneration({
+      completed: job.progress.completed,
+      currentName: job.progress.currentName,
+      failed: job.progress.failed,
+      quality: job.quality,
+      scopeLabel: job.scopeLabel,
+      status: 'running',
+      total: job.progress.total,
+    })
+    setStatusMessage(`正在生成缩略图：${job.scopeLabel} · ${job.progress.completed}/${job.progress.total}`)
+  }, [])
+
+  const queueNativeThumbnailBatch = useCallback(
+    (job: ActiveNativeThumbnailJob, payload: NativeThumbnailBatchPayload) => {
+      job.progress = {
+        completed: payload.completed,
+        currentName: payload.currentName ?? undefined,
+        failed: payload.failed,
+        total: payload.total,
+      }
+
+      for (const update of payload.updates) {
         const thumbnailPath = update.path ?? undefined
         const thumbnailUrl = thumbnailPath
           ? withCacheToken(convertFileSrc(thumbnailPath), `${payload.jobId}-${payload.completed}-${update.assetId}`)
           : undefined
 
-        return [
+        job.pendingUpdates.set(
           update.assetId,
           {
             thumbnailError: update.error ?? undefined,
@@ -607,29 +663,20 @@ export default function App() {
             thumbnailVersion: thumbnailPath ? `${payload.jobId}-${payload.completed}` : undefined,
             thumbnailWidth: update.width ?? undefined,
           } satisfies Partial<Asset>,
-        ]
-      }),
-    )
+        )
+      }
 
-    startTransition(() => {
-      setLibraryAssets((current) =>
-        current.map((asset) => {
-          const update = updates.get(asset.id)
-          return update ? { ...asset, ...update } : asset
-        }),
-      )
-    })
+      if (job.pendingUpdates.size >= THUMBNAIL_UPDATE_FLUSH_THRESHOLD) {
+        flushNativeThumbnailUpdates(job.id)
+        return
+      }
 
-    setThumbnailGeneration({
-      completed: payload.completed,
-      currentName: payload.currentName ?? undefined,
-      failed: payload.failed,
-      quality: job.quality,
-      scopeLabel: job.scopeLabel,
-      status: 'running',
-      total: payload.total,
-    })
-  }, [])
+      if (!job.flushTimer) {
+        job.flushTimer = window.setTimeout(() => flushNativeThumbnailUpdates(job.id), THUMBNAIL_UPDATE_FLUSH_MS)
+      }
+    },
+    [flushNativeThumbnailUpdates],
+  )
 
   useEffect(() => {
     let disposed = false
@@ -707,13 +754,13 @@ export default function App() {
         const job = activeNativeThumbnailJobRef.current
         if (!job || job.id !== event.payload.jobId) return
 
-        applyNativeThumbnailBatch(job, event.payload)
-        setStatusMessage(`正在生成缩略图：${job.scopeLabel} · ${event.payload.completed}/${event.payload.total}`)
+        queueNativeThumbnailBatch(job, event.payload)
       })
       const unlistenFinished = await listen<NativeThumbnailFinishedPayload>(THUMBNAIL_FINISHED_EVENT, (event) => {
         const job = activeNativeThumbnailJobRef.current
         if (!job || job.id !== event.payload.jobId) return
 
+        flushNativeThumbnailUpdates(job.id)
         activeNativeThumbnailJobRef.current = null
 
         if (event.payload.cancelled) {
@@ -757,10 +804,12 @@ export default function App() {
 
     return () => {
       disposed = true
+      const activeJob = activeNativeThumbnailJobRef.current
+      if (activeJob?.flushTimer) window.clearTimeout(activeJob.flushTimer)
       activeNativeThumbnailJobRef.current = null
       for (const unlisten of unlisteners) unlisten()
     }
-  }, [applyNativeThumbnailBatch])
+  }, [flushNativeThumbnailUpdates, queueNativeThumbnailBatch])
 
   const handleVisualOrderChange = useCallback(
     (ids: string[]) => {
@@ -1138,6 +1187,13 @@ export default function App() {
       const jobId = createThumbnailJobId(runId)
       activeNativeThumbnailJobRef.current = {
         id: jobId,
+        pendingUpdates: new Map(),
+        progress: {
+          completed: 0,
+          currentName: firstName,
+          failed: 0,
+          total: targetAssets.length,
+        },
         quality,
         scopeLabel,
         total: targetAssets.length,

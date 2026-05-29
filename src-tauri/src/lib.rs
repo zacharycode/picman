@@ -18,7 +18,7 @@ const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
 const SCAN_ERROR_EVENT: &str = "picman-library-scan-error";
 const SCAN_FINISHED_EVENT: &str = "picman-library-scan-finished";
-const THUMBNAIL_BATCH_SIZE: usize = 64;
+const THUMBNAIL_BATCH_SIZE: usize = 128;
 const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
 
