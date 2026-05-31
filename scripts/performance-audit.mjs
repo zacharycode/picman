@@ -117,6 +117,36 @@ async function main() {
     'allow_library_asset_scope + .picman',
   )
   assertCheck(checks, tauriSource.includes('has_visible_alpha') && tauriSource.includes('passthrough_limit_bytes'), '缩略图编码按实际透明度与体积限制优化', 'alpha-aware encoding')
+  assertCheck(
+    checks,
+    tauriSource.includes('existing_thumbnail_for_quality') &&
+      tauriSource.includes('existing_thumbnail_cache_hit') &&
+      appSource.includes('thumbnailPath') &&
+      appSource.includes('convertFileSrc(asset.thumbnailPath)'),
+    '打开资源目录时恢复已有缩略图缓存',
+    'existing thumbnail cache restore',
+  )
+  assertCheck(
+    checks,
+    tauriSource.includes('if let Some(existing) = existing_thumbnail_for_quality'),
+    '生成缩略图前跳过未变化缓存',
+    'skip unchanged thumbnail cache',
+  )
+  assertCheck(
+    checks,
+    libraryViewSource.includes('VIRTUAL_FAST_OVERSCAN_PX') &&
+      libraryViewSource.includes('FAST_SCROLL_VELOCITY_PX_PER_MS') &&
+      libraryViewSource.includes('deferThumbnailLoad'),
+    '快速滚动使用动态预渲染和缩略图降级',
+    'fast scroll overscan + deferred images',
+  )
+  assertCheck(
+    checks,
+    libraryViewSource.includes('translate3d') &&
+      (await readProjectFile('src/components/AssetItem.tsx')).includes('decoding="async"'),
+    '虚拟项使用合成层位移并异步解码图片',
+    'translate3d + async decoding',
+  )
 
   if (options.library) {
     const { fileCount, folderCount } = await countLibraryImages(options.library)

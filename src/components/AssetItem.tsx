@@ -6,6 +6,7 @@ import type { Asset, AssetViewMode } from '../types/library'
 
 type AssetItemProps = {
   asset: Asset
+  deferThumbnailLoad?: boolean
   primary: boolean
   selected: boolean
   style?: CSSProperties
@@ -27,11 +28,25 @@ function getAssetRatio(asset: Asset) {
   return `${width} / ${height}`
 }
 
-export function AssetItem({ asset, primary, selected, style, viewMode, onClick, onDoubleClick }: AssetItemProps) {
+export function AssetItem({
+  asset,
+  deferThumbnailLoad = false,
+  primary,
+  selected,
+  style,
+  viewMode,
+  onClick,
+  onDoubleClick,
+}: AssetItemProps) {
   const isList = viewMode === 'list'
   const [failedThumbnailKey, setFailedThumbnailKey] = useState<string | null>(null)
   const thumbnailKey = `${asset.thumbnailUrl ?? ''}:${asset.thumbnailQuality ?? 'none'}:${asset.thumbnailReady}`
-  const showThumbnail = asset.thumbnailReady && asset.thumbnailUrl && failedThumbnailKey !== thumbnailKey
+  const showThumbnail = !deferThumbnailLoad && asset.thumbnailReady && asset.thumbnailUrl && failedThumbnailKey !== thumbnailKey
+  const placeholderLabel = asset.thumbnailReady && deferThumbnailLoad
+    ? '加载中'
+    : asset.thumbnailReady || asset.thumbnailError
+      ? '加载失败'
+      : '待生成'
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === 'Enter' || event.key === ' ') {
@@ -58,11 +73,18 @@ export function AssetItem({ asset, primary, selected, style, viewMode, onClick, 
         style={viewMode === 'masonry' ? { aspectRatio: getAssetRatio(asset) } : undefined}
       >
         {showThumbnail ? (
-          <img src={asset.thumbnailUrl} alt="" onError={() => setFailedThumbnailKey(thumbnailKey)} />
+          <img
+            alt=""
+            decoding="async"
+            draggable={false}
+            loading="lazy"
+            src={asset.thumbnailUrl}
+            onError={() => setFailedThumbnailKey(thumbnailKey)}
+          />
         ) : (
           <div className={`asset-thumb-swatch thumbnail-placeholder ${asset.swatch}`}>
             <FileImage size={28} />
-            <span>{asset.thumbnailReady || asset.thumbnailError ? '加载失败' : '待生成'}</span>
+            <span>{placeholderLabel}</span>
           </div>
         )}
         <span className="type-badge">{asset.kind.toUpperCase()}</span>

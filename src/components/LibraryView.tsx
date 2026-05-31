@@ -37,6 +37,9 @@ const MASONRY_PADDING_TOP = 12
 const MASONRY_PADDING_BOTTOM = 28
 const MASONRY_TEXT_HEIGHT = 42
 const VIRTUAL_OVERSCAN_PX = 900
+const VIRTUAL_FAST_OVERSCAN_PX = 2400
+const FAST_SCROLL_SETTLE_MS = 120
+const FAST_SCROLL_VELOCITY_PX_PER_MS = 1.2
 const VIEW_MODE_LABELS: Record<AssetViewMode, string> = {
   adaptive: '自适应',
   masonry: '瀑布流',
@@ -49,6 +52,8 @@ type AssetGridStyle = CSSProperties & {
 
 type ViewportState = {
   height: number
+  scrollDirection: 'down' | 'up'
+  scrollSpeed: number
   scrollTop: number
   width: number
 }
@@ -91,6 +96,27 @@ type MasonryLayoutData = {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
+}
+
+function virtualItemStyle(left: number, top: number, style: CSSProperties): CSSProperties {
+  return {
+    ...style,
+    left: 0,
+    position: 'absolute',
+    top: 0,
+    transform: `translate3d(${left}px, ${top}px, 0)`,
+  }
+}
+
+function getOverscanWindow(viewport: ViewportState) {
+  const fastAmount = clamp(viewport.scrollSpeed / FAST_SCROLL_VELOCITY_PX_PER_MS, 0, 1)
+  const overscan = VIRTUAL_OVERSCAN_PX + (VIRTUAL_FAST_OVERSCAN_PX - VIRTUAL_OVERSCAN_PX) * fastAmount
+  const leading = Math.round(overscan)
+  const trailing = Math.round(overscan * (fastAmount > 0 ? 0.45 : 1))
+
+  return viewport.scrollDirection === 'down'
+    ? { after: leading, before: trailing }
+    : { after: trailing, before: leading }
 }
 
 function getAssetNumberRatio(asset?: Asset) {
@@ -145,13 +171,14 @@ function createAdaptiveLayout(
   metrics: AdaptiveLayoutMetrics,
 ): VirtualLayout {
   const viewportHeight = Math.max(1, viewport.height || 620)
+  const overscan = getOverscanWindow(viewport)
   const firstRow = Math.max(
     0,
-    Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
+    Math.floor((viewport.scrollTop - overscan.before - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
   )
   const lastRow = Math.min(
     Math.ceil(assetIds.length / metrics.columns) - 1,
-    Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
+    Math.ceil((viewport.scrollTop + viewportHeight + overscan.after - ADAPTIVE_PADDING_TOP) / metrics.rowPitch),
   )
   const startIndex = firstRow * metrics.columns
   const endIndex = Math.min(assetIds.length, (lastRow + 1) * metrics.columns)
@@ -163,13 +190,10 @@ function createAdaptiveLayout(
     const column = index % metrics.columns
     items.push({
       assetId,
-      style: {
+      style: virtualItemStyle(ADAPTIVE_PADDING_X + column * (metrics.itemWidth + ADAPTIVE_GAP_X), ADAPTIVE_PADDING_TOP + row * metrics.rowPitch, {
         height: metrics.itemHeight,
-        left: ADAPTIVE_PADDING_X + column * (metrics.itemWidth + ADAPTIVE_GAP_X),
-        position: 'absolute',
-        top: ADAPTIVE_PADDING_TOP + row * metrics.rowPitch,
         width: metrics.itemWidth,
-      },
+      }),
     })
   }
 
@@ -189,13 +213,14 @@ function getListPosition(index: number): VirtualPosition {
 function createListLayout(assetIds: string[], viewport: ViewportState): VirtualLayout {
   const viewportHeight = Math.max(1, viewport.height || 620)
   const totalHeight = LIST_PADDING_TOP + assetIds.length * LIST_ROW_HEIGHT + LIST_PADDING_BOTTOM
+  const overscan = getOverscanWindow(viewport)
   const firstIndex = Math.max(
     0,
-    Math.floor((viewport.scrollTop - VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
+    Math.floor((viewport.scrollTop - overscan.before - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
   )
   const lastIndex = Math.min(
     assetIds.length - 1,
-    Math.ceil((viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
+    Math.ceil((viewport.scrollTop + viewportHeight + overscan.after - LIST_PADDING_TOP) / LIST_ROW_HEIGHT),
   )
   const items: VirtualAssetItem[] = []
 
@@ -203,13 +228,10 @@ function createListLayout(assetIds: string[], viewport: ViewportState): VirtualL
     const assetId = assetIds[index]
     items.push({
       assetId,
-      style: {
+      style: virtualItemStyle(0, LIST_PADDING_TOP + index * LIST_ROW_HEIGHT, {
         height: LIST_ROW_HEIGHT,
-        left: 0,
-        position: 'absolute',
         right: 0,
-        top: LIST_PADDING_TOP + index * LIST_ROW_HEIGHT,
-      },
+      }),
     })
   }
 
@@ -250,12 +272,9 @@ function createMasonryLayoutData(
     items.push({
       assetId,
       height: itemHeight,
-      style: {
-        left,
-        position: 'absolute',
-        top,
+      style: virtualItemStyle(left, top, {
         width: columnWidth,
-      },
+      }),
       top,
     })
     positionById.set(assetId, { height: itemHeight, top })
@@ -298,8 +317,9 @@ function lowerBoundMasonryItems(items: MasonryVirtualItem[], targetTop: number) 
 
 function createMasonryLayout(layoutData: MasonryLayoutData, viewport: ViewportState): VirtualLayout {
   const viewportHeight = Math.max(1, viewport.height || 620)
-  const minTop = viewport.scrollTop - VIRTUAL_OVERSCAN_PX
-  const maxTop = viewport.scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX
+  const overscan = getOverscanWindow(viewport)
+  const minTop = viewport.scrollTop - overscan.before
+  const maxTop = viewport.scrollTop + viewportHeight + overscan.after
   const startIndex = lowerBoundMasonryItems(layoutData.items, minTop - layoutData.maxItemHeight)
   const items: VirtualAssetItem[] = []
 
@@ -400,7 +420,17 @@ export function LibraryView({
 }: LibraryViewProps) {
   const [inspectorWidth, setInspectorWidth] = useState(202)
   const [searchText, setSearchText] = useState(query)
-  const [viewport, setViewport] = useState<ViewportState>({ height: 620, scrollTop: 0, width: 960 })
+  const [viewport, setViewport] = useState<ViewportState>({
+    height: 620,
+    scrollDirection: 'down',
+    scrollSpeed: 0,
+    scrollTop: 0,
+    width: 960,
+  })
+  const [isFastScrolling, setIsFastScrolling] = useState(false)
+  const fastScrollTimeoutRef = useRef<number | null>(null)
+  const fastScrollingRef = useRef(false)
+  const scrollSampleRef = useRef({ scrollTop: 0, time: 0 })
   const searchComposingRef = useRef(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const libraryGridColumns = inspectorVisible ? `minmax(0, 1fr) 5px ${inspectorWidth}px` : 'minmax(0, 1fr)'
@@ -479,14 +509,44 @@ export function LibraryView({
     let frameId = 0
     const measure = () => {
       frameId = 0
+      const now = window.performance.now()
+      const previousSample = scrollSampleRef.current
+      const deltaY = container.scrollTop - previousSample.scrollTop
+      const elapsed = Math.max(1, now - previousSample.time)
+      const scrollSpeed = Math.abs(deltaY) / elapsed
+      const scrollDirection: ViewportState['scrollDirection'] = deltaY < 0 ? 'up' : 'down'
+      scrollSampleRef.current = {
+        scrollTop: container.scrollTop,
+        time: now,
+      }
+
+      if (Math.abs(deltaY) > 4 && scrollSpeed >= FAST_SCROLL_VELOCITY_PX_PER_MS) {
+        if (!fastScrollingRef.current) {
+          fastScrollingRef.current = true
+          setIsFastScrolling(true)
+        }
+        if (fastScrollTimeoutRef.current) window.clearTimeout(fastScrollTimeoutRef.current)
+        fastScrollTimeoutRef.current = window.setTimeout(() => {
+          fastScrollingRef.current = false
+          fastScrollTimeoutRef.current = null
+          setIsFastScrolling(false)
+        }, FAST_SCROLL_SETTLE_MS)
+      }
+
       setViewport((current) => {
         const next = {
           height: container.clientHeight,
+          scrollDirection,
+          scrollSpeed,
           scrollTop: container.scrollTop,
           width: container.clientWidth,
         }
 
-        return current.height === next.height && current.scrollTop === next.scrollTop && current.width === next.width
+        return current.height === next.height &&
+          current.scrollDirection === next.scrollDirection &&
+          current.scrollSpeed === next.scrollSpeed &&
+          current.scrollTop === next.scrollTop &&
+          current.width === next.width
           ? current
           : next
       })
@@ -503,6 +563,7 @@ export function LibraryView({
 
     return () => {
       if (frameId) window.cancelAnimationFrame(frameId)
+      if (fastScrollTimeoutRef.current) window.clearTimeout(fastScrollTimeoutRef.current)
       resizeObserver.disconnect()
       container.removeEventListener('scroll', scheduleMeasure)
     }
@@ -746,7 +807,7 @@ export function LibraryView({
             </button>
           </div>
         ) : (
-          <div ref={scrollRef} className="assets-scroll">
+          <div ref={scrollRef} className={`assets-scroll ${isFastScrolling ? 'is-fast-scrolling' : ''}`}>
             <div
               className={`asset-grid asset-grid--${viewMode} asset-grid--virtual`}
               style={{ ...assetGridStyle, height: virtualLayout.totalHeight }}
@@ -759,13 +820,14 @@ export function LibraryView({
                   <AssetItem
                     key={asset.id}
                     asset={asset}
-                    primary={primaryAsset?.id === asset.id}
-                    selected={selectedIds.has(asset.id)}
-                    style={style}
-                    viewMode={viewMode}
-                    onClick={(event) => onAssetClick(asset, event)}
-                    onDoubleClick={() => onAssetDoubleClick(asset)}
-                  />
+	                    primary={primaryAsset?.id === asset.id}
+	                    selected={selectedIds.has(asset.id)}
+	                    style={style}
+	                    viewMode={viewMode}
+	                    deferThumbnailLoad={isFastScrolling}
+	                    onClick={(event) => onAssetClick(asset, event)}
+	                    onDoubleClick={() => onAssetDoubleClick(asset)}
+	                  />
                 )
               })}
             </div>

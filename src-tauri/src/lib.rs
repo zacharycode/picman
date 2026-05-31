@@ -23,6 +23,7 @@ const THUMBNAIL_BATCH_SIZE: usize = 128;
 const THUMBNAIL_MAX_WORKERS: usize = 3;
 const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
+const THUMBNAIL_QUALITY_RESTORE_ORDER: [&str; 3] = ["standard", "high", "compact"];
 
 #[derive(Clone, Default)]
 struct ThumbnailJobState {
@@ -86,7 +87,13 @@ struct ScannedAsset {
     source_path: String,
     swatch: String,
     tags: Vec<String>,
+    thumbnail_format: Option<String>,
+    thumbnail_height: Option<u32>,
+    thumbnail_path: Option<String>,
+    thumbnail_quality: Option<String>,
     thumbnail_ready: bool,
+    thumbnail_size_kb: Option<u64>,
+    thumbnail_width: Option<u32>,
     width: Option<u32>,
 }
 
@@ -153,6 +160,11 @@ struct ThumbnailWorkerResult {
     current_name: Option<String>,
     is_failed: bool,
     update: ThumbnailUpdatePayload,
+}
+
+struct ThumbnailCacheHit {
+    quality: &'static str,
+    result: ThumbnailResult,
 }
 
 #[derive(Debug)]
@@ -355,6 +367,88 @@ fn cache_hash(
     format!("{digest:x}")
 }
 
+fn thumbnail_cache_dir(root: &Path, quality: &str) -> PathBuf {
+    root.join(".picman")
+        .join("cache")
+        .join("thumbnails")
+        .join(quality)
+}
+
+fn cached_thumbnail_candidates(source: &ThumbnailSource) -> &'static [(&'static str, &'static str)] {
+    if source.kind == "svg"
+        || source
+            .source_path
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.eq_ignore_ascii_case("svg"))
+            .unwrap_or(false)
+    {
+        &[("svg", "svg")]
+    } else {
+        &[("jpg", "jpeg"), ("png", "png"), ("webp", "webp"), ("jpeg", "jpeg")]
+    }
+}
+
+fn cached_thumbnail_dimensions(
+    source_path: &Path,
+    cached_path: &Path,
+    format: &str,
+    preset: &ThumbnailPreset,
+) -> (u32, u32) {
+    if format == "svg" {
+        let (_, width, height) = image_dimensions(source_path);
+        return (width.unwrap_or(preset.max_edge), height.unwrap_or(preset.max_edge));
+    }
+
+    image::image_dimensions(cached_path).unwrap_or((preset.max_edge, preset.max_edge))
+}
+
+fn existing_thumbnail_for_quality(
+    root: &Path,
+    source: &ThumbnailSource,
+    quality: &str,
+    metadata: &fs::Metadata,
+) -> Option<ThumbnailResult> {
+    let hash = cache_hash(root, source, quality, metadata);
+    let cache_dir = thumbnail_cache_dir(root, quality);
+    let source_path = Path::new(&source.source_path);
+    let preset = thumbnail_preset(quality);
+
+    for (extension, format) in cached_thumbnail_candidates(source) {
+        let output_path = cache_dir.join(format!("{hash}.{extension}"));
+        if !output_path.is_file() {
+            continue;
+        }
+
+        let output_metadata = fs::metadata(&output_path).ok()?;
+        let (width, height) =
+            cached_thumbnail_dimensions(source_path, &output_path, format, &preset);
+
+        return Some(ThumbnailResult {
+            format: (*format).to_string(),
+            height,
+            path: normalize_path(&output_path),
+            size_kb: std::cmp::max(1, output_metadata.len().div_ceil(1024)),
+            width,
+        });
+    }
+
+    None
+}
+
+fn existing_thumbnail_cache_hit(
+    root: &Path,
+    source: &ThumbnailSource,
+    metadata: &fs::Metadata,
+) -> Option<ThumbnailCacheHit> {
+    for quality in THUMBNAIL_QUALITY_RESTORE_ORDER {
+        if let Some(result) = existing_thumbnail_for_quality(root, source, quality, metadata) {
+            return Some(ThumbnailCacheHit { quality, result });
+        }
+    }
+
+    None
+}
+
 fn has_alpha(color: ColorType) -> bool {
     matches!(
         color,
@@ -449,13 +543,22 @@ fn scanned_asset_from_path(root: &Path, path: &Path, index: usize) -> Option<Sca
         ("unknown".to_string(), None, None)
     };
     let modified = modified_seconds(&metadata);
+    let id = asset_id(&normalized_relative_path, metadata.len(), modified);
+    let source_path = normalize_path(path);
+    let thumbnail_source = ThumbnailSource {
+        id: id.clone(),
+        kind: kind.to_string(),
+        relative_path: normalized_relative_path.clone(),
+        source_path: source_path.clone(),
+    };
+    let cached_thumbnail = existing_thumbnail_cache_hit(root, &thumbnail_source, &metadata);
 
     Some(ScannedAsset {
         dimensions,
         favorite: false,
         folder: normalize_folder(&normalized_relative_path),
         height,
-        id: asset_id(&normalized_relative_path, metadata.len(), modified),
+        id,
         kind: kind.to_string(),
         modified_at: modified_date(&metadata),
         name: path
@@ -466,10 +569,28 @@ fn scanned_asset_from_path(root: &Path, path: &Path, index: usize) -> Option<Sca
         preview_url: None,
         relative_path: normalized_relative_path,
         size_kb: std::cmp::max(1, metadata.len().div_ceil(1024)),
-        source_path: normalize_path(path),
+        source_path,
         swatch: swatch_for(index).to_string(),
         tags: Vec::new(),
-        thumbnail_ready: false,
+        thumbnail_format: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.result.format.clone()),
+        thumbnail_height: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.result.height),
+        thumbnail_path: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.result.path.clone()),
+        thumbnail_quality: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.quality.to_string()),
+        thumbnail_ready: cached_thumbnail.is_some(),
+        thumbnail_size_kb: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.result.size_kb),
+        thumbnail_width: cached_thumbnail
+            .as_ref()
+            .map(|thumbnail| thumbnail.result.width),
         width,
     })
 }
@@ -622,12 +743,12 @@ fn generate_thumbnail_result(
         fs::metadata(&source_path).map_err(|error| format!("无法读取源文件：{error}"))?;
     let preset = thumbnail_preset(quality);
     let hash = cache_hash(root, source, quality, &metadata);
-    let cache_dir = root
-        .join(".picman")
-        .join("cache")
-        .join("thumbnails")
-        .join(quality);
+    let cache_dir = thumbnail_cache_dir(root, quality);
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建缩略图缓存目录：{error}"))?;
+
+    if let Some(existing) = existing_thumbnail_for_quality(root, source, quality, &metadata) {
+        return Ok(existing);
+    }
 
     if source.kind == "svg"
         || source_path
@@ -1080,6 +1201,64 @@ mod tests {
         assert_eq!(result.format, "jpeg");
         assert_eq!(result.width, 160);
         assert!(thumbnail_size < source_size);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_thumbnail_cache_is_reused_before_source_decode() {
+        let root = test_root("reuse-existing");
+        let source_path = root.join("broken.jpg");
+        fs::write(&source_path, b"not a decodable image").unwrap();
+        let source = ThumbnailSource {
+            id: "asset-broken".to_string(),
+            kind: "jpg".to_string(),
+            relative_path: "broken.jpg".to_string(),
+            source_path: normalize_path(&source_path),
+        };
+        let metadata = fs::metadata(&source_path).unwrap();
+        let hash = cache_hash(&root, &source, "standard", &metadata);
+        let cache_dir = thumbnail_cache_dir(&root, "standard");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cached_path = cache_dir.join(format!("{hash}.png"));
+        write_rgba_png(&cached_path, 32, 24, false);
+
+        let result = generate_thumbnail_result(&root, &source, "standard").unwrap();
+
+        assert_eq!(result.format, "png");
+        assert_eq!(result.height, 24);
+        assert_eq!(result.path, normalize_path(&cached_path));
+        assert_eq!(result.width, 32);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_restores_existing_thumbnail_cache() {
+        let root = test_root("scan-restore");
+        let source_path = root.join("scan-restore.png");
+        write_rgba_png(&source_path, 512, 384, false);
+        let initial_scan = scanned_asset_from_path(&root, &source_path, 0).unwrap();
+        let source = ThumbnailSource {
+            id: initial_scan.id,
+            kind: initial_scan.kind,
+            relative_path: initial_scan.relative_path,
+            source_path: initial_scan.source_path,
+        };
+        let generated = generate_thumbnail_result(
+            &root,
+            &source,
+            "standard",
+        )
+        .unwrap();
+
+        let scanned = scanned_asset_from_path(&root, &source_path, 0).unwrap();
+
+        assert!(scanned.thumbnail_ready);
+        assert_eq!(scanned.thumbnail_format.as_deref(), Some("jpeg"));
+        assert_eq!(scanned.thumbnail_path.as_deref(), Some(generated.path.as_str()));
+        assert_eq!(scanned.thumbnail_quality.as_deref(), Some("standard"));
+        assert_eq!(scanned.thumbnail_width, Some(240));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -374,10 +374,15 @@ function createThumbnailJobId(runId: number) {
 }
 
 function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
+  const thumbnailUrl = asset.thumbnailPath
+    ? withCacheToken(convertFileSrc(asset.thumbnailPath), `${asset.id}-${asset.thumbnailQuality ?? 'cache'}`)
+    : undefined
+
   return withAssetSearchText({
     ...asset,
     previewUrl: undefined,
-    thumbnailReady: false,
+    thumbnailReady: Boolean(asset.thumbnailReady && asset.thumbnailPath),
+    thumbnailUrl,
   })
 }
 
@@ -748,10 +753,14 @@ export default function App() {
       if (firstAsset) scan.firstSelected = true
 
       appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
+      const restoredThumbnailMetrics = deriveThumbnailMetrics(incoming)
       startTransition(() => {
         setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
         setLibraryAssets((current) => [...current, ...incoming])
         setLibraryCatalogAssets((current) => [...current, ...incoming])
+        if (restoredThumbnailMetrics.generatedCount > 0 || restoredThumbnailMetrics.cacheSize > 0) {
+          setThumbnailMetrics((current) => addThumbnailMetrics(current, restoredThumbnailMetrics))
+        }
       })
 
       if (firstAsset) {

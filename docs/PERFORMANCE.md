@@ -35,8 +35,21 @@ blocking under large local folders.
    - Worker results are aggregated into batches before reaching the frontend.
    - Frontend thumbnail writes update the incremental asset store, not the
      source asset array.
+   - Existing thumbnail files under `.picman/cache/thumbnails` are reused when
+     the source file fingerprint, algorithm version, and quality still match.
 
-5. Stress verification must be repeatable.
+5. Fast scrolling must prioritize interaction smoothness.
+   - The app keeps native platform scrolling behavior.
+   - Overscan grows in the active scroll direction when scroll velocity is high.
+   - Newly mounted thumbnails can defer image loading while the user is moving
+     quickly, then load after scrolling settles.
+
+6. File-first performance artifacts must remain rebuildable.
+   - `.picman/cache` is a local performance layer, not source of truth.
+   - Future tags, metadata, and settings should remain file-readable and
+     controllable rather than being hidden in an opaque database.
+
+7. Stress verification must be repeatable.
    - Generate the large test folder:
 
      ```bash
@@ -58,6 +71,17 @@ alone. It needs both:
 - Manual or automated runtime evidence that the packaged app can open the
   25000 asset library, switch views, search, select, and generate thumbnails
   without making the interface unusable.
+
+### 2026-05-31 Runtime Evidence
+
+- `npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000`
+  passed 21/21 invariants after adding cache restore and fast-scroll checks.
+- `cargo test` passed 5 thumbnail/cache tests, including existing-cache reuse
+  before source decode and scan-time thumbnail cache restoration.
+- `npm run lint`, `npm run build`, `npm run desktop:build`, `npm run release:prepare`,
+  and codesign verification passed for v0.1.16.
+- GitHub Release `v0.1.16` was published with DMG, updater archive, signature,
+  and `latest.json`.
 
 ### 2026-05-29 Runtime Evidence
 
