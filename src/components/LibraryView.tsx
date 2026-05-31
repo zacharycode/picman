@@ -365,7 +365,9 @@ type LibraryViewProps = {
   onRefresh: () => void
   onRemoveAssetTag: (assetId: string, tag: string) => void
   onSetActiveTag: (tag: string) => void
+  onSetAssetFavorite: (assetId: string, favorite: boolean) => void
   onSetFiltersOpen: (updater: (open: boolean) => boolean) => void
+  onUpdateAssetNote: (assetId: string, note: string) => void
   onSetQuery: (query: string) => void
   onSetSortDir: (dir: SortDir) => void
   onSetSortField: (field: SortField) => void
@@ -407,7 +409,9 @@ export function LibraryView({
   onRefresh,
   onRemoveAssetTag,
   onSetActiveTag,
+  onSetAssetFavorite,
   onSetFiltersOpen,
+  onUpdateAssetNote,
   onSetQuery,
   onSetSortDir,
   onSetSortField,
@@ -865,7 +869,9 @@ export function LibraryView({
                 asset={primaryAsset}
                 onAddTag={onAddAssetTag}
                 onRemoveTag={onRemoveAssetTag}
+                onSetFavorite={onSetAssetFavorite}
                 onSelectTag={onSetActiveTag}
+                onUpdateNote={onUpdateAssetNote}
               />
             ) : (
               <EmptyInspector />

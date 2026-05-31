@@ -166,6 +166,12 @@ type ActiveNativeThumbnailJob = {
 
 type LibraryScanStatus = 'idle' | 'open' | 'refresh'
 
+type FolderAssetMetadataPayload = {
+  favorite: boolean
+  note: string
+  tags: string[]
+}
+
 type LibraryCatalogState = {
   allTags: string[]
   folders: FolderNode[]
@@ -1717,6 +1723,40 @@ export default function App() {
     }
   }
 
+  function commitAssetMetadataUpdate(updatedAsset: Asset) {
+    const updates = new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]])
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+    )
+    setLibraryAssets((current) =>
+      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
+    )
+    setLibraryCatalogAssets((current) =>
+      current.map((asset) => {
+        return asset.id === updatedAsset.id ? updatedAsset : asset
+      }),
+    )
+  }
+
+  function saveFolderAssetMetadata(asset: Asset) {
+    if (!libraryRootPath || !asset.sourcePath) return
+
+    const metadata: FolderAssetMetadataPayload = {
+      favorite: asset.favorite,
+      note: asset.note,
+      tags: asset.tags,
+    }
+
+    void invoke('write_folder_asset_metadata', {
+      libraryRoot: libraryRootPath,
+      metadata,
+      relativePath: asset.relativePath,
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : '文件夹元数据保存失败'
+      setStatusMessage(`元数据保存失败：${message}`)
+    })
+  }
+
   function addAssetTag(assetId: string, rawTag: string) {
     const tag = rawTag.trim().replace(/\s+/g, ' ')
     if (!tag) return
@@ -1728,19 +1768,9 @@ export default function App() {
     }
 
     const updatedAsset = withAssetSearchText({ ...target, tags: [...target.tags, tag] })
-    const updates = new Map<string, Partial<Asset>>([[assetId, updatedAsset]])
-    setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
-    )
-    setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
-    )
-    setLibraryCatalogAssets((current) =>
-      current.map((asset) => {
-        return asset.id === assetId ? updatedAsset : asset
-      }),
-    )
-    setStatusMessage(`已添加标签：${tag}`)
+    commitAssetMetadataUpdate(updatedAsset)
+    saveFolderAssetMetadata(updatedAsset)
+    setStatusMessage(libraryRootPath ? `已添加标签并写入文件：${tag}` : `已添加标签：${tag}`)
   }
 
   function removeAssetTag(assetId: string, tag: string) {
@@ -1752,20 +1782,30 @@ export default function App() {
       ...target,
       tags: target.tags.filter((assetTag) => assetTag !== tag),
     })
-    const updates = new Map<string, Partial<Asset>>([[assetId, updatedAsset]])
-    setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
-    )
-    setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
-    )
-    setLibraryCatalogAssets((current) =>
-      current.map((asset) => {
-        return asset.id === assetId ? updatedAsset : asset
-      }),
-    )
+    commitAssetMetadataUpdate(updatedAsset)
+    saveFolderAssetMetadata(updatedAsset)
     if (activeTag === tag && !tagStillUsed) setActiveTag('all')
-    setStatusMessage(`已移除标签：${tag}`)
+    setStatusMessage(libraryRootPath ? `已移除标签并写入文件：${tag}` : `已移除标签：${tag}`)
+  }
+
+  function setAssetFavorite(assetId: string, favorite: boolean) {
+    const target = assetByIdRef.current.get(assetId)
+    if (!target || target.favorite === favorite) return
+
+    const updatedAsset = withAssetSearchText({ ...target, favorite })
+    commitAssetMetadataUpdate(updatedAsset)
+    saveFolderAssetMetadata(updatedAsset)
+    setStatusMessage(libraryRootPath ? '已更新收藏并写入文件' : '已更新收藏')
+  }
+
+  function updateAssetNote(assetId: string, note: string) {
+    const target = assetByIdRef.current.get(assetId)
+    if (!target || target.note === note) return
+
+    const updatedAsset = withAssetSearchText({ ...target, note })
+    commitAssetMetadataUpdate(updatedAsset)
+    saveFolderAssetMetadata(updatedAsset)
+    setStatusMessage(libraryRootPath ? '已更新备注并写入文件' : '已更新备注')
   }
 
   function startSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1857,6 +1897,7 @@ export default function App() {
             onRefresh={refreshLibrary}
             onRemoveAssetTag={removeAssetTag}
             onSetActiveTag={setActiveTag}
+            onSetAssetFavorite={setAssetFavorite}
             onSetFiltersOpen={setFiltersOpen}
             onSetQuery={setQuery}
             onSetSortDir={setSortDir}
@@ -1866,6 +1907,7 @@ export default function App() {
             onSetThumbSize={setThumbSize}
             onSetTypeFilter={setTypeFilter}
             onSetViewMode={setViewMode}
+            onUpdateAssetNote={updateAssetNote}
             onVisualOrderChange={handleVisualOrderChange}
           />
         </div>

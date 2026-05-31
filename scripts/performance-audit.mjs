@@ -147,6 +147,22 @@ async function main() {
     '虚拟项使用合成层位移并异步解码图片',
     'translate3d + async decoding',
   )
+  assertCheck(
+    checks,
+    tauriSource.includes('FOLDER_METADATA_FILE_NAME') &&
+      tauriSource.includes('FolderMetadataCache') &&
+      tauriSource.includes('write_folder_asset_metadata'),
+    '文件夹级元数据使用可读 JSON 文件',
+    '.picman.folder.json metadata',
+  )
+  assertCheck(
+    checks,
+    appSource.includes('saveFolderAssetMetadata') &&
+      appSource.includes('write_folder_asset_metadata') &&
+      (await readProjectFile('src/components/Inspector.tsx')).includes('onUpdateNote'),
+    '标签收藏备注会写回文件夹级元数据',
+    'tags favorite note persistence',
+  )
 
   if (options.library) {
     const { fileCount, folderCount } = await countLibraryImages(options.library)

@@ -48,6 +48,8 @@ blocking under large local folders.
    - `.picman/cache` is a local performance layer, not source of truth.
    - Future tags, metadata, and settings should remain file-readable and
      controllable rather than being hidden in an opaque database.
+   - User-authored asset metadata is stored in per-folder `.picman.folder.json`
+     files, not in thumbnail caches or opaque local indexes.
 
 7. Stress verification must be repeatable.
    - Generate the large test folder:
@@ -74,6 +76,12 @@ alone. It needs both:
 
 ### 2026-05-31 Runtime Evidence
 
+- `v0.1.17` added folder-level metadata persistence. `npm run stress:audit
+  -- --library=/tmp/picman-stress-25000 --min-count=25000` passed 23/23
+  invariants, including checks for `.picman.folder.json` and metadata writeback.
+- `cargo test` passed 6 tests, including folder metadata write-and-restore.
+- `npm run lint`, `npm run build`, `npm run desktop:build`, `npm run release:prepare`,
+  and codesign verification passed for v0.1.17.
 - `npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000`
   passed 21/21 invariants after adding cache restore and fast-scroll checks.
 - `cargo test` passed 5 thumbnail/cache tests, including existing-cache reuse

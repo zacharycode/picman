@@ -13,18 +13,20 @@ must remain secondary, inspectable, removable, and rebuildable.
    - Must remain usable without Picman.
 
 2. Open metadata
-   - `.picman-library.json` at the library root.
-   - `.picman/folder.json` and `.picman/items.json` inside folders.
-   - JSON only, versioned, relative-path based, and cross-platform readable.
+   - `.picman/settings.json` at the library root for library-level settings.
+   - `.picman.folder.json` inside image folders for tags, notes, favorites,
+     ratings, and future user-authored metadata.
+   - JSON only, versioned, file-name keyed within each folder, and
+     cross-platform readable.
 
 3. Local index
-   - SQLite or equivalent local store.
+   - `.picman/cache/catalog.jsonl` or an equivalent local performance store.
    - Used only for speed: search, filters, sorting, and scan state.
    - Safe to delete and rebuild from files plus metadata.
 
 4. Local cache
    - Thumbnails, previews, color analysis, OCR, hashes, and derived data.
-   - Stored outside the asset library by default.
+   - Stored under `.picman/cache`.
    - Must have visible management controls for size, count, clearing,
      compression, and regeneration.
 
@@ -32,18 +34,33 @@ must remain secondary, inspectable, removable, and rebuildable.
 
 ```text
 DesignAssets/
-  .picman-library.json
+  .picman/
+    settings.json
+    cache/
+      catalog.jsonl
+      thumbnails/
   Icons/
     home.png
     search.svg
-    .picman/
-      folder.json
-      items.json
+    .picman.folder.json
   Inspiration/
     landing-page.png
-    .picman/
-      folder.json
-      items.json
+    .picman.folder.json
+```
+
+Folder metadata example:
+
+```json
+{
+  "version": 1,
+  "assets": {
+    "home.png": {
+      "favorite": true,
+      "note": "Primary home icon.",
+      "tags": ["icon", "ui"]
+    }
+  }
+}
 ```
 
 ## Sync Principle
@@ -56,18 +73,14 @@ Synchronized:
 
 ```text
 source files
-.picman-library.json
-**/.picman/folder.json
-**/.picman/items.json
+.picman/settings.json
+**/.picman.folder.json
 ```
 
 Not synchronized:
 
 ```text
-local SQLite indexes
-thumbnail caches
-preview caches
-temporary scan state
+.picman/cache
 ```
 
 ## Implementation Boundary

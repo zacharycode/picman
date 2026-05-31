@@ -1,4 +1,4 @@
-import { FileImage, Plus, Smile, Tag, X } from 'lucide-react'
+import { FileImage, Heart, Plus, Smile, Tag, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset } from '../types/library'
@@ -34,12 +34,24 @@ type InspectorProps = {
   asset: Asset
   onAddTag: (assetId: string, tag: string) => void
   onRemoveTag: (assetId: string, tag: string) => void
+  onSetFavorite: (assetId: string, favorite: boolean) => void
   onSelectTag: (tag: string) => void
+  onUpdateNote: (assetId: string, note: string) => void
 }
 
-export function Inspector({ activeTag, allTags, asset, onAddTag, onRemoveTag, onSelectTag }: InspectorProps) {
+export function Inspector({
+  activeTag,
+  allTags,
+  asset,
+  onAddTag,
+  onRemoveTag,
+  onSetFavorite,
+  onSelectTag,
+  onUpdateNote,
+}: InspectorProps) {
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [failedPreviewKey, setFailedPreviewKey] = useState<string | null>(null)
+  const [noteDraft, setNoteDraft] = useState(asset.note)
   const [tagInput, setTagInput] = useState('')
   const tagInputRef = useRef<HTMLInputElement>(null)
   const previewKey = `${asset.thumbnailUrl ?? ''}:${asset.thumbnailQuality ?? 'none'}:${asset.thumbnailReady}`
@@ -66,6 +78,11 @@ export function Inspector({ activeTag, allTags, asset, onAddTag, onRemoveTag, on
     window.requestAnimationFrame(() => tagInputRef.current?.focus())
   }
 
+  function commitNote() {
+    const note = noteDraft.trim()
+    if (note !== asset.note) onUpdateNote(asset.id, note)
+  }
+
   return (
     <>
       <div className="insp-preview">
@@ -82,7 +99,17 @@ export function Inspector({ activeTag, allTags, asset, onAddTag, onRemoveTag, on
         )}
       </div>
       <div className="insp-section">
-        <div className="insp-name">{asset.name}</div>
+        <div className="insp-name-row">
+          <div className="insp-name">{asset.name}</div>
+          <button
+            className={`insp-favorite-btn ${asset.favorite ? 'active' : ''}`}
+            title={asset.favorite ? '取消收藏' : '收藏'}
+            type="button"
+            onClick={() => onSetFavorite(asset.id, !asset.favorite)}
+          >
+            <Heart size={13} fill={asset.favorite ? 'currentColor' : 'none'} />
+          </button>
+        </div>
         <div className="insp-path">{asset.relativePath}</div>
       </div>
       <div className="insp-section">
@@ -211,12 +238,21 @@ export function Inspector({ activeTag, allTags, asset, onAddTag, onRemoveTag, on
           </div>
         )}
       </div>
-      {asset.note && (
-        <div className="insp-section insp-note">
-          <div className="insp-title">备注</div>
-          <p>{asset.note}</p>
-        </div>
-      )}
+      <div className="insp-section insp-note">
+        <div className="insp-title">备注</div>
+        <textarea
+          className="insp-note-input"
+          placeholder="备注"
+          value={noteDraft}
+          onBlur={commitNote}
+          onChange={(event) => setNoteDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+              event.currentTarget.blur()
+            }
+          }}
+        />
+      </div>
     </>
   )
 }

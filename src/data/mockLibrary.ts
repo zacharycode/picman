@@ -121,13 +121,11 @@ export const assets: Asset[] = [
 
 export const metadataExample = {
   version: 1,
-  items: {
+  assets: {
     'navigation-home.png': {
-      id: 'asset_01',
-      tags: ['icon', 'ui', 'product'],
       favorite: true,
       note: 'Primary navigation reference.',
-      updatedAt: '2026-05-22T15:30:00Z',
+      tags: ['icon', 'ui', 'product'],
     },
   },
 }

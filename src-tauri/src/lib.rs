@@ -5,7 +5,10 @@ use image::imageops::FilterType;
 use image::{ColorType, GenericImageView, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::ErrorKind;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -24,6 +27,7 @@ const THUMBNAIL_MAX_WORKERS: usize = 3;
 const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
 const THUMBNAIL_QUALITY_RESTORE_ORDER: [&str; 3] = ["standard", "high", "compact"];
+const FOLDER_METADATA_FILE_NAME: &str = ".picman.folder.json";
 
 #[derive(Clone, Default)]
 struct ThumbnailJobState {
@@ -162,6 +166,44 @@ struct ThumbnailWorkerResult {
     update: ThumbnailUpdatePayload,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderAssetMetadata {
+    #[serde(default)]
+    favorite: bool,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderMetadataFile {
+    #[serde(default)]
+    assets: BTreeMap<String, FolderAssetMetadata>,
+    #[serde(default = "folder_metadata_version")]
+    version: u32,
+}
+
+fn folder_metadata_version() -> u32 {
+    1
+}
+
+impl Default for FolderMetadataFile {
+    fn default() -> Self {
+        Self {
+            assets: BTreeMap::new(),
+            version: 1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FolderMetadataCache {
+    folders: HashMap<PathBuf, FolderMetadataFile>,
+}
+
 struct ThumbnailCacheHit {
     quality: &'static str,
     result: ThumbnailResult,
@@ -272,6 +314,63 @@ fn library_name_for(root: &Path) -> String {
         .map(|name| name.to_string_lossy().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Local Library".to_string())
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for tag in tags {
+        let tag = tag.split_whitespace().collect::<Vec<_>>().join(" ");
+        if tag.is_empty() || normalized.contains(&tag) {
+            continue;
+        }
+        normalized.push(tag);
+    }
+
+    normalized
+}
+
+fn normalize_folder_asset_metadata(mut metadata: FolderAssetMetadata) -> FolderAssetMetadata {
+    metadata.tags = normalize_tags(metadata.tags);
+    metadata.note = metadata.note.trim().to_string();
+    metadata
+}
+
+fn read_folder_metadata(path: &Path) -> Result<FolderMetadataFile, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<FolderMetadataFile>(&text)
+            .map_err(|error| format!("文件夹元数据解析失败：{}：{error}", normalize_path(path))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(FolderMetadataFile::default()),
+        Err(error) => Err(format!("无法读取文件夹元数据：{}：{error}", normalize_path(path))),
+    }
+}
+
+fn write_folder_metadata(path: &Path, metadata: &FolderMetadataFile) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(metadata)
+        .map_err(|error| format!("文件夹元数据序列化失败：{error}"))?;
+    let temp_path = path.with_file_name(format!("{FOLDER_METADATA_FILE_NAME}.tmp"));
+
+    fs::write(&temp_path, format!("{text}\n"))
+        .map_err(|error| format!("无法写入文件夹元数据临时文件：{error}"))?;
+    fs::rename(&temp_path, path).map_err(|error| format!("无法保存文件夹元数据：{error}"))
+}
+
+impl FolderMetadataCache {
+    fn metadata_for_asset(
+        &mut self,
+        folder_path: &Path,
+        file_name: &str,
+    ) -> Option<FolderAssetMetadata> {
+        let metadata = self
+            .folders
+            .entry(folder_path.to_path_buf())
+            .or_insert_with(|| {
+                read_folder_metadata(&folder_path.join(FOLDER_METADATA_FILE_NAME))
+                    .unwrap_or_default()
+            });
+
+        metadata.assets.get(file_name).cloned().map(normalize_folder_asset_metadata)
+    }
 }
 
 fn image_dimensions(path: &Path) -> (String, Option<u32>, Option<u32>) {
@@ -517,6 +616,22 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<(), String> {
     }
 }
 
+fn safe_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = PathBuf::from(relative_path);
+
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_) | Component::RootDir))
+    {
+        return Err("文件路径无效".to_string());
+    }
+
+    let path = root.join(relative);
+    ensure_inside(root, &path)?;
+    Ok(path)
+}
+
 fn allow_library_asset_scope(app: &AppHandle, root: &Path) -> Result<(), String> {
     let root = root
         .canonicalize()
@@ -532,7 +647,12 @@ fn allow_library_asset_scope(app: &AppHandle, root: &Path) -> Result<(), String>
         .map_err(|error| format!("缓存目录授权失败：{error}"))
 }
 
-fn scanned_asset_from_path(root: &Path, path: &Path, index: usize) -> Option<ScannedAsset> {
+fn scanned_asset_from_path(
+    root: &Path,
+    path: &Path,
+    index: usize,
+    folder_metadata: &mut FolderMetadataCache,
+) -> Option<ScannedAsset> {
     let kind = get_kind(path)?;
     let relative_path = path.strip_prefix(root).ok()?;
     let metadata = fs::metadata(path).ok()?;
@@ -552,26 +672,31 @@ fn scanned_asset_from_path(root: &Path, path: &Path, index: usize) -> Option<Sca
         source_path: source_path.clone(),
     };
     let cached_thumbnail = existing_thumbnail_cache_hit(root, &thumbnail_source, &metadata);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| normalized_relative_path.clone());
+    let folder_asset_metadata = path
+        .parent()
+        .and_then(|folder| folder_metadata.metadata_for_asset(folder, &file_name))
+        .unwrap_or_default();
 
     Some(ScannedAsset {
         dimensions,
-        favorite: false,
+        favorite: folder_asset_metadata.favorite,
         folder: normalize_folder(&normalized_relative_path),
         height,
         id,
         kind: kind.to_string(),
         modified_at: modified_date(&metadata),
-        name: path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| normalized_relative_path.clone()),
-        note: "Imported from local folder.".to_string(),
+        name: file_name,
+        note: folder_asset_metadata.note,
         preview_url: None,
         relative_path: normalized_relative_path,
         size_kb: std::cmp::max(1, metadata.len().div_ceil(1024)),
         source_path,
         swatch: swatch_for(index).to_string(),
-        tags: Vec::new(),
+        tags: folder_asset_metadata.tags,
         thumbnail_format: cached_thumbnail
             .as_ref()
             .map(|thumbnail| thumbnail.result.format.clone()),
@@ -604,6 +729,7 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
 
     let library_name = library_name_for(&root);
     let mut assets = Vec::new();
+    let mut folder_metadata = FolderMetadataCache::default();
 
     for entry in WalkDir::new(&root)
         .into_iter()
@@ -614,7 +740,9 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
             continue;
         }
 
-        if let Some(asset) = scanned_asset_from_path(&root, entry.path(), assets.len()) {
+        if let Some(asset) =
+            scanned_asset_from_path(&root, entry.path(), assets.len(), &mut folder_metadata)
+        {
             assets.push(asset);
         }
     }
@@ -648,6 +776,7 @@ fn scan_library_folder_stream(
 
     thread::spawn(move || {
         let mut assets = Vec::with_capacity(SCAN_BATCH_SIZE);
+        let mut folder_metadata = FolderMetadataCache::default();
         let mut total = 0usize;
 
         for entry_result in WalkDir::new(&thread_root)
@@ -672,7 +801,9 @@ fn scan_library_folder_stream(
                 continue;
             }
 
-            if let Some(asset) = scanned_asset_from_path(&thread_root, entry.path(), total) {
+            if let Some(asset) =
+                scanned_asset_from_path(&thread_root, entry.path(), total, &mut folder_metadata)
+            {
                 total += 1;
                 assets.push(asset);
             }
@@ -729,6 +860,39 @@ fn generate_thumbnail(
     let root = PathBuf::from(&library_root);
     allow_library_asset_scope(&app, &root)?;
     generate_thumbnail_result(&root, &source, &quality)
+}
+
+#[tauri::command]
+fn write_folder_asset_metadata(
+    library_root: String,
+    relative_path: String,
+    metadata: FolderAssetMetadata,
+) -> Result<(), String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let source_path = safe_relative_path(&root, &relative_path)?;
+    if !source_path.is_file() {
+        return Err("素材文件不存在".to_string());
+    }
+
+    let folder_path = source_path
+        .parent()
+        .ok_or_else(|| "素材文件夹无效".to_string())?;
+    let file_name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| "素材文件名无效".to_string())?;
+    let metadata_path = folder_path.join(FOLDER_METADATA_FILE_NAME);
+    let mut folder_metadata = read_folder_metadata(&metadata_path)?;
+
+    folder_metadata.version = 1;
+    folder_metadata
+        .assets
+        .insert(file_name, normalize_folder_asset_metadata(metadata));
+    write_folder_metadata(&metadata_path, &folder_metadata)
 }
 
 fn generate_thumbnail_result(
@@ -1088,7 +1252,8 @@ pub fn run() {
             generate_thumbnail,
             generate_thumbnails_stream,
             scan_library_folder,
-            scan_library_folder_stream
+            scan_library_folder_stream,
+            write_folder_asset_metadata
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -1238,7 +1403,8 @@ mod tests {
         let root = test_root("scan-restore");
         let source_path = root.join("scan-restore.png");
         write_rgba_png(&source_path, 512, 384, false);
-        let initial_scan = scanned_asset_from_path(&root, &source_path, 0).unwrap();
+        let mut metadata_cache = FolderMetadataCache::default();
+        let initial_scan = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
         let source = ThumbnailSource {
             id: initial_scan.id,
             kind: initial_scan.kind,
@@ -1252,13 +1418,46 @@ mod tests {
         )
         .unwrap();
 
-        let scanned = scanned_asset_from_path(&root, &source_path, 0).unwrap();
+        let mut metadata_cache = FolderMetadataCache::default();
+        let scanned = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
 
         assert!(scanned.thumbnail_ready);
         assert_eq!(scanned.thumbnail_format.as_deref(), Some("jpeg"));
         assert_eq!(scanned.thumbnail_path.as_deref(), Some(generated.path.as_str()));
         assert_eq!(scanned.thumbnail_quality.as_deref(), Some("standard"));
         assert_eq!(scanned.thumbnail_width, Some(240));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn folder_asset_metadata_is_written_and_restored_by_scan() {
+        let root = test_root("folder-metadata");
+        let folder_path = root.join("Icons");
+        fs::create_dir_all(&folder_path).unwrap();
+        let source_path = folder_path.join("home.png");
+        write_rgba_png(&source_path, 128, 128, false);
+
+        write_folder_asset_metadata(
+            normalize_path(&root),
+            "Icons/home.png".to_string(),
+            FolderAssetMetadata {
+                favorite: true,
+                note: "Home icon".to_string(),
+                tags: vec![" icon ".to_string(), "ui".to_string(), "icon".to_string()],
+            },
+        )
+        .unwrap();
+
+        let metadata_path = folder_path.join(FOLDER_METADATA_FILE_NAME);
+        assert!(metadata_path.exists());
+
+        let mut metadata_cache = FolderMetadataCache::default();
+        let scanned = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
+
+        assert!(scanned.favorite);
+        assert_eq!(scanned.note, "Home icon");
+        assert_eq!(scanned.tags, vec!["icon".to_string(), "ui".to_string()]);
 
         let _ = fs::remove_dir_all(root);
     }
