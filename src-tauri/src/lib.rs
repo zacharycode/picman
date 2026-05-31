@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
-const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v1";
+const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v2-alpha-aware";
 const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
 const SCAN_ERROR_EVENT: &str = "picman-library-scan-error";
@@ -159,6 +159,7 @@ struct ThumbnailWorkerResult {
 struct ThumbnailPreset {
     jpeg_quality: u8,
     max_edge: u32,
+    passthrough_limit_bytes: u64,
 }
 
 fn thumbnail_preset(quality: &str) -> ThumbnailPreset {
@@ -166,14 +167,17 @@ fn thumbnail_preset(quality: &str) -> ThumbnailPreset {
         "compact" => ThumbnailPreset {
             jpeg_quality: 58,
             max_edge: 160,
+            passthrough_limit_bytes: 8 * 1024,
         },
         "high" => ThumbnailPreset {
             jpeg_quality: 82,
-            max_edge: 384,
+            max_edge: 360,
+            passthrough_limit_bytes: 24 * 1024,
         },
         _ => ThumbnailPreset {
             jpeg_quality: 72,
-            max_edge: 256,
+            max_edge: 240,
+            passthrough_limit_bytes: 12 * 1024,
         },
     }
 }
@@ -362,6 +366,14 @@ fn has_alpha(color: ColorType) -> bool {
     )
 }
 
+fn has_visible_alpha(image: &image::DynamicImage) -> bool {
+    if !has_alpha(image.color()) {
+        return false;
+    }
+
+    image.to_rgba8().pixels().any(|pixel| pixel[3] < 250)
+}
+
 fn write_jpeg(path: &Path, image: &image::DynamicImage, quality: u8) -> Result<(), String> {
     let file = fs::File::create(path).map_err(|error| format!("无法创建缩略图文件：{error}"))?;
     let mut encoder = JpegEncoder::new_with_quality(file, quality);
@@ -409,6 +421,21 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<(), String> {
     } else {
         Err("文件不在当前资源目录内".to_string())
     }
+}
+
+fn allow_library_asset_scope(app: &AppHandle, root: &Path) -> Result<(), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("资源目录无效：{error}"))?;
+    let picman_dir = root.join(".picman");
+    let asset_scope = app.asset_protocol_scope();
+
+    asset_scope
+        .allow_directory(root, true)
+        .map_err(|error| format!("资源目录授权失败：{error}"))?;
+    asset_scope
+        .allow_directory(picman_dir, true)
+        .map_err(|error| format!("缓存目录授权失败：{error}"))
 }
 
 fn scanned_asset_from_path(root: &Path, path: &Path, index: usize) -> Option<ScannedAsset> {
@@ -490,6 +517,7 @@ fn scan_library_folder_stream(
     if !root.is_dir() {
         return Err("请选择有效的资源目录".to_string());
     }
+    allow_library_asset_scope(&app, &root)?;
 
     let library_name = library_name_for(&root);
     let normalized_root = normalize_path(&root);
@@ -572,11 +600,13 @@ fn scan_library_folder_stream(
 
 #[tauri::command]
 fn generate_thumbnail(
+    app: AppHandle,
     library_root: String,
     source: ThumbnailSource,
     quality: String,
 ) -> Result<ThumbnailResult, String> {
     let root = PathBuf::from(&library_root);
+    allow_library_asset_scope(&app, &root)?;
     generate_thumbnail_result(&root, &source, &quality)
 }
 
@@ -624,7 +654,10 @@ fn generate_thumbnail_result(
     let decoded = image::open(&source_path).map_err(|error| format!("图片解码失败：{error}"))?;
     let source_width = decoded.width();
     let source_height = decoded.height();
-    let passthrough = if source_width <= preset.max_edge && source_height <= preset.max_edge {
+    let passthrough = if source_width <= preset.max_edge
+        && source_height <= preset.max_edge
+        && metadata.len() <= preset.passthrough_limit_bytes
+    {
         source_passthrough_format(&source_path)
     } else {
         None
@@ -646,9 +679,13 @@ fn generate_thumbnail_result(
         });
     }
 
-    let thumbnail = decoded.resize(preset.max_edge, preset.max_edge, FilterType::Lanczos3);
+    let thumbnail = if source_width <= preset.max_edge && source_height <= preset.max_edge {
+        decoded
+    } else {
+        decoded.resize(preset.max_edge, preset.max_edge, FilterType::Lanczos3)
+    };
     let (width, height) = thumbnail.dimensions();
-    let alpha = has_alpha(thumbnail.color());
+    let alpha = has_visible_alpha(&thumbnail);
     let extension = if alpha { "png" } else { "jpg" };
     let format = if alpha { "png" } else { "jpeg" };
 
@@ -748,6 +785,7 @@ fn generate_thumbnails_stream(
     if !root.is_dir() {
         return Err("资源目录无效".to_string());
     }
+    allow_library_asset_scope(&app, &root)?;
 
     let total = sources.len();
     let active_job_id = state.active_job_id.clone();
@@ -943,4 +981,106 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "picman-thumbnail-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_rgba_png(path: &Path, width: u32, height: u32, transparent: bool) {
+        let image = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_fn(width, height, |x, y| {
+            let alpha = if transparent && (x + y) % 7 == 0 {
+                96
+            } else {
+                255
+            };
+            image::Rgba([
+                ((x * 37 + y * 17) % 251) as u8,
+                ((x * 13 + y * 53) % 241) as u8,
+                ((x * 29 + y * 31) % 239) as u8,
+                alpha,
+            ])
+        });
+
+        image.save(path).unwrap();
+    }
+
+    fn thumbnail_source(path: &Path, name: &str) -> ThumbnailSource {
+        ThumbnailSource {
+            id: format!("asset-{name}"),
+            kind: "png".to_string(),
+            relative_path: format!("{name}.png"),
+            source_path: normalize_path(path),
+        }
+    }
+
+    #[test]
+    fn opaque_rgba_png_is_encoded_as_jpeg_thumbnail() {
+        let root = test_root("opaque");
+        let source_path = root.join("opaque.png");
+        write_rgba_png(&source_path, 512, 384, false);
+
+        let result =
+            generate_thumbnail_result(&root, &thumbnail_source(&source_path, "opaque"), "standard")
+                .unwrap();
+
+        assert_eq!(result.format, "jpeg");
+        assert_eq!(result.width, 240);
+        assert!(Path::new(&result.path).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transparent_png_keeps_alpha_thumbnail() {
+        let root = test_root("transparent");
+        let source_path = root.join("transparent.png");
+        write_rgba_png(&source_path, 512, 384, true);
+
+        let result = generate_thumbnail_result(
+            &root,
+            &thumbnail_source(&source_path, "transparent"),
+            "standard",
+        )
+        .unwrap();
+
+        assert_eq!(result.format, "png");
+        assert_eq!(result.width, 240);
+        assert!(Path::new(&result.path).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn small_but_heavy_opaque_png_is_reencoded_instead_of_copied() {
+        let root = test_root("heavy-small");
+        let source_path = root.join("heavy-small.png");
+        write_rgba_png(&source_path, 160, 90, false);
+        let source_size = fs::metadata(&source_path).unwrap().len();
+        assert!(source_size > thumbnail_preset("standard").passthrough_limit_bytes);
+
+        let result = generate_thumbnail_result(
+            &root,
+            &thumbnail_source(&source_path, "heavy-small"),
+            "standard",
+        )
+        .unwrap();
+        let thumbnail_size = fs::metadata(&result.path).unwrap().len();
+
+        assert_eq!(result.format, "jpeg");
+        assert_eq!(result.width, 160);
+        assert!(thumbnail_size < source_size);
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

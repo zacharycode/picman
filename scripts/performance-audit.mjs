@@ -108,6 +108,15 @@ async function main() {
   assertCheck(checks, thumbnailWorkerLimit !== null && thumbnailWorkerLimit <= 3, '缩略图后台并发受控', `THUMBNAIL_MAX_WORKERS=${thumbnailWorkerLimit}`)
   assertCheck(checks, tauriSource.includes('available_parallelism') && tauriSource.includes('mpsc::channel'), '缩略图 worker 池按机器能力保守调度并聚合结果', 'available_parallelism + mpsc')
   assertCheck(checks, tauriSource.includes('completed: usize') && appSource.includes('completed: number'), '缩略图取消/完成事件携带真实完成数量', 'completed payload')
+  assertCheck(
+    checks,
+    tauriSource.includes('allow_library_asset_scope') &&
+      tauriSource.includes('asset_protocol_scope()') &&
+      tauriSource.includes('root.join(".picman")'),
+    '恢复目录时主动授权资源目录与 .picman 缓存',
+    'allow_library_asset_scope + .picman',
+  )
+  assertCheck(checks, tauriSource.includes('has_visible_alpha') && tauriSource.includes('passthrough_limit_bytes'), '缩略图编码按实际透明度与体积限制优化', 'alpha-aware encoding')
 
   if (options.library) {
     const { fileCount, folderCount } = await countLibraryImages(options.library)

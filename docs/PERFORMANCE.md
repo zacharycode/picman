@@ -58,3 +58,14 @@ alone. It needs both:
 - Manual or automated runtime evidence that the packaged app can open the
   25000 asset library, switch views, search, select, and generate thumbnails
   without making the interface unusable.
+
+### 2026-05-29 Runtime Evidence
+
+- `npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000`
+  passed 17/17 invariants.
+- The packaged macOS app opened `/tmp/picman-stress-25000` and scanned 25000
+  assets without blocking the interface.
+- Standard thumbnail generation completed for all 25000 assets while the UI
+  stayed responsive enough to switch to list view during generation.
+- Final standard thumbnail cache: 25000 files, about 159M total, with 21250 JPG,
+  2500 PNG, and 1250 SVG files.
