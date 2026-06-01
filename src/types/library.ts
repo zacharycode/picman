@@ -36,6 +36,7 @@ export type FolderNode = {
   count: number
 }
 
+export type ThemePref = 'system' | 'light' | 'dark'
 export type ThumbnailState = 'all' | 'generated' | 'pending'
 export type SortField = 'name' | 'date' | 'size' | 'type'
 export type SortDir = 'asc' | 'desc'

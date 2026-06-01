@@ -340,12 +340,12 @@ type LibraryViewProps = {
   activeFilterCount: number
   allTags: string[]
   assetById: ReadonlyMap<string, Asset>
+  assetIndexById: ReadonlyMap<string, number>
   breadcrumb: string
   filtersOpen: boolean
   inspectorVisible: boolean
   keyboardScrollTargetId: string | null
   keyboardScrollVersion: number
-  layoutAssetById: ReadonlyMap<string, Asset>
   primaryAsset?: Asset
   query: string
   selectedIds: Set<string>
@@ -384,12 +384,12 @@ export function LibraryView({
   activeFilterCount,
   allTags,
   assetById,
+  assetIndexById,
   breadcrumb,
   filtersOpen,
   inspectorVisible,
   keyboardScrollTargetId,
   keyboardScrollVersion,
-  layoutAssetById,
   primaryAsset,
   query,
   selectedIds,
@@ -449,16 +449,6 @@ export function LibraryView({
             gridTemplateColumns: `repeat(auto-fit, minmax(${adaptiveMinSize}, 1fr))`,
           }
         : { '--asset-thumb-size': fixedThumbSize }
-  const assetIndexById = useMemo(
-    () => {
-      const indexById = new Map<string, number>()
-      for (let index = 0; index < visibleAssetIds.length; index += 1) {
-        indexById.set(visibleAssetIds[index], index)
-      }
-      return indexById
-    },
-    [visibleAssetIds],
-  )
   const adaptiveMetrics = useMemo(
     () => createAdaptiveMetrics(visibleAssetIds.length, viewport.width, thumbSize),
     [thumbSize, viewport.width, visibleAssetIds.length],
@@ -466,9 +456,9 @@ export function LibraryView({
   const masonryLayoutData = useMemo(
     () =>
       viewMode === 'masonry'
-        ? createMasonryLayoutData(visibleAssetIds, layoutAssetById, viewport.width, thumbSize)
+        ? createMasonryLayoutData(visibleAssetIds, assetById, viewport.width, thumbSize)
         : undefined,
-    [layoutAssetById, thumbSize, viewMode, viewport.width, visibleAssetIds],
+    [assetById, thumbSize, viewMode, viewport.width, visibleAssetIds],
   )
   const virtualLayout = useMemo(() => {
     if (viewMode === 'list') return createListLayout(visibleAssetIds, viewport)

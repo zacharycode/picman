@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Picman",
-  "version": "0.1.17",
+  "version": "0.1.22",
   "identifier": "app.picman.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -17,6 +17,7 @@
         "height": 820,
         "minWidth": 1080,
         "minHeight": 640,
+        "dragDropEnabled": false,
         "resizable": true,
         "fullscreen": false,
         "decorations": true,
@@ -25,8 +26,7 @@
         "trafficLightPosition": {
           "x": 20,
           "y": 18
-        },
-        "theme": "Dark"
+        }
       }
     ],
     "security": {

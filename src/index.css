@@ -19,6 +19,17 @@
   --danger:       #e05240;
   --danger-bg:    rgba(224, 82, 64, 0.12);
 
+  --bg-deep:      #181818;
+  --surface-sunken: #202020;
+  --text-hi:      #d8d8d8;
+
+  /* Overlay tints that flip polarity between themes (white-on-dark by default). */
+  --hover:        rgba(255,255,255,0.06);
+  --hover-strong: rgba(255,255,255,0.1);
+  --text-strong:  #ffffff;
+  --on-accent:    #ffffff;
+
+  color-scheme: light dark;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter",
     ui-sans-serif, system-ui, sans-serif;
   font-size: 13px;
@@ -28,6 +39,40 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Light appearance. `data-theme` is set before first paint by the inline
+   script in index.html and kept in sync by App. In "system" mode it resolves
+   to the OS appearance (and live-updates via a single event listener); the
+   user can also force light/dark from Preferences. ── */
+:root[data-theme='light'] {
+    --toolbar:      #e9e9eb;
+    --sidebar:      #ededef;
+    --bg:           #f6f6f7;
+    --surface:      #ffffff;
+    --surface-2:    #f0f0f2;
+    --border:       #dcdce0;
+    --border-hi:    #c6c6ca;
+
+    --text:         #26262a;
+    --text2:        #5e5e64;
+    --muted:        #8a8a90;
+
+    --accent:       #2f80ff;
+    --accent-bg:    rgba(47, 128, 255, 0.14);
+    --accent-dim:   rgba(47, 128, 255, 0.08);
+
+    --danger:       #d23b28;
+    --danger-bg:    rgba(224, 82, 64, 0.1);
+
+    --bg-deep:      #ffffff;
+    --surface-sunken: #fbfbfc;
+    --text-hi:      #232327;
+
+    --hover:        rgba(0,0,0,0.04);
+    --hover-strong: rgba(0,0,0,0.07);
+    --text-strong:  #1a1a1c;
+    --on-accent:    #ffffff;
 }
 
 *, *::before, *::after { box-sizing: border-box; }

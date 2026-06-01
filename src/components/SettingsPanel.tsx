@@ -6,9 +6,16 @@ import type {
   AppUpdateState,
   FolderNode,
   SelectionKeyAxis,
+  ThemePref,
   ThumbnailGenerationState,
   ThumbnailQuality,
 } from '../types/library'
+
+const THEME_OPTIONS: [ThemePref, string][] = [
+  ['system', '跟随系统'],
+  ['light', '浅色'],
+  ['dark', '深色'],
+]
 
 const THUMBNAIL_QUALITY_LABELS: Record<ThumbnailQuality, string> = {
   compact: '紧凑',
@@ -31,6 +38,7 @@ type SettingsPanelProps = {
   pendingCount: number
   sourceSize: number
   selectionKeyAxis: SelectionKeyAxis
+  themePref: ThemePref
   thumbnailGeneration: ThumbnailGenerationState
   thumbnailQuality: ThumbnailQuality
   updateState: AppUpdateState
@@ -42,6 +50,7 @@ type SettingsPanelProps = {
   onOpenFolder: () => void
   onSetCacheLimit: (value: number) => void
   onSetSelectionKeyAxis: (value: SelectionKeyAxis) => void
+  onSetThemePref: (value: ThemePref) => void
   onSetThumbnailQuality: (value: ThumbnailQuality) => void
 }
 
@@ -54,6 +63,7 @@ export function SettingsPanel({
   pendingCount,
   sourceSize,
   selectionKeyAxis,
+  themePref,
   thumbnailGeneration,
   thumbnailQuality,
   updateState,
@@ -65,6 +75,7 @@ export function SettingsPanel({
   onOpenFolder,
   onSetCacheLimit,
   onSetSelectionKeyAxis,
+  onSetThemePref,
   onSetThumbnailQuality,
 }: SettingsPanelProps) {
   const [selectedFolders, setSelectedFolders] = useState<Set<string>>(() => new Set())
@@ -125,6 +136,24 @@ export function SettingsPanel({
               <FolderOpen size={13} /> 打开文件夹
             </button>
           </div>
+        </div>
+
+        <div className="sp-section">
+          <div className="sp-section-title">外观</div>
+          <label className="sp-field">
+            <span>主题模式</span>
+            <div className="segmented">
+              {THEME_OPTIONS.map(([value, label]) => (
+                <button
+                  key={value}
+                  className={themePref === value ? 'active' : ''}
+                  onClick={() => onSetThemePref(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </label>
         </div>
 
         <div className="sp-section">

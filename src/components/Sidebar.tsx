@@ -1,6 +1,6 @@
-import { Folder, Search, Tag, X } from 'lucide-react'
+import { Folder, FolderOpen, Search, Tag, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent } from 'react'
+import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { normalizeSearchText } from '../lib/search'
 import type { FolderNode } from '../types/library'
 
@@ -8,8 +8,11 @@ type SidebarProps = {
   activeFolder: string
   activeTag: string
   allTags: string[]
+  canReveal: boolean
   folders: FolderNode[]
   libraryName: string
+  onRevealLibrary: () => void
+  onReorderFolders: (orderedChildPaths: string[]) => void
   onSetActiveFolder: (folder: string) => void
   onSetActiveTag: (tag: string) => void
 }
@@ -25,8 +28,11 @@ export function Sidebar({
   activeFolder,
   activeTag,
   allTags,
+  canReveal,
   folders,
   libraryName,
+  onRevealLibrary,
+  onReorderFolders,
   onSetActiveFolder,
   onSetActiveTag,
 }: SidebarProps) {
@@ -34,18 +40,56 @@ export function Sidebar({
   const [folderSearchOpen, setFolderSearchOpen] = useState(false)
   const [folderQuery, setFolderQuery] = useState('')
   const [folderSearchText, setFolderSearchText] = useState('')
+  const [draggingPath, setDraggingPath] = useState<string | null>(null)
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null)
   const folderSearchComposingRef = useRef(false)
   const folderSearch = normalizeSearchText(folderQuery).trim()
+  const allChildFolders = useMemo(() => folders.filter((folder) => folder.path !== '/'), [folders])
   const childFolders = useMemo(
     () =>
-      folders
-        .filter((folder) => folder.path !== '/')
-        .filter((folder) => {
-          if (!folderSearch) return true
-          return normalizeSearchText(`${folder.name} ${folder.path}`).includes(folderSearch)
-        }),
-    [folderSearch, folders],
+      allChildFolders.filter((folder) => {
+        if (!folderSearch) return true
+        return normalizeSearchText(`${folder.name} ${folder.path}`).includes(folderSearch)
+      }),
+    [allChildFolders, folderSearch],
   )
+  // Manual reordering only makes sense on the full, unfiltered list.
+  const canReorder = !folderSearch && allChildFolders.length > 1
+
+  function handleFolderDragStart(event: ReactDragEvent<HTMLButtonElement>, path: string) {
+    if (!canReorder) return
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('application/x-picman-folder', path)
+    setDraggingPath(path)
+  }
+
+  function handleFolderDragOver(event: ReactDragEvent<HTMLButtonElement>, path: string) {
+    if (!draggingPath) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    if (path !== dropTargetPath) setDropTargetPath(path)
+  }
+
+  function clearFolderDrag() {
+    setDraggingPath(null)
+    setDropTargetPath(null)
+  }
+
+  function handleFolderDrop(event: ReactDragEvent<HTMLButtonElement>, targetPath: string) {
+    event.preventDefault()
+    const sourcePath = draggingPath
+    clearFolderDrag()
+    if (!sourcePath || sourcePath === targetPath) return
+
+    const paths = allChildFolders.map((folder) => folder.path)
+    const from = paths.indexOf(sourcePath)
+    const to = paths.indexOf(targetPath)
+    if (from === -1 || to === -1) return
+
+    paths.splice(from, 1)
+    paths.splice(to, 0, sourcePath)
+    onReorderFolders(paths)
+  }
 
   function clearFolderSearch() {
     folderSearchComposingRef.current = false
@@ -100,6 +144,13 @@ export function Sidebar({
           </button>
           <div className="sb-head-actions">
             <button
+              disabled={!canReveal}
+              title="在 Finder 中显示资源库文件夹"
+              onClick={onRevealLibrary}
+            >
+              <FolderOpen size={13} />
+            </button>
+            <button
               className={folderSearchOpen ? 'active' : ''}
               title={folderSearchOpen ? '关闭文件夹搜索' : '搜索文件夹'}
               onClick={() => {
@@ -130,8 +181,15 @@ export function Sidebar({
           {childFolders.map((folder) => (
             <button
               key={folder.path}
-              className={`sb-item ${activeFolder === folder.path ? 'active' : ''}`}
+              className={`sb-item ${activeFolder === folder.path ? 'active' : ''} ${
+                draggingPath === folder.path ? 'dragging' : ''
+              } ${dropTargetPath === folder.path && draggingPath !== folder.path ? 'drag-over' : ''}`}
+              draggable={canReorder}
               onClick={() => onSetActiveFolder(folder.path)}
+              onDragStart={(event) => handleFolderDragStart(event, folder.path)}
+              onDragOver={(event) => handleFolderDragOver(event, folder.path)}
+              onDrop={(event) => handleFolderDrop(event, folder.path)}
+              onDragEnd={clearFolderDrag}
             >
               <Folder size={13} />
               <span className="sb-item-label">{folder.name}</span>

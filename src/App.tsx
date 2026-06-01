@@ -6,12 +6,15 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
 import type { MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import './App.css'
+import { CollectOverlay } from './components/CollectOverlay'
 import { Lightbox } from './components/Lightbox'
 import { LibraryView } from './components/LibraryView'
 import { SettingsPanel } from './components/SettingsPanel'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { assets as sampleAssets } from './data/mockLibrary'
+import { dataTransferHasImage, extractImagePayload } from './lib/collect'
+import type { CollectPayload } from './lib/collect'
 import { folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
 import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
 import { sortAssets } from './lib/sort'
@@ -24,6 +27,7 @@ import type {
   SelectionKeyAxis,
   SortDir,
   SortField,
+  ThemePref,
   ThumbnailFormat,
   ThumbnailGenerationState,
   ThumbnailQuality,
@@ -182,6 +186,10 @@ type LibraryCatalogState = {
 type ThumbnailMetrics = {
   cacheSize: number
   generatedCount: number
+}
+
+type LibrarySettings = {
+  folderOrder: string[]
 }
 
 type AssetStore = {
@@ -468,6 +476,25 @@ function deriveLibraryCatalogState(libraryName: string, assets: Asset[]): Librar
   }
 }
 
+function applyFolderOrder(folders: FolderNode[], order: string[]): FolderNode[] {
+  if (order.length === 0) return folders
+
+  const rank = new Map(order.map((path, index) => [path, index]))
+  const root = folders.filter((folder) => folder.path === '/')
+  const children = folders
+    .filter((folder) => folder.path !== '/')
+    .sort((a, b) => {
+      const rankA = rank.get(a.path)
+      const rankB = rank.get(b.path)
+      if (rankA !== undefined && rankB !== undefined) return rankA - rankB
+      if (rankA !== undefined) return -1
+      if (rankB !== undefined) return 1
+      return 0
+    })
+
+  return [...root, ...children]
+}
+
 function deriveThumbnailMetrics(assets: Asset[]): ThumbnailMetrics {
   let cacheSize = 0
   let generatedCount = 0
@@ -594,13 +621,15 @@ export default function App() {
   const [activeFolder, setActiveFolder] = useState('/')
   const [activeTag, setActiveTag] = useState('all')
   const [cacheLimit, setCacheLimit] = useState(5)
+  const [collectPending, setCollectPending] = useState<{ payload: CollectPayload; previewUrl: string } | null>(null)
+  const [lastCollectFolder, setLastCollectFolder] = useState('/Inbox')
+  const [folderOrder, setFolderOrder] = useState<string[]>([])
   const [filtersOpen, setFiltersOpen] = useState(false)
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>(sampleAssets)
   const [assetStore, setAssetStore] = useState<AssetStore>(() => ({
     byId: createAssetMap(sampleAssets),
     version: 0,
   }))
-  const [libraryCatalogAssets, setLibraryCatalogAssets] = useState<Asset[]>(sampleAssets)
   const [libraryName, setLibraryName] = useState('DesignAssets')
   const [libraryRootPath, setLibraryRootPath] = useState<string | null>(null)
   const [libraryScanStatus, setLibraryScanStatus] = useState<LibraryScanStatus>('idle')
@@ -612,6 +641,9 @@ export default function App() {
   const [keyboardScrollTargetId, setKeyboardScrollTargetId] = useState<string | null>(null)
   const [keyboardScrollVersion, setKeyboardScrollVersion] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [themePref, setThemePref] = useState<ThemePref>(
+    () => (localStorage.getItem('picman-theme') as ThemePref | null) ?? 'system',
+  )
   const [sidebarWidth, setSidebarWidth] = useState(218)
   const [inspectorVisible, setInspectorVisible] = useState(true)
   const [sortDir, setSortDir] = useState<SortDir>('asc')
@@ -641,20 +673,19 @@ export default function App() {
   const deferredQuery = useDeferredValue(query)
   const assetById = assetStore.byId
   const libraryCatalog = useMemo(
-    () => deriveLibraryCatalogState(libraryName, libraryCatalogAssets),
-    [libraryCatalogAssets, libraryName],
+    () => deriveLibraryCatalogState(libraryName, libraryAssets),
+    [libraryAssets, libraryName],
   )
-  const catalogAssetById = useMemo(() => createAssetMap(libraryCatalogAssets), [libraryCatalogAssets])
   const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
+  const orderedFolders = useMemo(() => applyFolderOrder(folders, folderOrder), [folders, folderOrder])
   const { cacheSize, generatedCount } = thumbnailMetrics
-  const pendingCount = Math.max(0, libraryCatalogAssets.length - generatedCount)
+  const pendingCount = Math.max(0, libraryAssets.length - generatedCount)
   const thumbnailFilterVersion = thumbnailState === 'all' ? 0 : assetStore.version
-  const layoutAssetById = thumbnailState === 'all' ? catalogAssetById : assetById
 
   const visibleAssetIds = useMemo(() => {
     const searchQuery = normalizeSearchText(deferredQuery).trim()
     const shouldUseLiveThumbnailState = thumbnailState !== 'all' && thumbnailFilterVersion >= 0
-    const filtered = libraryCatalogAssets.filter((asset) => {
+    const filtered = libraryAssets.filter((asset) => {
       const inFolder = activeFolder === '/' || asset.folder === activeFolder
       const inTag = activeTag === 'all' || asset.tags.includes(activeTag)
       const inType = typeFilter === 'all' || asset.kind === typeFilter
@@ -679,7 +710,7 @@ export default function App() {
     activeTag,
     assetById,
     deferredQuery,
-    libraryCatalogAssets,
+    libraryAssets,
     libraryScanStatus,
     sortDir,
     sortField,
@@ -734,6 +765,23 @@ export default function App() {
     return () => revokePreviewUrls(libraryAssetsRef.current)
   }, [])
 
+  useEffect(() => {
+    localStorage.setItem('picman-theme', themePref)
+
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)')
+    const apply = () => {
+      const resolved = themePref === 'system' ? (systemDark.matches ? 'dark' : 'light') : themePref
+      document.documentElement.dataset.theme = resolved
+    }
+
+    apply()
+    if (themePref !== 'system') return
+
+    // Follow live OS appearance changes only while in system mode.
+    systemDark.addEventListener('change', apply)
+    return () => systemDark.removeEventListener('change', apply)
+  }, [themePref])
+
   const clearScanFlushTimer = useCallback((scan: ActiveNativeScan | null) => {
     if (!scan?.flushTimer) return
 
@@ -763,7 +811,6 @@ export default function App() {
       startTransition(() => {
         setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
         setLibraryAssets((current) => [...current, ...incoming])
-        setLibraryCatalogAssets((current) => [...current, ...incoming])
         if (restoredThumbnailMetrics.generatedCount > 0 || restoredThumbnailMetrics.cacheSize > 0) {
           setThumbnailMetrics((current) => addThumbnailMetrics(current, restoredThumbnailMetrics))
         }
@@ -801,7 +848,6 @@ export default function App() {
     startTransition(() => {
       setAssetStore((current) => replaceAssetStore(current, merged.assets))
       setLibraryAssets(merged.assets)
-      setLibraryCatalogAssets(merged.assets)
       setLibraryName(payload.libraryName)
       setLibraryRootPath(payload.rootPath)
       setLibraryScanStatus('idle')
@@ -1046,6 +1092,69 @@ export default function App() {
     }
   }, [flushNativeThumbnailUpdates, queueNativeThumbnailBatch])
 
+  const beginCollect = useCallback(
+    (payload: CollectPayload) => {
+      if (!libraryRootPath) {
+        setStatusMessage('请先打开本地资源目录后再收藏图片')
+        return
+      }
+
+      const previewUrl = URL.createObjectURL(new Blob([payload.bytes], { type: payload.mimeType }))
+      setCollectPending((current) => {
+        if (current) URL.revokeObjectURL(current.previewUrl)
+        return { payload, previewUrl }
+      })
+    },
+    [libraryRootPath],
+  )
+
+  useEffect(() => {
+    function isEditableTarget(target: EventTarget | null) {
+      const element = target as HTMLElement | null
+      if (!element) return false
+      const tag = element.tagName
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable
+    }
+
+    async function handlePaste(event: ClipboardEvent) {
+      const data = event.clipboardData
+      if (!data) return
+
+      const allowRemote = !isEditableTarget(document.activeElement)
+      if (!dataTransferHasImage(data, allowRemote)) return
+
+      event.preventDefault()
+      const payload = await extractImagePayload(data, allowRemote)
+      if (payload) beginCollect(payload)
+      else setStatusMessage('剪贴板里没有可收藏的图片（跨域图片请改用“复制图片”）')
+    }
+
+    function handleDragOver(event: DragEvent) {
+      if (event.dataTransfer) event.preventDefault()
+    }
+
+    async function handleDrop(event: DragEvent) {
+      const data = event.dataTransfer
+      if (!data) return
+
+      event.preventDefault()
+      if (!dataTransferHasImage(data, true)) return
+
+      const payload = await extractImagePayload(data, true)
+      if (payload) beginCollect(payload)
+      else setStatusMessage('拖入的图片无法读取（防盗链/跨域时请改用“复制图片”再粘贴）')
+    }
+
+    window.addEventListener('paste', handlePaste)
+    window.addEventListener('dragover', handleDragOver)
+    window.addEventListener('drop', handleDrop)
+    return () => {
+      window.removeEventListener('paste', handlePaste)
+      window.removeEventListener('dragover', handleDragOver)
+      window.removeEventListener('drop', handleDrop)
+    }
+  }, [beginCollect])
+
   const handleVisualOrderChange = useCallback(
     (ids: string[]) => {
       visualAssetIdsRef.current = ids.length === visibleCount ? ids : visibleAssetIds
@@ -1208,8 +1317,8 @@ export default function App() {
       }
       setSelectedIds(next)
     } else if (event.shiftKey) {
-      const startIndex = primaryId ? visibleAssetIds.indexOf(primaryId) : -1
-      const endIndex = visibleAssetIds.indexOf(asset.id)
+      const startIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
+      const endIndex = visibleIndexById.get(asset.id) ?? -1
       const safeStart = startIndex === -1 ? endIndex : startIndex
       const [from, to] = safeStart <= endIndex ? [safeStart, endIndex] : [endIndex, safeStart]
 
@@ -1251,13 +1360,13 @@ export default function App() {
       revokePreviewUrls(current)
       return []
     })
-    setLibraryCatalogAssets([])
     setLibraryRootPath(rootPath)
     setLibraryName(optimisticLibraryName)
     setActiveFolder('/')
     setActiveTag('all')
     setTypeFilter('all')
     setThumbnailState('all')
+    setFolderOrder([])
     setThumbnailGeneration({
       completed: 0,
       failed: 0,
@@ -1280,6 +1389,12 @@ export default function App() {
       setLibraryRootPath(scan.rootPath)
       setLibraryName(scan.libraryName)
       setStatusMessage(`${scan.libraryName} · 正在扫描资源目录...`)
+
+      void invoke<LibrarySettings>('read_library_settings', { libraryRoot: scan.rootPath })
+        .then((settings) => {
+          if (activeNativeScanRef.current?.id === scanId) setFolderOrder(settings.folderOrder ?? [])
+        })
+        .catch(() => undefined)
     } catch (error) {
       if (activeNativeScanRef.current?.id !== scanId) return
 
@@ -1328,7 +1443,6 @@ export default function App() {
       revokePreviewUrls(current)
       return []
     })
-    setLibraryCatalogAssets([])
     setLibraryRootPath(null)
     setLibraryName(nextLibraryName)
     setActiveFolder('/')
@@ -1359,7 +1473,6 @@ export default function App() {
         startTransition(() => {
           setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
           setLibraryAssets((current) => [...current, ...incoming])
-          setLibraryCatalogAssets((current) => [...current, ...incoming])
         })
 
         if (!firstAssetSelected && incoming[0]) {
@@ -1723,18 +1836,141 @@ export default function App() {
     }
   }
 
-  function commitAssetMetadataUpdate(updatedAsset: Asset) {
+  function closeCollect() {
+    setCollectPending((current) => {
+      if (current) URL.revokeObjectURL(current.previewUrl)
+      return null
+    })
+  }
+
+  function insertCollectedAsset(asset: Asset) {
+    appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, [asset])
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, [asset])),
+    )
+    setLibraryAssets((current) => [...current, asset])
+  }
+
+  async function generateCollectedThumbnail(asset: Asset) {
+    if (!libraryRootPath || !asset.sourcePath) return
+
+    try {
+      const result = await invoke<NativeThumbnailResult>('generate_thumbnail', {
+        libraryRoot: libraryRootPath,
+        quality: thumbnailQuality,
+        source: {
+          id: asset.id,
+          kind: asset.kind,
+          relativePath: asset.relativePath,
+          sourcePath: asset.sourcePath,
+        },
+      })
+      const token = `collect-${asset.id}-${Date.now()}`
+      const update = new Map<string, Partial<Asset>>([
+        [
+          asset.id,
+          {
+            thumbnailError: undefined,
+            thumbnailFormat: result.format,
+            thumbnailHeight: result.height,
+            thumbnailPath: result.path,
+            thumbnailQuality,
+            thumbnailReady: true,
+            thumbnailSizeKb: result.sizeKb,
+            thumbnailUrl: withCacheToken(convertFileSrc(result.path), token),
+            thumbnailVersion: token,
+            thumbnailWidth: result.width,
+          },
+        ],
+      ])
+      setAssetStore((current) =>
+        updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, update)),
+      )
+      setThumbnailMetrics((current) =>
+        addThumbnailMetrics(current, { cacheSize: result.sizeKb, generatedCount: 1 }),
+      )
+    } catch {
+      // Leave the placeholder; the file is collected and can be generated later.
+    }
+  }
+
+  async function collectIntoFolder(folderPath: string) {
+    const pending = collectPending
+    if (!pending || !libraryRootPath) return
+
+    const targetFolder = folderPath === '/' ? '' : folderPath.replace(/^\/+/, '')
+    closeCollect()
+
+    try {
+      const scanned = await invoke<NativeScannedAsset>('collect_image', {
+        bytes: pending.payload.bytes,
+        libraryRoot: libraryRootPath,
+        provenance: {
+          sourceUrl: pending.payload.sourceUrl ?? null,
+          title: pending.payload.title ?? null,
+        },
+        targetFolder,
+      })
+      const asset = nativeAssetToFrontend(scanned)
+      const alreadyInLibrary = assetByIdRef.current.has(asset.id)
+
+      if (!alreadyInLibrary) insertCollectedAsset(asset)
+      setLastCollectFolder(asset.folder)
+      setActiveFolder(asset.folder)
+      setSelectedIds(new Set([asset.id]))
+      setPrimaryId(asset.id)
+      setStatusMessage(
+        alreadyInLibrary
+          ? `该图片已在 ${folderName(asset.folder, libraryName)} 中`
+          : `已收藏到 ${folderName(asset.folder, libraryName)}`,
+      )
+      if (!alreadyInLibrary) void generateCollectedThumbnail(asset)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '收藏失败'
+      setStatusMessage(`收藏失败：${message}`)
+    }
+  }
+
+  function reorderFolders(orderedChildPaths: string[]) {
+    setFolderOrder(orderedChildPaths)
+    if (!libraryRootPath) return
+
+    void invoke('write_library_settings', {
+      libraryRoot: libraryRootPath,
+      settings: { folderOrder: orderedChildPaths },
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : '文件夹排序保存失败'
+      setStatusMessage(`文件夹排序保存失败：${message}`)
+    })
+  }
+
+  function revealLibraryInFinder() {
+    if (!libraryRootPath) {
+      setStatusMessage('请先打开本地资源目录后再在 Finder 中显示')
+      return
+    }
+
+    void invoke('reveal_in_finder', { path: libraryRootPath }).catch((error) => {
+      const message = error instanceof Error ? error.message : '无法打开 Finder'
+      setStatusMessage(`无法打开 Finder：${message}`)
+    })
+  }
+
+  function writeAssetToStore(updatedAsset: Asset) {
     const updates = new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]])
     setAssetStore((current) =>
       updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
     )
+  }
+
+  function commitAssetMetadataUpdate(updatedAsset: Asset) {
+    writeAssetToStore(updatedAsset)
     setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(current, updates, libraryAssetIndexByIdRef.current),
-    )
-    setLibraryCatalogAssets((current) =>
-      current.map((asset) => {
-        return asset.id === updatedAsset.id ? updatedAsset : asset
-      }),
+      applyAssetUpdatesToArray(
+        current,
+        new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]]),
+        libraryAssetIndexByIdRef.current,
+      ),
     )
   }
 
@@ -1792,8 +2028,8 @@ export default function App() {
     const target = assetByIdRef.current.get(assetId)
     if (!target || target.favorite === favorite) return
 
-    const updatedAsset = withAssetSearchText({ ...target, favorite })
-    commitAssetMetadataUpdate(updatedAsset)
+    const updatedAsset = { ...target, favorite }
+    writeAssetToStore(updatedAsset)
     saveFolderAssetMetadata(updatedAsset)
     setStatusMessage(libraryRootPath ? '已更新收藏并写入文件' : '已更新收藏')
   }
@@ -1852,8 +2088,11 @@ export default function App() {
           activeFolder={activeFolder}
           activeTag={activeTag}
           allTags={allTags}
-          folders={folders}
+          canReveal={Boolean(libraryRootPath)}
+          folders={orderedFolders}
           libraryName={libraryName}
+          onRevealLibrary={revealLibraryInFinder}
+          onReorderFolders={reorderFolders}
           onSetActiveFolder={setActiveFolder}
           onSetActiveTag={setActiveTag}
         />
@@ -1872,12 +2111,12 @@ export default function App() {
             activeFilterCount={activeFilterCount}
             allTags={allTags}
             assetById={assetById}
+            assetIndexById={visibleIndexById}
             breadcrumb={breadcrumb}
             filtersOpen={filtersOpen}
             inspectorVisible={inspectorVisible}
             keyboardScrollTargetId={keyboardScrollTargetId}
             keyboardScrollVersion={keyboardScrollVersion}
-            layoutAssetById={layoutAssetById}
             primaryAsset={primaryAsset}
             query={query}
             selectedIds={visibleSelectedIds}
@@ -1923,6 +2162,7 @@ export default function App() {
           pendingCount={pendingCount}
           selectionKeyAxis={selectionKeyAxis}
           sourceSize={sourceSize}
+          themePref={themePref}
           thumbnailGeneration={thumbnailGeneration}
           thumbnailQuality={thumbnailQuality}
           updateState={updateState}
@@ -1934,7 +2174,21 @@ export default function App() {
           onOpenFolder={openLibraryFolder}
           onSetCacheLimit={setCacheLimit}
           onSetSelectionKeyAxis={setSelectionKeyAxis}
+          onSetThemePref={setThemePref}
           onSetThumbnailQuality={setThumbnailQuality}
+        />
+      )}
+
+      {collectPending && libraryRootPath && (
+        <CollectOverlay
+          previewUrl={collectPending.previewUrl}
+          title={collectPending.payload.title}
+          sourceUrl={collectPending.payload.sourceUrl}
+          folders={orderedFolders}
+          libraryName={libraryName}
+          defaultFolder={lastCollectFolder}
+          onConfirm={collectIntoFolder}
+          onCancel={closeCollect}
         />
       )}
 

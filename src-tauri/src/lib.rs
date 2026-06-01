@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind};
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -175,6 +176,10 @@ struct FolderAssetMetadata {
     note: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    captured_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -207,6 +212,23 @@ struct FolderMetadataCache {
 struct ThumbnailCacheHit {
     quality: &'static str,
     result: ThumbnailResult,
+}
+
+/// Quality cache directories that actually exist for a library, probed once per
+/// scan. On a fresh library no thumbnail cache exists, so scanning can skip the
+/// per-file hash and stat work that would otherwise always miss.
+struct ThumbnailCacheProbe {
+    qualities: Vec<&'static str>,
+}
+
+impl ThumbnailCacheProbe {
+    fn new(root: &Path) -> Self {
+        let qualities = THUMBNAIL_QUALITY_RESTORE_ORDER
+            .into_iter()
+            .filter(|quality| thumbnail_cache_dir(root, quality).is_dir())
+            .collect();
+        Self { qualities }
+    }
 }
 
 #[derive(Debug)]
@@ -538,8 +560,9 @@ fn existing_thumbnail_cache_hit(
     root: &Path,
     source: &ThumbnailSource,
     metadata: &fs::Metadata,
+    probe: &ThumbnailCacheProbe,
 ) -> Option<ThumbnailCacheHit> {
-    for quality in THUMBNAIL_QUALITY_RESTORE_ORDER {
+    for &quality in &probe.qualities {
         if let Some(result) = existing_thumbnail_for_quality(root, source, quality, metadata) {
             return Some(ThumbnailCacheHit { quality, result });
         }
@@ -652,6 +675,7 @@ fn scanned_asset_from_path(
     path: &Path,
     index: usize,
     folder_metadata: &mut FolderMetadataCache,
+    cache_probe: &ThumbnailCacheProbe,
 ) -> Option<ScannedAsset> {
     let kind = get_kind(path)?;
     let relative_path = path.strip_prefix(root).ok()?;
@@ -671,7 +695,8 @@ fn scanned_asset_from_path(
         relative_path: normalized_relative_path.clone(),
         source_path: source_path.clone(),
     };
-    let cached_thumbnail = existing_thumbnail_cache_hit(root, &thumbnail_source, &metadata);
+    let cached_thumbnail =
+        existing_thumbnail_cache_hit(root, &thumbnail_source, &metadata, cache_probe);
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -730,6 +755,7 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
     let library_name = library_name_for(&root);
     let mut assets = Vec::new();
     let mut folder_metadata = FolderMetadataCache::default();
+    let cache_probe = ThumbnailCacheProbe::new(&root);
 
     for entry in WalkDir::new(&root)
         .into_iter()
@@ -740,9 +766,13 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
             continue;
         }
 
-        if let Some(asset) =
-            scanned_asset_from_path(&root, entry.path(), assets.len(), &mut folder_metadata)
-        {
+        if let Some(asset) = scanned_asset_from_path(
+            &root,
+            entry.path(),
+            assets.len(),
+            &mut folder_metadata,
+            &cache_probe,
+        ) {
             assets.push(asset);
         }
     }
@@ -777,6 +807,7 @@ fn scan_library_folder_stream(
     thread::spawn(move || {
         let mut assets = Vec::with_capacity(SCAN_BATCH_SIZE);
         let mut folder_metadata = FolderMetadataCache::default();
+        let cache_probe = ThumbnailCacheProbe::new(&thread_root);
         let mut total = 0usize;
 
         for entry_result in WalkDir::new(&thread_root)
@@ -801,9 +832,13 @@ fn scan_library_folder_stream(
                 continue;
             }
 
-            if let Some(asset) =
-                scanned_asset_from_path(&thread_root, entry.path(), total, &mut folder_metadata)
-            {
+            if let Some(asset) = scanned_asset_from_path(
+                &thread_root,
+                entry.path(),
+                total,
+                &mut folder_metadata,
+                &cache_probe,
+            ) {
                 total += 1;
                 assets.push(asset);
             }
@@ -888,11 +923,292 @@ fn write_folder_asset_metadata(
     let metadata_path = folder_path.join(FOLDER_METADATA_FILE_NAME);
     let mut folder_metadata = read_folder_metadata(&metadata_path)?;
 
+    // Frontend metadata writes only carry favorite/note/tags. Preserve the
+    // file-first provenance (source URL, capture time) recorded at collect time
+    // so editing a tag never drops it.
+    let mut next = normalize_folder_asset_metadata(metadata);
+    if let Some(previous) = folder_metadata.assets.get(&file_name) {
+        if next.source_url.is_none() {
+            next.source_url = previous.source_url.clone();
+        }
+        if next.captured_at.is_none() {
+            next.captured_at = previous.captured_at.clone();
+        }
+    }
+
     folder_metadata.version = 1;
-    folder_metadata
-        .assets
-        .insert(file_name, normalize_folder_asset_metadata(metadata));
+    folder_metadata.assets.insert(file_name, next);
     write_folder_metadata(&metadata_path, &folder_metadata)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectProvenance {
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Keep collected bytes verbatim for already-supported, browser-displayable
+/// formats; transcode anything else (bmp/tiff/ico/...) to PNG so every
+/// collected file stays a viewable, scannable asset.
+fn prepare_collected_bytes(bytes: Vec<u8>) -> Result<(Vec<u8>, &'static str), String> {
+    match image::guess_format(&bytes).ok() {
+        Some(image::ImageFormat::Png) => Ok((bytes, "png")),
+        Some(image::ImageFormat::Jpeg) => Ok((bytes, "jpg")),
+        Some(image::ImageFormat::WebP) => Ok((bytes, "webp")),
+        Some(image::ImageFormat::Gif) => Ok((bytes, "gif")),
+        Some(image::ImageFormat::Avif) => Ok((bytes, "avif")),
+        _ => {
+            let image =
+                image::load_from_memory(&bytes).map_err(|_| "无法识别图片格式".to_string())?;
+            let mut out = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+                .map_err(|error| format!("图片转码失败：{error}"))?;
+            Ok((out, "png"))
+        }
+    }
+}
+
+fn resolve_collect_folder(root: &Path, target_folder: &str) -> Result<PathBuf, String> {
+    let trimmed = target_folder.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+
+    let relative = PathBuf::from(trimmed);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            ) || component.as_os_str() == ".picman"
+        })
+    {
+        return Err("目标文件夹无效".to_string());
+    }
+
+    let folder_dir = root.join(relative);
+    fs::create_dir_all(&folder_dir).map_err(|error| format!("无法创建目标文件夹：{error}"))?;
+    ensure_inside(root, &folder_dir)?;
+    Ok(folder_dir)
+}
+
+fn slugify_collect_name(raw: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() {
+            slug.push(ch);
+            prev_dash = false;
+        } else if !slug.is_empty() && !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+
+    slug.trim_matches('-').chars().take(60).collect()
+}
+
+fn collect_base_name(provenance: &CollectProvenance) -> String {
+    if let Some(title) = provenance.title.as_deref() {
+        let slug = slugify_collect_name(title);
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+
+    if let Some(url) = provenance.source_url.as_deref() {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let base = path.rsplit('/').next().unwrap_or("");
+        let stem = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
+        let slug = slugify_collect_name(stem);
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+
+    format!("capture-{}", Local::now().format("%Y%m%d-%H%M%S"))
+}
+
+fn unique_collect_path(folder_dir: &Path, base: &str, ext: &str) -> PathBuf {
+    let first = folder_dir.join(format!("{base}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+
+    for suffix in 2..10000 {
+        let candidate = folder_dir.join(format!("{base}-{suffix}.{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    folder_dir.join(format!("{base}-{}.{ext}", Local::now().format("%H%M%S%3f")))
+}
+
+fn find_collected_duplicate(folder_dir: &Path, len: u64, hash: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(folder_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() || get_kind(&path).is_none() {
+            continue;
+        }
+
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == len => {}
+            _ => continue,
+        }
+
+        if fs::read(&path)
+            .map(|existing| sha256_hex(&existing) == hash)
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn build_collected_asset(root: &Path, path: &Path) -> Result<ScannedAsset, String> {
+    let mut folder_metadata = FolderMetadataCache::default();
+    let cache_probe = ThumbnailCacheProbe::new(root);
+    scanned_asset_from_path(root, path, 0, &mut folder_metadata, &cache_probe)
+        .ok_or_else(|| "无法读取采集到的素材".to_string())
+}
+
+fn collect_image_into(
+    root: &Path,
+    target_folder: &str,
+    bytes: Vec<u8>,
+    provenance: &CollectProvenance,
+) -> Result<ScannedAsset, String> {
+    if bytes.is_empty() {
+        return Err("图片内容为空".to_string());
+    }
+
+    let (data, ext) = prepare_collected_bytes(bytes)?;
+    let folder_dir = resolve_collect_folder(root, target_folder)?;
+    let hash = sha256_hex(&data);
+
+    if let Some(existing) = find_collected_duplicate(&folder_dir, data.len() as u64, &hash) {
+        return build_collected_asset(root, &existing);
+    }
+
+    let base = collect_base_name(provenance);
+    let output_path = unique_collect_path(&folder_dir, &base, ext);
+    let mut temp_os = output_path.clone().into_os_string();
+    temp_os.push(".collecting");
+    let temp_path = PathBuf::from(temp_os);
+
+    fs::write(&temp_path, &data).map_err(|error| format!("无法写入采集图片：{error}"))?;
+    fs::rename(&temp_path, &output_path).map_err(|error| format!("无法保存采集图片：{error}"))?;
+
+    let file_name = output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| "采集文件名无效".to_string())?;
+    let metadata_path = folder_dir.join(FOLDER_METADATA_FILE_NAME);
+    let mut folder_metadata = read_folder_metadata(&metadata_path)?;
+
+    folder_metadata.version = 1;
+    folder_metadata.assets.insert(
+        file_name,
+        FolderAssetMetadata {
+            captured_at: Some(Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()),
+            source_url: provenance.source_url.clone(),
+            ..FolderAssetMetadata::default()
+        },
+    );
+    write_folder_metadata(&metadata_path, &folder_metadata)?;
+
+    build_collected_asset(root, &output_path)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySettings {
+    #[serde(default)]
+    folder_order: Vec<String>,
+}
+
+fn library_settings_path(root: &Path) -> PathBuf {
+    root.join(".picman").join("settings.json")
+}
+
+#[tauri::command]
+fn read_library_settings(library_root: String) -> Result<LibrarySettings, String> {
+    let path = library_settings_path(&PathBuf::from(&library_root));
+    match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<LibrarySettings>(&text)
+            .map_err(|error| format!("库设置解析失败：{error}")),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(LibrarySettings::default()),
+        Err(error) => Err(format!("无法读取库设置：{error}")),
+    }
+}
+
+#[tauri::command]
+fn write_library_settings(library_root: String, settings: LibrarySettings) -> Result<(), String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let dir = root.join(".picman");
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建配置目录：{error}"))?;
+
+    let path = dir.join("settings.json");
+    let temp = dir.join("settings.json.tmp");
+    let text = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("库设置序列化失败：{error}"))?;
+
+    fs::write(&temp, format!("{text}\n"))
+        .map_err(|error| format!("无法写入库设置临时文件：{error}"))?;
+    fs::rename(&temp, &path).map_err(|error| format!("无法保存库设置：{error}"))
+}
+
+#[tauri::command]
+fn reveal_in_finder(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("路径不存在".to_string());
+    }
+
+    let status = Command::new("open")
+        .arg(&target)
+        .status()
+        .map_err(|error| format!("无法在 Finder 中打开：{error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Finder 打开失败".to_string())
+    }
+}
+
+#[tauri::command]
+fn collect_image(
+    app: AppHandle,
+    library_root: String,
+    target_folder: String,
+    bytes: Vec<u8>,
+    provenance: CollectProvenance,
+) -> Result<ScannedAsset, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+    allow_library_asset_scope(&app, &root)?;
+    collect_image_into(&root, &target_folder, bytes, &provenance)
 }
 
 fn generate_thumbnail_result(
@@ -1249,11 +1565,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             cancel_thumbnail_generation,
             clear_thumbnail_cache,
+            collect_image,
             generate_thumbnail,
             generate_thumbnails_stream,
+            read_library_settings,
+            reveal_in_finder,
             scan_library_folder,
             scan_library_folder_stream,
-            write_folder_asset_metadata
+            write_folder_asset_metadata,
+            write_library_settings
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -1404,7 +1724,14 @@ mod tests {
         let source_path = root.join("scan-restore.png");
         write_rgba_png(&source_path, 512, 384, false);
         let mut metadata_cache = FolderMetadataCache::default();
-        let initial_scan = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
+        let initial_scan = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
         let source = ThumbnailSource {
             id: initial_scan.id,
             kind: initial_scan.kind,
@@ -1419,7 +1746,14 @@ mod tests {
         .unwrap();
 
         let mut metadata_cache = FolderMetadataCache::default();
-        let scanned = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
+        let scanned = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
 
         assert!(scanned.thumbnail_ready);
         assert_eq!(scanned.thumbnail_format.as_deref(), Some("jpeg"));
@@ -1445,6 +1779,7 @@ mod tests {
                 favorite: true,
                 note: "Home icon".to_string(),
                 tags: vec![" icon ".to_string(), "ui".to_string(), "icon".to_string()],
+                ..FolderAssetMetadata::default()
             },
         )
         .unwrap();
@@ -1453,11 +1788,137 @@ mod tests {
         assert!(metadata_path.exists());
 
         let mut metadata_cache = FolderMetadataCache::default();
-        let scanned = scanned_asset_from_path(&root, &source_path, 0, &mut metadata_cache).unwrap();
+        let scanned = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
 
         assert!(scanned.favorite);
         assert_eq!(scanned.note, "Home icon");
         assert_eq!(scanned.tags, vec!["icon".to_string(), "ui".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!(
+            "picman-collect-src-{}-{}x{}.png",
+            std::process::id(),
+            width,
+            height
+        ));
+        write_rgba_png(&path, width, height, false);
+        let bytes = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        bytes
+    }
+
+    #[test]
+    fn collect_image_writes_file_metadata_and_dedups() {
+        let root = test_root("collect-basic");
+        let provenance = CollectProvenance {
+            source_url: Some("https://example.com/path/Cool Picture.png?x=1".to_string()),
+            title: Some("Cool Picture".to_string()),
+        };
+        let bytes = png_bytes(40, 30);
+
+        let asset = collect_image_into(&root, "Inbox", bytes.clone(), &provenance).unwrap();
+
+        assert_eq!(asset.folder, "/Inbox");
+        assert_eq!(asset.kind, "png");
+        assert!(!asset.thumbnail_ready);
+        let stored_path = PathBuf::from(&asset.source_path);
+        assert!(stored_path.is_file());
+        assert_eq!(stored_path.file_name().unwrap(), "Cool-Picture.png");
+
+        let metadata_path = root.join("Inbox").join(FOLDER_METADATA_FILE_NAME);
+        let folder_metadata = read_folder_metadata(&metadata_path).unwrap();
+        let entry = folder_metadata.assets.get("Cool-Picture.png").unwrap();
+        assert_eq!(
+            entry.source_url.as_deref(),
+            Some("https://example.com/path/Cool Picture.png?x=1")
+        );
+        assert!(entry.captured_at.is_some());
+
+        // Identical bytes into the same folder are deduplicated, not re-saved.
+        let again = collect_image_into(&root, "Inbox", bytes, &provenance).unwrap();
+        assert_eq!(again.source_path, asset.source_path);
+        let file_count = fs::read_dir(root.join("Inbox"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| get_kind(&entry.path()).is_some())
+            .count();
+        assert_eq!(file_count, 1);
+
+        // Different bytes produce a second file.
+        let other = collect_image_into(&root, "Inbox", png_bytes(50, 50), &provenance).unwrap();
+        assert_ne!(other.source_path, asset.source_path);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn editing_metadata_preserves_collected_provenance() {
+        let root = test_root("collect-provenance");
+        let provenance = CollectProvenance {
+            source_url: Some("https://example.com/cat.png".to_string()),
+            title: Some("cat".to_string()),
+        };
+        let asset =
+            collect_image_into(&root, "Inbox", png_bytes(24, 24), &provenance).unwrap();
+
+        // A normal tag edit from the UI carries only favorite/note/tags.
+        write_folder_asset_metadata(
+            normalize_path(&root),
+            asset.relative_path.clone(),
+            FolderAssetMetadata {
+                favorite: true,
+                tags: vec!["pet".to_string()],
+                ..FolderAssetMetadata::default()
+            },
+        )
+        .unwrap();
+
+        let metadata_path = root.join("Inbox").join(FOLDER_METADATA_FILE_NAME);
+        let folder_metadata = read_folder_metadata(&metadata_path).unwrap();
+        let entry = folder_metadata.assets.get(&asset.name).unwrap();
+        assert!(entry.favorite);
+        assert_eq!(entry.tags, vec!["pet".to_string()]);
+        assert_eq!(entry.source_url.as_deref(), Some("https://example.com/cat.png"));
+        assert!(entry.captured_at.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_transcodes_unsupported_format_to_png() {
+        let root = test_root("collect-transcode");
+        let bmp_path = std::env::temp_dir().join(format!("picman-collect-{}.bmp", std::process::id()));
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]))
+            .save(&bmp_path)
+            .unwrap();
+        let bmp_bytes = fs::read(&bmp_path).unwrap();
+        let _ = fs::remove_file(&bmp_path);
+
+        let asset = collect_image_into(
+            &root,
+            "Inbox",
+            bmp_bytes,
+            &CollectProvenance {
+                title: Some("shot".to_string()),
+                ..CollectProvenance::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(asset.kind, "png");
+        let stored = PathBuf::from(&asset.source_path);
+        assert_eq!(stored.extension().unwrap(), "png");
+        assert_eq!(image::guess_format(&fs::read(&stored).unwrap()).unwrap(), image::ImageFormat::Png);
 
         let _ = fs::remove_dir_all(root);
     }
