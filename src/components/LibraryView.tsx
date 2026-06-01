@@ -7,6 +7,8 @@ import {
   Rows3,
   Search,
   SlidersHorizontal,
+  Trash2,
+  Wand2,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
@@ -361,6 +363,9 @@ type LibraryViewProps = {
   onAddAssetTag: (assetId: string, tag: string) => void
   onAssetClick: (asset: Asset, event: MouseEvent<HTMLDivElement>) => void
   onAssetDoubleClick: (asset: Asset) => void
+  onDeleteSelected: () => void
+  onOpenBatch: () => void
+  onOcr: (asset: Asset) => void
   onOpenFolder: () => void
   onRefresh: () => void
   onRemoveAssetTag: (assetId: string, tag: string) => void
@@ -405,6 +410,9 @@ export function LibraryView({
   onAddAssetTag,
   onAssetClick,
   onAssetDoubleClick,
+  onDeleteSelected,
+  onOpenBatch,
+  onOcr,
   onOpenFolder,
   onRefresh,
   onRemoveAssetTag,
@@ -725,6 +733,22 @@ export function LibraryView({
               <RefreshCw size={14} />
             </button>
             <button
+              className="view-icon-btn"
+              disabled={selectedIds.size === 0}
+              title={selectedIds.size > 0 ? `批量调整与压缩（${selectedIds.size}）` : '批量调整与压缩'}
+              onClick={onOpenBatch}
+            >
+              <Wand2 size={14} />
+            </button>
+            <button
+              className="view-icon-btn"
+              disabled={selectedIds.size === 0}
+              title={selectedIds.size > 0 ? `删除所选到回收站（${selectedIds.size}）` : '删除到回收站'}
+              onClick={onDeleteSelected}
+            >
+              <Trash2 size={14} />
+            </button>
+            <button
               className={`view-icon-btn ${filtersOpen ? 'active' : ''}`}
               title="Filters"
               onClick={() => onSetFiltersOpen((open) => !open)}
@@ -858,6 +882,7 @@ export function LibraryView({
                 allTags={allTags}
                 asset={primaryAsset}
                 onAddTag={onAddAssetTag}
+                onOcr={onOcr}
                 onRemoveTag={onRemoveAssetTag}
                 onSetFavorite={onSetAssetFavorite}
                 onSelectTag={onSetActiveTag}

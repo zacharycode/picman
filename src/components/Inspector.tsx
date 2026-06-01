@@ -1,4 +1,4 @@
-import { FileImage, Heart, Plus, Smile, Tag, X } from 'lucide-react'
+import { FileImage, Heart, Plus, ScanText, Smile, Tag, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset } from '../types/library'
@@ -33,6 +33,7 @@ type InspectorProps = {
   allTags: string[]
   asset: Asset
   onAddTag: (assetId: string, tag: string) => void
+  onOcr: (asset: Asset) => void
   onRemoveTag: (assetId: string, tag: string) => void
   onSetFavorite: (assetId: string, favorite: boolean) => void
   onSelectTag: (tag: string) => void
@@ -44,6 +45,7 @@ export function Inspector({
   allTags,
   asset,
   onAddTag,
+  onOcr,
   onRemoveTag,
   onSetFavorite,
   onSelectTag,
@@ -111,6 +113,15 @@ export function Inspector({
           </button>
         </div>
         <div className="insp-path">{asset.relativePath}</div>
+        <button
+          className="insp-ocr-btn"
+          disabled={asset.kind === 'svg'}
+          title={asset.kind === 'svg' ? '矢量图暂不支持文字识别' : '识别图片中的文字'}
+          type="button"
+          onClick={() => onOcr(asset)}
+        >
+          <ScanText size={13} /> 识别文字
+        </button>
       </div>
       <div className="insp-section">
         <div className="insp-title">素材信息</div>

@@ -36,6 +36,18 @@ export type FolderNode = {
   count: number
 }
 
+export type TrashItem = {
+  id: string
+  name: string
+  kind: AssetKind
+  originalRelativePath: string
+  trashFileName: string
+  trashFilePath: string
+  sizeKb: number
+  deletedAt: string
+  metadata: { favorite: boolean; note: string; tags: string[]; sourceUrl?: string; capturedAt?: string }
+}
+
 export type ThemePref = 'system' | 'light' | 'dark'
 export type ThumbnailState = 'all' | 'generated' | 'pending'
 export type SortField = 'name' | 'date' | 'size' | 'type'

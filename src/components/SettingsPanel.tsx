@@ -1,7 +1,22 @@
-import { Archive, DownloadCloud, FileImage, FolderOpen, HardDrive, Image, Sparkles, Trash2, X } from 'lucide-react'
+import {
+  Archive,
+  DownloadCloud,
+  FileImage,
+  FolderOpen,
+  HardDrive,
+  Image,
+  Monitor,
+  Moon,
+  Sparkles,
+  Sun,
+  Trash2,
+  X,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
+import type { ComponentType, KeyboardEvent } from 'react'
 import { metadataExample } from '../data/mockLibrary'
 import { formatMb } from '../lib/format'
+import { eventToShortcut, formatShortcut } from '../lib/shortcut'
 import type {
   AppUpdateState,
   FolderNode,
@@ -11,10 +26,10 @@ import type {
   ThumbnailQuality,
 } from '../types/library'
 
-const THEME_OPTIONS: [ThemePref, string][] = [
-  ['system', '跟随系统'],
-  ['light', '浅色'],
-  ['dark', '深色'],
+const THEME_OPTIONS: [ThemePref, string, ComponentType<{ size?: number }>][] = [
+  ['system', '系统', Monitor],
+  ['light', '浅色', Sun],
+  ['dark', '深色', Moon],
 ]
 
 const THUMBNAIL_QUALITY_LABELS: Record<ThumbnailQuality, string> = {
@@ -32,9 +47,12 @@ const THUMBNAIL_QUALITY_HINTS: Record<ThumbnailQuality, string> = {
 type SettingsPanelProps = {
   cacheLimit: number
   cacheSize: number
+  deleteShortcut: string
   folders: FolderNode[]
   generatedCount: number
   libraryName: string
+  ocrApiKey: string
+  ocrLanguage: string
   pendingCount: number
   sourceSize: number
   selectionKeyAxis: SelectionKeyAxis
@@ -49,6 +67,9 @@ type SettingsPanelProps = {
   onGenerateFolderThumbnails: (folderPaths: string[]) => void
   onOpenFolder: () => void
   onSetCacheLimit: (value: number) => void
+  onSetDeleteShortcut: (value: string) => void
+  onSetOcrApiKey: (value: string) => void
+  onSetOcrLanguage: (value: string) => void
   onSetSelectionKeyAxis: (value: SelectionKeyAxis) => void
   onSetThemePref: (value: ThemePref) => void
   onSetThumbnailQuality: (value: ThumbnailQuality) => void
@@ -57,9 +78,12 @@ type SettingsPanelProps = {
 export function SettingsPanel({
   cacheLimit,
   cacheSize,
+  deleteShortcut,
   folders,
   generatedCount,
   libraryName,
+  ocrApiKey,
+  ocrLanguage,
   pendingCount,
   sourceSize,
   selectionKeyAxis,
@@ -74,11 +98,28 @@ export function SettingsPanel({
   onGenerateFolderThumbnails,
   onOpenFolder,
   onSetCacheLimit,
+  onSetDeleteShortcut,
+  onSetOcrApiKey,
+  onSetOcrLanguage,
   onSetSelectionKeyAxis,
   onSetThemePref,
   onSetThumbnailQuality,
 }: SettingsPanelProps) {
   const [selectedFolders, setSelectedFolders] = useState<Set<string>>(() => new Set())
+  const [capturingShortcut, setCapturingShortcut] = useState(false)
+
+  function handleShortcutKey(event: KeyboardEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    if (event.key === 'Escape') {
+      setCapturingShortcut(false)
+      return
+    }
+    const shortcut = eventToShortcut(event.nativeEvent)
+    if (shortcut) {
+      onSetDeleteShortcut(shortcut)
+      setCapturingShortcut(false)
+    }
+  }
   const activeSelectedFolders = useMemo(
     () => folders.filter((folder) => selectedFolders.has(folder.path)).map((folder) => folder.path),
     [folders, selectedFolders],
@@ -136,67 +177,6 @@ export function SettingsPanel({
               <FolderOpen size={13} /> 打开文件夹
             </button>
           </div>
-        </div>
-
-        <div className="sp-section">
-          <div className="sp-section-title">外观</div>
-          <label className="sp-field">
-            <span>主题模式</span>
-            <div className="segmented">
-              {THEME_OPTIONS.map(([value, label]) => (
-                <button
-                  key={value}
-                  className={themePref === value ? 'active' : ''}
-                  onClick={() => onSetThemePref(value)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </label>
-        </div>
-
-        <div className="sp-section">
-          <div className="sp-section-title">软件更新</div>
-          <div className={`sp-update-box sp-update-box--${updateState.status}`}>
-            <div className="sp-update-main">
-              <div className="sp-lib-name">
-                <span className="sp-lib-label">更新源</span>
-                <strong>GitHub Releases</strong>
-              </div>
-              <button className="sp-open-btn" disabled={updateBusy} onClick={onCheckForUpdate}>
-                <DownloadCloud size={13} /> {updateBusy ? '更新中' : '检查更新'}
-              </button>
-            </div>
-            <div className="sp-update-message">{updateState.message}</div>
-            {typeof updateState.progress === 'number' && (
-              <div className="sp-generation-progress" aria-label="应用更新进度">
-                <div style={{ width: `${updateState.progress}%` }} />
-              </div>
-            )}
-            {updateState.version && <div className="sp-update-version">目标版本：{updateState.version}</div>}
-          </div>
-        </div>
-
-        <div className="sp-section">
-          <div className="sp-section-title">素材选择</div>
-          <label className="sp-field">
-            <span>方向键切换</span>
-            <div className="segmented">
-              {[
-                ['horizontal', '左右键'],
-                ['vertical', '上下键'],
-              ].map(([axis, label]) => (
-                <button
-                  key={axis}
-                  className={selectionKeyAxis === axis ? 'active' : ''}
-                  onClick={() => onSetSelectionKeyAxis(axis as SelectionKeyAxis)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </label>
         </div>
 
         <div className="sp-section">
@@ -315,6 +295,101 @@ export function SettingsPanel({
             <button className="danger" disabled={isGenerating || generatedCount === 0} onClick={onClearThumbnailCache}>
               <Trash2 size={13} /> 清理缓存
             </button>
+          </div>
+        </div>
+
+        <div className="sp-section">
+          <div className="sp-section-title">通用</div>
+          <div className="sp-field">
+            <span>主题模式</span>
+            <div className="segmented sp-theme-seg">
+              {THEME_OPTIONS.map(([value, label, Icon]) => (
+                <button
+                  key={value}
+                  className={themePref === value ? 'active' : ''}
+                  title={label}
+                  onClick={() => onSetThemePref(value)}
+                >
+                  <Icon size={13} />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="sp-row">
+            <span>方向键切换</span>
+            <select
+              className="sp-select"
+              value={selectionKeyAxis}
+              onChange={(event) => onSetSelectionKeyAxis(event.target.value as SelectionKeyAxis)}
+            >
+              <option value="horizontal">左右键</option>
+              <option value="vertical">上下键</option>
+            </select>
+          </label>
+          <div className="sp-row">
+            <span>删除到回收站快捷键</span>
+            <button
+              className={`sp-shortcut ${capturingShortcut ? 'capturing' : ''}`}
+              type="button"
+              onBlur={() => setCapturingShortcut(false)}
+              onClick={() => setCapturingShortcut(true)}
+              onKeyDown={capturingShortcut ? handleShortcutKey : undefined}
+            >
+              {capturingShortcut ? '请按下快捷键…' : formatShortcut(deleteShortcut)}
+            </button>
+          </div>
+        </div>
+
+        <div className="sp-section">
+          <div className="sp-section-title">文字识别（OCR）</div>
+          <label className="sp-field">
+            <span>OCR.space API Key</span>
+            <input
+              className="sp-text-input"
+              placeholder="在此填写 OCR.space API Key"
+              spellCheck={false}
+              type="text"
+              value={ocrApiKey}
+              onChange={(event) => onSetOcrApiKey(event.target.value)}
+            />
+          </label>
+          <label className="sp-row">
+            <span>识别语言</span>
+            <select
+              className="sp-select"
+              value={ocrLanguage}
+              onChange={(event) => onSetOcrLanguage(event.target.value)}
+            >
+              <option value="chs">简体中文</option>
+              <option value="cht">繁体中文</option>
+              <option value="eng">英文</option>
+              <option value="jpn">日文</option>
+              <option value="kor">韩文</option>
+            </select>
+          </label>
+          <p className="sp-desc">在 ocr.space 免费注册即可获取 API Key；识别结果会去除换行、合并为一段，可在弹窗中编辑并复制。</p>
+        </div>
+
+        <div className="sp-section">
+          <div className="sp-section-title">软件更新</div>
+          <div className={`sp-update-box sp-update-box--${updateState.status}`}>
+            <div className="sp-update-main">
+              <div className="sp-lib-name">
+                <span className="sp-lib-label">更新源</span>
+                <strong>GitHub Releases</strong>
+              </div>
+              <button className="sp-open-btn" disabled={updateBusy} onClick={onCheckForUpdate}>
+                <DownloadCloud size={13} /> {updateBusy ? '更新中' : '检查更新'}
+              </button>
+            </div>
+            <div className="sp-update-message">{updateState.message}</div>
+            {typeof updateState.progress === 'number' && (
+              <div className="sp-generation-progress" aria-label="应用更新进度">
+                <div style={{ width: `${updateState.progress}%` }} />
+              </div>
+            )}
+            {updateState.version && <div className="sp-update-version">目标版本：{updateState.version}</div>}
           </div>
         </div>
 

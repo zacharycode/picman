@@ -1415,6 +1415,48 @@
 }
 .sp-field span { color: var(--text2); font-size: 11.5px; }
 
+/* Compact "label … control" row for secondary settings. */
+.sp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+.sp-row > span { color: var(--text2); font-size: 11.5px; }
+
+/* Theme picker: full-width segmented with an icon per option. */
+.sp-theme-seg { width: 100%; }
+.sp-theme-seg button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 6px;
+}
+
+/* Native popup styled to match, with a custom chevron. */
+.sp-select {
+  height: 28px;
+  min-width: 104px;
+  padding: 0 26px 0 10px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background-color: var(--surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.sp-select:hover { border-color: var(--accent); }
+.sp-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 .sp-actions {
   display: grid;
   gap: 5px;
@@ -1915,6 +1957,10 @@
 .view-icon-btn.active {
   color: var(--text-strong);
   background: var(--border);
+}
+.view-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .tag-bar {
@@ -3150,3 +3196,428 @@ body.is-resizing-row * {
      below — the default border is too light against the near-white surface. */
   border-bottom-color: rgba(0, 0, 0, 0.09);
 }
+
+/* ============================================================
+   OCR  –  inspector action, settings input, result modal
+   ============================================================ */
+.insp-ocr-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  margin-top: 10px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--hover);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+.insp-ocr-btn:hover:not(:disabled) {
+  background: var(--hover-strong);
+  border-color: var(--accent);
+}
+.insp-ocr-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sp-text-input {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+.sp-text-input:focus { border-color: var(--accent); }
+.sp-text-input::placeholder { color: var(--muted); }
+
+.ocr-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: grid;
+  place-items: center;
+}
+.ocr-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+.ocr-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 120px);
+  background: var(--surface);
+  border: 1px solid var(--border-hi);
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.ocr-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.ocr-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ocr-close {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.ocr-close:hover { background: var(--border); color: var(--text); }
+.ocr-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 40px 16px;
+  color: var(--text2);
+  font-size: 12.5px;
+}
+.ocr-spin { animation: ocr-spin 0.8s linear infinite; color: var(--accent); }
+@keyframes ocr-spin { to { transform: rotate(360deg); } }
+.ocr-error {
+  padding: 28px 18px;
+  text-align: center;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--danger);
+}
+.ocr-text {
+  margin: 14px 16px 0;
+  min-height: 200px;
+  max-height: 50vh;
+  padding: 12px;
+  border: 1px solid var(--border-hi);
+  border-radius: 8px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+  outline: none;
+}
+.ocr-text:focus { border-color: var(--accent); }
+.ocr-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+}
+.ocr-hint { font-size: 11px; color: var(--muted); }
+.ocr-copy {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 16px;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ocr-copy:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ============================================================
+   RECYCLE BIN  –  sidebar entry, context menu, shortcut, trash view
+   ============================================================ */
+.sb-trash-row-wrap { position: relative; flex-shrink: 0; }
+.sb-trash-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px 0 14px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+}
+.sb-trash-row:hover { background: var(--hover); color: var(--text); }
+.sb-trash-row.active { background: var(--accent-bg); color: var(--text-strong); }
+
+.sb-ctx-backdrop { position: fixed; inset: 0; z-index: 1400; }
+.sb-ctx-menu {
+  position: fixed;
+  z-index: 1401;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--border-hi);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
+}
+.sb-ctx-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.sb-ctx-menu button:hover { background: var(--danger-bg); }
+
+.sp-shortcut {
+  height: 28px;
+  min-width: 104px;
+  padding: 0 12px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+.sp-shortcut:hover { border-color: var(--accent); }
+.sp-shortcut.capturing {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.trash-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+}
+.trash-toolbar { gap: 12px; }
+.trash-back {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.trash-back:hover { border-color: var(--accent); }
+.trash-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); }
+.trash-action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.trash-action:hover:not(:disabled) { border-color: var(--accent); }
+.trash-action.danger { color: var(--danger); }
+.trash-action.danger:hover:not(:disabled) { border-color: var(--danger); }
+.trash-action:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.trash-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; }
+.trash-grid { display: grid; gap: 16px; }
+.trash-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+.trash-item.selected { outline-color: var(--accent); }
+.trash-thumb {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.trash-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.trash-restore-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.trash-item:hover .trash-restore-btn { opacity: 1; }
+.trash-restore-btn:hover { background: var(--accent); }
+.trash-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 0 2px; }
+.trash-name {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-sub { font-size: 10.5px; color: var(--muted); }
+
+/* ============================================================
+   BATCH PROCESS MODAL  (resize + compress)
+   ============================================================ */
+.batch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: grid;
+  place-items: center;
+}
+.batch-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+.batch-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  padding: 0 0 16px;
+  background: var(--surface);
+  border: 1px solid var(--border-hi);
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.batch-head h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+.batch-close {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.batch-close:hover:not(:disabled) { background: var(--border); color: var(--text); }
+.batch-summary { padding: 0 16px; font-size: 12px; color: var(--text2); }
+.batch-summary strong { color: var(--accent); }
+.batch-field { display: grid; gap: 7px; padding: 0 16px; }
+.batch-label { font-size: 11.5px; color: var(--text2); }
+.batch-seg { width: 100%; }
+.batch-seg button { flex: 1; }
+.batch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 16px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.batch-num { display: flex; align-items: center; gap: 6px; }
+.batch-num input {
+  width: 88px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-hi);
+  border-radius: 6px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+.batch-num input:focus { border-color: var(--accent); }
+.batch-num small { font-size: 11px; color: var(--muted); }
+.batch-quality { width: 100%; }
+.batch-hint { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.batch-warn {
+  margin: 0 16px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.batch-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 16px;
+}
+.batch-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 16px;
+  border: 1px solid var(--border-hi);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.batch-btn:hover:not(:disabled) { background: var(--border); }
+.batch-btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+.batch-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.batch-spin { animation: ocr-spin 0.8s linear infinite; }

@@ -1,4 +1,4 @@
-import { Folder, FolderOpen, Search, Tag, X } from 'lucide-react'
+import { Folder, FolderOpen, Search, Tag, Trash2, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { normalizeSearchText } from '../lib/search'
@@ -11,10 +11,14 @@ type SidebarProps = {
   canReveal: boolean
   folders: FolderNode[]
   libraryName: string
+  trashActive: boolean
+  trashCount: number
+  onEmptyTrash: () => void
   onRevealLibrary: () => void
   onReorderFolders: (orderedChildPaths: string[]) => void
   onSetActiveFolder: (folder: string) => void
   onSetActiveTag: (tag: string) => void
+  onShowTrash: () => void
 }
 
 const FOLDER_PANE_MIN = 48
@@ -31,10 +35,14 @@ export function Sidebar({
   canReveal,
   folders,
   libraryName,
+  trashActive,
+  trashCount,
+  onEmptyTrash,
   onRevealLibrary,
   onReorderFolders,
   onSetActiveFolder,
   onSetActiveTag,
+  onShowTrash,
 }: SidebarProps) {
   const [folderPaneHeight, setFolderPaneHeight] = useState(226)
   const [folderSearchOpen, setFolderSearchOpen] = useState(false)
@@ -42,6 +50,7 @@ export function Sidebar({
   const [folderSearchText, setFolderSearchText] = useState('')
   const [draggingPath, setDraggingPath] = useState<string | null>(null)
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null)
+  const [trashMenu, setTrashMenu] = useState<{ x: number; y: number } | null>(null)
   const folderSearchComposingRef = useRef(false)
   const folderSearch = normalizeSearchText(folderQuery).trim()
   const allChildFolders = useMemo(() => folders.filter((folder) => folder.path !== '/'), [folders])
@@ -229,6 +238,39 @@ export function Sidebar({
           {allTags.length === 0 && <div className="sb-tag-empty">暂无标签</div>}
         </div>
       </section>
+
+      <div className="sb-trash-row-wrap">
+        <button
+          className={`sb-trash-row ${trashActive ? 'active' : ''}`}
+          title="回收站（右键清空）"
+          onClick={onShowTrash}
+          onContextMenu={(event) => {
+            event.preventDefault()
+            if (trashCount > 0) {
+              setTrashMenu({ x: event.clientX, y: event.clientY })
+            }
+          }}
+        >
+          <Trash2 size={13} />
+          <span className="sb-item-label">回收站</span>
+          {trashCount > 0 && <span className="sb-item-count">{trashCount}</span>}
+        </button>
+        {trashMenu && (
+          <>
+            <div className="sb-ctx-backdrop" onClick={() => setTrashMenu(null)} onContextMenu={(event) => { event.preventDefault(); setTrashMenu(null) }} />
+            <div className="sb-ctx-menu" style={{ left: trashMenu.x, top: trashMenu.y }}>
+              <button
+                onClick={() => {
+                  setTrashMenu(null)
+                  onEmptyTrash()
+                }}
+              >
+                <Trash2 size={13} /> 清空回收站
+              </button>
+            </div>
+          </>
+        )}
+      </div>
 
       <div className="sb-footer">
         <div className="sb-dot" />

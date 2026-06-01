@@ -5,7 +5,7 @@ use image::imageops::FilterType;
 use image::{ColorType, GenericImageView, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, ErrorKind};
 use std::path::Component;
@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
@@ -1176,6 +1176,53 @@ fn write_library_settings(library_root: String, settings: LibrarySettings) -> Re
     fs::rename(&temp, &path).map_err(|error| format!("无法保存库设置：{error}"))
 }
 
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+
+    out
+}
+
+/// Decode the source image, bound its size, and return a JPEG data URI. This
+/// keeps the payload within OCR.space limits and produces a format the API
+/// accepts, reusing the existing image pipeline (no new dependency).
+#[tauri::command]
+fn prepare_image_for_ocr(source_path: String) -> Result<String, String> {
+    let path = PathBuf::from(&source_path);
+    if !path.is_file() {
+        return Err("图片文件不存在".to_string());
+    }
+
+    let decoded = image::open(&path).map_err(|error| format!("图片解码失败：{error}"))?;
+    let (width, height) = decoded.dimensions();
+    const MAX_EDGE: u32 = 2048;
+    let prepared = if width.max(height) > MAX_EDGE {
+        decoded.resize(MAX_EDGE, MAX_EDGE, FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+
+    let mut buffer = Vec::new();
+    JpegEncoder::new_with_quality(&mut buffer, 85)
+        .encode_image(&prepared.to_rgb8())
+        .map_err(|error| format!("图片编码失败：{error}"))?;
+
+    Ok(format!("data:image/jpeg;base64,{}", base64_encode(&buffer)))
+}
+
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     let target = PathBuf::from(&path);
@@ -1209,6 +1256,377 @@ fn collect_image(
     }
     allow_library_asset_scope(&app, &root)?;
     collect_image_into(&root, &target_folder, bytes, &provenance)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrashItem {
+    id: String,
+    name: String,
+    kind: String,
+    original_relative_path: String,
+    trash_file_name: String,
+    trash_file_path: String,
+    size_kb: u64,
+    deleted_at: String,
+    #[serde(default)]
+    metadata: FolderAssetMetadata,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrashManifest {
+    #[serde(default)]
+    items: Vec<TrashItem>,
+}
+
+fn trash_dir(root: &Path) -> PathBuf {
+    root.join(".picman").join("trash")
+}
+
+fn read_trash_manifest(root: &Path) -> Result<TrashManifest, String> {
+    let path = trash_dir(root).join("trash.json");
+    let mut manifest = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<TrashManifest>(&text)
+            .map_err(|error| format!("回收站清单解析失败：{error}"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => TrashManifest::default(),
+        Err(error) => return Err(format!("无法读取回收站清单：{error}")),
+    };
+
+    // Recompute the absolute path so a moved library still resolves correctly.
+    let dir = trash_dir(root);
+    for item in &mut manifest.items {
+        item.trash_file_path = normalize_path(&dir.join(&item.trash_file_name));
+    }
+    manifest.items.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    Ok(manifest)
+}
+
+fn write_trash_manifest(root: &Path, manifest: &TrashManifest) -> Result<(), String> {
+    let dir = trash_dir(root);
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建回收站目录：{error}"))?;
+    let path = dir.join("trash.json");
+    let temp = dir.join("trash.json.tmp");
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("回收站清单序列化失败：{error}"))?;
+
+    fs::write(&temp, format!("{text}\n"))
+        .map_err(|error| format!("无法写入回收站清单临时文件：{error}"))?;
+    fs::rename(&temp, &path).map_err(|error| format!("无法保存回收站清单：{error}"))
+}
+
+/// A library-relative path that does not need to exist yet (restore targets),
+/// rejecting traversal and the reserved `.picman` directory.
+fn safe_library_path(root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = PathBuf::from(relative_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            ) || component.as_os_str() == ".picman"
+        })
+    {
+        return Err("文件路径无效".to_string());
+    }
+    Ok(root.join(relative))
+}
+
+fn restore_destination(root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let base = safe_library_path(root, relative_path)?;
+    if !base.exists() {
+        return Ok(base);
+    }
+
+    let parent = base.parent().ok_or_else(|| "恢复目录无效".to_string())?;
+    let stem = base
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = base.extension().map(|value| value.to_string_lossy().to_string());
+
+    for suffix in 1..10000 {
+        let name = match &ext {
+            Some(ext) => format!("{stem} (恢复{suffix}).{ext}"),
+            None => format!("{stem} (恢复{suffix})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("无法确定恢复位置".to_string())
+}
+
+#[tauri::command]
+fn move_to_trash(library_root: String, relative_paths: Vec<String>) -> Result<Vec<TrashItem>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let dir = trash_dir(&root);
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建回收站目录：{error}"))?;
+    let mut manifest = read_trash_manifest(&root)?;
+    let mut created = Vec::new();
+
+    for relative_path in &relative_paths {
+        let source = safe_relative_path(&root, relative_path)?;
+        if !source.is_file() {
+            continue;
+        }
+
+        let metadata = fs::metadata(&source).map_err(|error| format!("无法读取文件：{error}"))?;
+        let file_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "文件名无效".to_string())?;
+        let kind = get_kind(&source).unwrap_or("png").to_string();
+
+        // Snapshot the folder metadata into the trash entry, then drop it from
+        // the source folder so the live library no longer references the file.
+        let folder = source.parent().ok_or_else(|| "文件夹无效".to_string())?;
+        let metadata_path = folder.join(FOLDER_METADATA_FILE_NAME);
+        let mut folder_metadata = read_folder_metadata(&metadata_path)?;
+        let asset_metadata = folder_metadata.assets.remove(&file_name).unwrap_or_default();
+        if metadata_path.exists() {
+            write_folder_metadata(&metadata_path, &folder_metadata)?;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let id = format!(
+            "trash_{}",
+            &sha256_hex(format!("{relative_path}-{nanos}").as_bytes())[..16]
+        );
+        let extension = source
+            .extension()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bin".to_string());
+        let trash_file_name = format!("{id}.{extension}");
+        let destination = dir.join(&trash_file_name);
+        fs::rename(&source, &destination).map_err(|error| format!("无法移动到回收站：{error}"))?;
+
+        let item = TrashItem {
+            id,
+            name: file_name,
+            kind,
+            original_relative_path: relative_path.clone(),
+            trash_file_name,
+            trash_file_path: normalize_path(&destination),
+            size_kb: std::cmp::max(1, metadata.len().div_ceil(1024)),
+            deleted_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            metadata: normalize_folder_asset_metadata(asset_metadata),
+        };
+        created.push(item.clone());
+        manifest.items.push(item);
+    }
+
+    write_trash_manifest(&root, &manifest)?;
+    Ok(created)
+}
+
+#[tauri::command]
+fn list_trash(library_root: String) -> Result<Vec<TrashItem>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+    Ok(read_trash_manifest(&root)?.items)
+}
+
+#[tauri::command]
+fn restore_from_trash(library_root: String, ids: Vec<String>) -> Result<Vec<ScannedAsset>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let mut manifest = read_trash_manifest(&root)?;
+    let wanted: HashSet<&String> = ids.iter().collect();
+    let dir = trash_dir(&root);
+    let mut restored = Vec::new();
+    let mut remaining = Vec::new();
+
+    for item in std::mem::take(&mut manifest.items) {
+        if !wanted.contains(&item.id) {
+            remaining.push(item);
+            continue;
+        }
+
+        let trash_path = dir.join(&item.trash_file_name);
+        if !trash_path.is_file() {
+            continue;
+        }
+
+        let destination = restore_destination(&root, &item.original_relative_path)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("无法创建恢复目录：{error}"))?;
+        }
+        fs::rename(&trash_path, &destination).map_err(|error| format!("无法恢复文件：{error}"))?;
+
+        if let Some(file_name) = destination.file_name().map(|name| name.to_string_lossy().to_string()) {
+            if let Some(folder) = destination.parent() {
+                let metadata_path = folder.join(FOLDER_METADATA_FILE_NAME);
+                let mut folder_metadata = read_folder_metadata(&metadata_path)?;
+                folder_metadata.version = 1;
+                folder_metadata.assets.insert(file_name, item.metadata.clone());
+                write_folder_metadata(&metadata_path, &folder_metadata)?;
+            }
+        }
+
+        restored.push(build_collected_asset(&root, &destination)?);
+    }
+
+    manifest.items = remaining;
+    write_trash_manifest(&root, &manifest)?;
+    Ok(restored)
+}
+
+#[tauri::command]
+fn empty_trash(library_root: String) -> Result<(), String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let dir = trash_dir(&root);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|error| format!("无法清空回收站：{error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchProcessOptions {
+    #[serde(default)]
+    max_edge: Option<u32>,
+    #[serde(default)]
+    scale_percent: Option<u32>,
+    quality: u8,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessedAsset {
+    previous_relative_path: String,
+    previous_size_kb: u64,
+    asset: ScannedAsset,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchProcessResult {
+    processed: Vec<ProcessedAsset>,
+    failed: usize,
+}
+
+fn batch_target_dims(width: u32, height: u32, options: &BatchProcessOptions) -> Option<(u32, u32)> {
+    if let Some(edge) = options.max_edge.filter(|value| *value > 0) {
+        let longest = width.max(height);
+        if longest <= edge {
+            return None;
+        }
+        let scale = edge as f64 / longest as f64;
+        return Some((
+            ((width as f64 * scale).round() as u32).max(1),
+            ((height as f64 * scale).round() as u32).max(1),
+        ));
+    }
+
+    if let Some(percent) = options.scale_percent.filter(|value| *value > 0 && *value < 100) {
+        return Some(((width * percent / 100).max(1), (height * percent / 100).max(1)));
+    }
+
+    None
+}
+
+fn encode_processed_image(
+    path: &Path,
+    image: &image::DynamicImage,
+    ext: &str,
+    quality: u8,
+) -> Result<(), String> {
+    match ext {
+        "jpg" | "jpeg" => write_jpeg(path, image, quality),
+        "png" => write_png(path, image),
+        "webp" => image
+            .save_with_format(path, image::ImageFormat::WebP)
+            .map_err(|error| format!("WebP 编码失败：{error}")),
+        other => Err(format!("不支持处理 {other} 格式")),
+    }
+}
+
+fn process_single_image(
+    root: &Path,
+    relative_path: &str,
+    options: &BatchProcessOptions,
+) -> Result<ProcessedAsset, String> {
+    let source = safe_relative_path(root, relative_path)?;
+    let ext = source
+        .extension()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        return Err("不支持的格式".to_string());
+    }
+
+    let previous_size_kb = std::cmp::max(
+        1,
+        fs::metadata(&source)
+            .map_err(|error| format!("无法读取文件：{error}"))?
+            .len()
+            .div_ceil(1024),
+    );
+    let decoded = image::open(&source).map_err(|error| format!("图片解码失败：{error}"))?;
+    let (width, height) = decoded.dimensions();
+    let resized = match batch_target_dims(width, height, options) {
+        Some((target_width, target_height)) => {
+            decoded.resize(target_width, target_height, FilterType::Lanczos3)
+        }
+        None => decoded,
+    };
+
+    let quality = options.quality.clamp(10, 100);
+    let mut temp_os = source.clone().into_os_string();
+    temp_os.push(".processing");
+    let temp_path = PathBuf::from(temp_os);
+    encode_processed_image(&temp_path, &resized, &ext, quality)?;
+    fs::rename(&temp_path, &source).map_err(|error| format!("无法写回图片：{error}"))?;
+
+    let asset = build_collected_asset(root, &source)?;
+    Ok(ProcessedAsset {
+        previous_relative_path: relative_path.to_string(),
+        previous_size_kb,
+        asset,
+    })
+}
+
+#[tauri::command]
+fn batch_process_images(
+    library_root: String,
+    relative_paths: Vec<String>,
+    options: BatchProcessOptions,
+) -> Result<BatchProcessResult, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let mut processed = Vec::new();
+    let mut failed = 0;
+    for relative_path in &relative_paths {
+        match process_single_image(&root, relative_path, &options) {
+            Ok(result) => processed.push(result),
+            Err(_) => failed += 1,
+        }
+    }
+
+    Ok(BatchProcessResult { processed, failed })
 }
 
 fn generate_thumbnail_result(
@@ -1563,12 +1981,18 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(ThumbnailJobState::default())
         .invoke_handler(tauri::generate_handler![
+            batch_process_images,
             cancel_thumbnail_generation,
             clear_thumbnail_cache,
             collect_image,
+            empty_trash,
             generate_thumbnail,
             generate_thumbnails_stream,
+            list_trash,
+            move_to_trash,
+            prepare_image_for_ocr,
             read_library_settings,
+            restore_from_trash,
             reveal_in_finder,
             scan_library_folder,
             scan_library_folder_stream,
@@ -1890,6 +2314,126 @@ mod tests {
         assert_eq!(entry.tags, vec!["pet".to_string()]);
         assert_eq!(entry.source_url.as_deref(), Some("https://example.com/cat.png"));
         assert!(entry.captured_at.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn prepare_image_for_ocr_returns_jpeg_data_uri() {
+        let root = test_root("ocr-prep");
+        let source_path = root.join("ocr.png");
+        write_rgba_png(&source_path, 64, 48, false);
+
+        let data_uri = prepare_image_for_ocr(normalize_path(&source_path)).unwrap();
+        assert!(data_uri.starts_with("data:image/jpeg;base64,"));
+        let payload = data_uri.trim_start_matches("data:image/jpeg;base64,");
+        assert!(!payload.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_process_resizes_and_recompresses() {
+        let root = test_root("batch");
+        let folder = root.join("Photos");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("big.jpg");
+        let buffer = image::RgbImage::from_fn(800, 600, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        image::DynamicImage::ImageRgb8(buffer).save(&file).unwrap();
+
+        let result = batch_process_images(
+            normalize_path(&root),
+            vec!["Photos/big.jpg".to_string()],
+            BatchProcessOptions {
+                max_edge: Some(400),
+                scale_percent: None,
+                quality: 70,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.processed.len(), 1);
+        let (width, height) = image::image_dimensions(&file).unwrap();
+        assert_eq!(width.max(height), 400);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_process_handles_webp() {
+        let root = test_root("batch-webp");
+        let file = root.join("shot.webp");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 200, image::Rgb([10, 20, 30])))
+            .save_with_format(&file, image::ImageFormat::WebP)
+            .unwrap();
+
+        let result = batch_process_images(
+            normalize_path(&root),
+            vec!["shot.webp".to_string()],
+            BatchProcessOptions {
+                max_edge: Some(150),
+                scale_percent: None,
+                quality: 80,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.failed, 0);
+        let (width, _) = image::image_dimensions(&file).unwrap();
+        assert_eq!(width, 150);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trash_move_restore_and_empty_round_trip() {
+        let root = test_root("trash");
+        let library = normalize_path(&root);
+        let folder = root.join("Icons");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("home.png");
+        write_rgba_png(&file, 32, 32, false);
+
+        write_folder_asset_metadata(
+            library.clone(),
+            "Icons/home.png".to_string(),
+            FolderAssetMetadata {
+                favorite: true,
+                tags: vec!["icon".to_string()],
+                ..FolderAssetMetadata::default()
+            },
+        )
+        .unwrap();
+
+        let trashed = move_to_trash(library.clone(), vec!["Icons/home.png".to_string()]).unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert!(!file.exists());
+        assert!(trashed[0].metadata.favorite);
+        assert_eq!(list_trash(library.clone()).unwrap().len(), 1);
+
+        let restored = restore_from_trash(library.clone(), vec![trashed[0].id.clone()]).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(file.exists());
+        assert!(restored[0].favorite);
+        assert_eq!(restored[0].tags, vec!["icon".to_string()]);
+        assert!(list_trash(library.clone()).unwrap().is_empty());
+
+        move_to_trash(library.clone(), vec!["Icons/home.png".to_string()]).unwrap();
+        assert!(!file.exists());
+        empty_trash(library.clone()).unwrap();
+        assert!(list_trash(library).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

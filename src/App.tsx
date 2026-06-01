@@ -1,22 +1,29 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { open } from '@tauri-apps/plugin-dialog'
+import { confirm as tauriConfirm, open } from '@tauri-apps/plugin-dialog'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
 import type { MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import './App.css'
+import { BatchModal } from './components/BatchModal'
+import type { BatchOptions } from './components/BatchModal'
 import { CollectOverlay } from './components/CollectOverlay'
 import { Lightbox } from './components/Lightbox'
 import { LibraryView } from './components/LibraryView'
+import { OcrModal } from './components/OcrModal'
 import { SettingsPanel } from './components/SettingsPanel'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
+import { TrashView } from './components/TrashView'
 import { assets as sampleAssets } from './data/mockLibrary'
 import { dataTransferHasImage, extractImagePayload } from './lib/collect'
 import type { CollectPayload } from './lib/collect'
+import { formatMb } from './lib/format'
 import { folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
+import { imageUrlToJpegDataUri, recognizeText } from './lib/ocr'
 import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
+import { eventToShortcut } from './lib/shortcut'
 import { sortAssets } from './lib/sort'
 import type {
   Asset,
@@ -32,6 +39,7 @@ import type {
   ThumbnailGenerationState,
   ThumbnailQuality,
   ThumbnailState,
+  TrashItem,
 } from './types/library'
 
 const THUMBNAIL_PRESETS: Record<
@@ -190,6 +198,13 @@ type ThumbnailMetrics = {
 
 type LibrarySettings = {
   folderOrder: string[]
+}
+
+const BATCH_PROCESSABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['png', 'jpg', 'webp'])
+
+type BatchProcessResult = {
+  processed: { previousRelativePath: string; previousSizeKb: number; asset: NativeScannedAsset }[]
+  failed: number
 }
 
 type AssetStore = {
@@ -616,6 +631,8 @@ export default function App() {
   const primaryIdRef = useRef<string | null>(sampleAssets[0].id)
   const selectedIdsRef = useRef<Set<string>>(new Set([sampleAssets[0].id]))
   const thumbnailRunRef = useRef(0)
+  const ocrRunRef = useRef(0)
+  const runDeleteRef = useRef<() => void>(() => {})
   const visualAssetIdsRef = useRef<string[]>(sampleAssets.map((asset) => asset.id))
 
   const [activeFolder, setActiveFolder] = useState('/')
@@ -644,6 +661,17 @@ export default function App() {
   const [themePref, setThemePref] = useState<ThemePref>(
     () => (localStorage.getItem('picman-theme') as ThemePref | null) ?? 'system',
   )
+  const [ocrApiKey, setOcrApiKey] = useState(() => localStorage.getItem('picman-ocr-apikey') ?? '')
+  const [ocrLanguage, setOcrLanguage] = useState(() => localStorage.getItem('picman-ocr-language') ?? 'chs')
+  const [ocr, setOcr] = useState<{ status: 'loading' | 'done' | 'error'; text: string; error?: string } | null>(null)
+  const [trashItems, setTrashItems] = useState<TrashItem[]>([])
+  const [trashView, setTrashView] = useState(false)
+  const [trashSelectedIds, setTrashSelectedIds] = useState<Set<string>>(() => new Set())
+  const [deleteShortcut, setDeleteShortcut] = useState(
+    () => localStorage.getItem('picman-delete-shortcut') ?? 'Meta+Backspace',
+  )
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchProcessing, setBatchProcessing] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(218)
   const [inspectorVisible, setInspectorVisible] = useState(true)
   const [sortDir, setSortDir] = useState<SortDir>('asc')
@@ -781,6 +809,18 @@ export default function App() {
     systemDark.addEventListener('change', apply)
     return () => systemDark.removeEventListener('change', apply)
   }, [themePref])
+
+  useEffect(() => {
+    localStorage.setItem('picman-ocr-apikey', ocrApiKey)
+  }, [ocrApiKey])
+
+  useEffect(() => {
+    localStorage.setItem('picman-ocr-language', ocrLanguage)
+  }, [ocrLanguage])
+
+  useEffect(() => {
+    localStorage.setItem('picman-delete-shortcut', deleteShortcut)
+  }, [deleteShortcut])
 
   const clearScanFlushTimer = useCallback((scan: ActiveNativeScan | null) => {
     if (!scan?.flushTimer) return
@@ -1208,6 +1248,12 @@ export default function App() {
       const tag = (event.target as HTMLElement).tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
 
+      if (deleteShortcut && eventToShortcut(event) === deleteShortcut) {
+        event.preventDefault()
+        runDeleteRef.current()
+        return
+      }
+
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') {
         setSelectedIds(new Set(visibleAssetIds))
         setPrimaryId(visibleAssetIds[0] ?? null)
@@ -1294,6 +1340,7 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [
+    deleteShortcut,
     getCurrentVisualIds,
     getVisibleAssetAt,
     lightboxOpen,
@@ -1367,6 +1414,9 @@ export default function App() {
     setTypeFilter('all')
     setThumbnailState('all')
     setFolderOrder([])
+    setTrashView(false)
+    setTrashItems([])
+    setTrashSelectedIds(new Set())
     setThumbnailGeneration({
       completed: 0,
       failed: 0,
@@ -1393,6 +1443,12 @@ export default function App() {
       void invoke<LibrarySettings>('read_library_settings', { libraryRoot: scan.rootPath })
         .then((settings) => {
           if (activeNativeScanRef.current?.id === scanId) setFolderOrder(settings.folderOrder ?? [])
+        })
+        .catch(() => undefined)
+
+      void invoke<TrashItem[]>('list_trash', { libraryRoot: scan.rootPath })
+        .then((items) => {
+          if (activeNativeScanRef.current?.id === scanId) setTrashItems(items)
         })
         .catch(() => undefined)
     } catch (error) {
@@ -1916,6 +1972,7 @@ export default function App() {
 
       if (!alreadyInLibrary) insertCollectedAsset(asset)
       setLastCollectFolder(asset.folder)
+      setTrashView(false)
       setActiveFolder(asset.folder)
       setSelectedIds(new Set([asset.id]))
       setPrimaryId(asset.id)
@@ -1954,6 +2011,229 @@ export default function App() {
       const message = error instanceof Error ? error.message : '无法打开 Finder'
       setStatusMessage(`无法打开 Finder：${message}`)
     })
+  }
+
+  function closeOcr() {
+    ocrRunRef.current += 1
+    setOcr(null)
+  }
+
+  async function runOcr(asset: Asset) {
+    const apiKey = ocrApiKey.trim()
+    if (!apiKey) {
+      setOcr({ status: 'error', text: '', error: '请先在「偏好设置 → 文字识别」中填写 OCR.space API Key。' })
+      return
+    }
+
+    const runId = ocrRunRef.current + 1
+    ocrRunRef.current = runId
+    setOcr({ status: 'loading', text: '' })
+
+    try {
+      let base64Image: string
+      if (asset.sourcePath) {
+        base64Image = await invoke<string>('prepare_image_for_ocr', { sourcePath: asset.sourcePath })
+      } else if (asset.previewUrl) {
+        base64Image = await imageUrlToJpegDataUri(asset.previewUrl)
+      } else {
+        throw new Error('无法读取图片内容')
+      }
+
+      const text = await recognizeText(base64Image, apiKey, ocrLanguage)
+      if (ocrRunRef.current !== runId) return
+      setOcr({ status: 'done', text })
+    } catch (error) {
+      if (ocrRunRef.current !== runId) return
+      const message = error instanceof Error ? error.message : 'OCR 识别失败'
+      setOcr({ status: 'error', text: '', error: message })
+    }
+  }
+
+  async function confirmAction(message: string, title: string): Promise<boolean> {
+    try {
+      return await tauriConfirm(message, { title, kind: 'warning' })
+    } catch {
+      return window.confirm(message)
+    }
+  }
+
+  function removeAssetsFromLibrary(removedIds: Set<string>) {
+    if (removedIds.size === 0) return
+
+    const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
+    const removedAssets = liveAssets.filter((asset) => removedIds.has(asset.id))
+    revokePreviewUrls(removedAssets)
+    const removedMetrics = deriveThumbnailMetrics(removedAssets)
+    const nextAssets = libraryAssetsRef.current.filter((asset) => !removedIds.has(asset.id))
+    libraryAssetIndexByIdRef.current = createAssetIndexMap(nextAssets)
+
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => {
+        for (const id of removedIds) assetMap.delete(id)
+      }),
+    )
+    setLibraryAssets(nextAssets)
+    if (removedMetrics.generatedCount > 0 || removedMetrics.cacheSize > 0) {
+      setThumbnailMetrics((current) => subtractThumbnailMetrics(current, removedMetrics))
+    }
+    setSelectedIds((current) => new Set([...current].filter((id) => !removedIds.has(id))))
+    setPrimaryId((current) => (current && removedIds.has(current) ? null : current))
+  }
+
+  async function deleteSelectedToTrash() {
+    if (!libraryRootPath) {
+      setStatusMessage('请先打开本地资源目录后再删除')
+      return
+    }
+
+    const targets = [...visibleSelectedIds]
+      .map((id) => assetByIdRef.current.get(id))
+      .filter((asset): asset is Asset => Boolean(asset?.relativePath && asset.sourcePath))
+    if (targets.length === 0) return
+
+    try {
+      const created = await invoke<TrashItem[]>('move_to_trash', {
+        libraryRoot: libraryRootPath,
+        relativePaths: targets.map((asset) => asset.relativePath),
+      })
+      removeAssetsFromLibrary(new Set(targets.map((asset) => asset.id)))
+      setTrashItems((current) => [...created, ...current])
+      setStatusMessage(`已删除 ${created.length} 项到回收站`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '删除失败'
+      setStatusMessage(`删除失败：${message}`)
+    }
+  }
+
+  async function restoreTrashItems(ids: string[]) {
+    if (!libraryRootPath || ids.length === 0) return
+
+    try {
+      const restored = await invoke<NativeScannedAsset[]>('restore_from_trash', {
+        libraryRoot: libraryRootPath,
+        ids,
+      })
+      for (const scanned of restored) {
+        const asset = nativeAssetToFrontend(scanned)
+        if (!assetByIdRef.current.has(asset.id)) insertCollectedAsset(asset)
+      }
+      const idSet = new Set(ids)
+      setTrashItems((current) => current.filter((item) => !idSet.has(item.id)))
+      setTrashSelectedIds((current) => new Set([...current].filter((id) => !idSet.has(id))))
+      setStatusMessage(`已恢复 ${restored.length} 项`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '恢复失败'
+      setStatusMessage(`恢复失败：${message}`)
+    }
+  }
+
+  async function emptyTrash() {
+    if (!libraryRootPath || trashItems.length === 0) return
+
+    const confirmed = await confirmAction(
+      `确定要清空回收站吗？将永久删除 ${trashItems.length} 项，且无法恢复。`,
+      '清空回收站',
+    )
+    if (!confirmed) return
+
+    try {
+      await invoke('empty_trash', { libraryRoot: libraryRootPath })
+      setTrashItems([])
+      setTrashSelectedIds(new Set())
+      setStatusMessage('回收站已清空')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '清空失败'
+      setStatusMessage(`清空失败：${message}`)
+    }
+  }
+
+  function toggleTrashSelect(id: string) {
+    setTrashSelectedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function showTrashView() {
+    setTrashView(true)
+    setTrashSelectedIds(new Set())
+    if (libraryRootPath) {
+      void invoke<TrashItem[]>('list_trash', { libraryRoot: libraryRootPath })
+        .then(setTrashItems)
+        .catch(() => undefined)
+    }
+  }
+
+  function selectFolder(folder: string) {
+    setTrashView(false)
+    setActiveFolder(folder)
+  }
+
+  function selectTag(tag: string) {
+    setTrashView(false)
+    setActiveTag(tag)
+  }
+
+  useEffect(() => {
+    runDeleteRef.current = deleteSelectedToTrash
+  })
+
+  async function regenerateThumbnailsSequentially(assets: Asset[]) {
+    for (const asset of assets) {
+      await generateCollectedThumbnail(asset)
+    }
+  }
+
+  async function runBatchProcess(options: BatchOptions) {
+    if (!libraryRootPath) return
+
+    const targets = [...visibleSelectedIds]
+      .map((id) => assetByIdRef.current.get(id))
+      .filter((asset): asset is Asset => Boolean(asset?.sourcePath && BATCH_PROCESSABLE_KINDS.has(asset.kind)))
+    if (targets.length === 0) {
+      setStatusMessage('所选素材中没有可处理的图片（仅支持 PNG/JPG/WebP）')
+      return
+    }
+
+    setBatchProcessing(true)
+    try {
+      const result = await invoke<BatchProcessResult>('batch_process_images', {
+        libraryRoot: libraryRootPath,
+        relativePaths: targets.map((asset) => asset.relativePath),
+        options: {
+          maxEdge: options.resizeMode === 'maxEdge' ? options.maxEdge : null,
+          scalePercent: options.resizeMode === 'percent' ? options.percent : null,
+          quality: options.quality,
+        },
+      })
+
+      const processedPaths = new Set(result.processed.map((entry) => entry.previousRelativePath))
+      const removedIds = new Set(
+        targets.filter((asset) => processedPaths.has(asset.relativePath)).map((asset) => asset.id),
+      )
+      removeAssetsFromLibrary(removedIds)
+
+      const newAssets = result.processed.map((entry) => nativeAssetToFrontend(entry.asset))
+      for (const asset of newAssets) insertCollectedAsset(asset)
+      setSelectedIds(new Set(newAssets.map((asset) => asset.id)))
+      setPrimaryId(newAssets[0]?.id ?? null)
+
+      const previousKb = result.processed.reduce((sum, entry) => sum + entry.previousSizeKb, 0)
+      const nextKb = newAssets.reduce((sum, asset) => sum + asset.sizeKb, 0)
+      const savedPercent = previousKb > 0 ? Math.max(0, Math.round((1 - nextKb / previousKb) * 100)) : 0
+      setStatusMessage(
+        `已处理 ${result.processed.length} 张${result.failed ? ` · 失败 ${result.failed}` : ''} · ${formatMb(previousKb)} → ${formatMb(nextKb)}（省 ${savedPercent}%）`,
+      )
+      setBatchOpen(false)
+      void regenerateThumbnailsSequentially(newAssets)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '批量处理失败'
+      setStatusMessage(`批量处理失败：${message}`)
+    } finally {
+      setBatchProcessing(false)
+    }
   }
 
   function writeAssetToStore(updatedAsset: Asset) {
@@ -2091,10 +2371,14 @@ export default function App() {
           canReveal={Boolean(libraryRootPath)}
           folders={orderedFolders}
           libraryName={libraryName}
+          trashActive={trashView}
+          trashCount={trashItems.length}
+          onEmptyTrash={emptyTrash}
           onRevealLibrary={revealLibraryInFinder}
           onReorderFolders={reorderFolders}
-          onSetActiveFolder={setActiveFolder}
-          onSetActiveTag={setActiveTag}
+          onSetActiveFolder={selectFolder}
+          onSetActiveTag={selectTag}
+          onShowTrash={showTrashView}
         />
 
         <div
@@ -2106,6 +2390,17 @@ export default function App() {
         />
 
         <div className="workspace">
+          {trashView ? (
+            <TrashView
+              items={trashItems}
+              selectedIds={trashSelectedIds}
+              thumbSize={thumbSize}
+              onBack={() => setTrashView(false)}
+              onEmpty={emptyTrash}
+              onRestore={restoreTrashItems}
+              onToggleSelect={(id) => toggleTrashSelect(id)}
+            />
+          ) : (
           <LibraryView
             activeTag={activeTag}
             activeFilterCount={activeFilterCount}
@@ -2135,7 +2430,10 @@ export default function App() {
             onOpenFolder={openLibraryFolder}
             onRefresh={refreshLibrary}
             onRemoveAssetTag={removeAssetTag}
-            onSetActiveTag={setActiveTag}
+            onOcr={runOcr}
+            onDeleteSelected={deleteSelectedToTrash}
+            onOpenBatch={() => setBatchOpen(true)}
+            onSetActiveTag={selectTag}
             onSetAssetFavorite={setAssetFavorite}
             onSetFiltersOpen={setFiltersOpen}
             onSetQuery={setQuery}
@@ -2149,6 +2447,7 @@ export default function App() {
             onUpdateAssetNote={updateAssetNote}
             onVisualOrderChange={handleVisualOrderChange}
           />
+          )}
         </div>
       </div>
 
@@ -2156,9 +2455,12 @@ export default function App() {
         <SettingsPanel
           cacheLimit={cacheLimit}
           cacheSize={cacheSize}
+          deleteShortcut={deleteShortcut}
           folders={thumbnailFolders}
           generatedCount={generatedCount}
           libraryName={libraryName}
+          ocrApiKey={ocrApiKey}
+          ocrLanguage={ocrLanguage}
           pendingCount={pendingCount}
           selectionKeyAxis={selectionKeyAxis}
           sourceSize={sourceSize}
@@ -2173,9 +2475,29 @@ export default function App() {
           onGenerateFolderThumbnails={generateFolderThumbnails}
           onOpenFolder={openLibraryFolder}
           onSetCacheLimit={setCacheLimit}
+          onSetDeleteShortcut={setDeleteShortcut}
+          onSetOcrApiKey={setOcrApiKey}
+          onSetOcrLanguage={setOcrLanguage}
           onSetSelectionKeyAxis={setSelectionKeyAxis}
           onSetThemePref={setThemePref}
           onSetThumbnailQuality={setThumbnailQuality}
+        />
+      )}
+
+      {ocr && <OcrModal status={ocr.status} text={ocr.text} error={ocr.error} onClose={closeOcr} />}
+
+      {batchOpen && (
+        <BatchModal
+          selectedCount={visibleSelectedIds.size}
+          processableCount={
+            [...visibleSelectedIds].filter((id) => {
+              const asset = assetById.get(id)
+              return Boolean(asset && BATCH_PROCESSABLE_KINDS.has(asset.kind))
+            }).length
+          }
+          processing={batchProcessing}
+          onClose={() => !batchProcessing && setBatchOpen(false)}
+          onStart={runBatchProcess}
         />
       )}
 
