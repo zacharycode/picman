@@ -7,9 +7,13 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
     "core:window:allow-start-dragging",
     "dialog:allow-open",
     "dialog:allow-confirm",
+    "drag:allow-start-drag",
     "process:allow-restart",
     "updater:default"
   ]

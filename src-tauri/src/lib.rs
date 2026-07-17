@@ -16,6 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use walkdir::WalkDir;
 
 const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v2-alpha-aware";
@@ -1629,6 +1630,317 @@ fn batch_process_images(
     Ok(BatchProcessResult { processed, failed })
 }
 
+#[tauri::command]
+fn copy_image_to_clipboard(app: AppHandle, source_path: String) -> Result<(), String> {
+    let path = PathBuf::from(&source_path);
+    if !path.is_file() {
+        return Err("图片文件不存在".to_string());
+    }
+
+    let rgba = image::open(&path)
+        .map_err(|error| format!("图片解码失败：{error}"))?
+        .to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let image = tauri::image::Image::new_owned(rgba.into_raw(), width, height);
+
+    app.clipboard()
+        .write_image(&image)
+        .map_err(|error| format!("复制到剪贴板失败：{error}"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MovedAsset {
+    previous_relative_path: String,
+    asset: ScannedAsset,
+}
+
+fn unique_dest_path(folder_dir: &Path, file_name: &str) -> PathBuf {
+    let base = folder_dir.join(file_name);
+    if !base.exists() {
+        return base;
+    }
+
+    let name = Path::new(file_name);
+    let stem = name
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = name.extension().map(|value| value.to_string_lossy().to_string());
+
+    for suffix in 1..10000 {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({suffix}).{ext}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = folder_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    base
+}
+
+#[tauri::command]
+fn move_assets(
+    library_root: String,
+    relative_paths: Vec<String>,
+    target_folder: String,
+) -> Result<Vec<MovedAsset>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let folder_dir = resolve_collect_folder(&root, &target_folder)?;
+    let canonical_target = fs::canonicalize(&folder_dir).unwrap_or_else(|_| folder_dir.clone());
+    let mut moved = Vec::new();
+
+    for relative_path in &relative_paths {
+        let source = safe_relative_path(&root, relative_path)?;
+        if !source.is_file() {
+            continue;
+        }
+
+        let source_parent = source.parent().ok_or_else(|| "文件夹无效".to_string())?;
+        let canonical_source_parent =
+            fs::canonicalize(source_parent).unwrap_or_else(|_| source_parent.to_path_buf());
+        if canonical_source_parent == canonical_target {
+            continue;
+        }
+
+        let file_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "文件名无效".to_string())?;
+
+        let source_meta_path = source_parent.join(FOLDER_METADATA_FILE_NAME);
+        let mut source_metadata = read_folder_metadata(&source_meta_path)?;
+        let asset_metadata = source_metadata.assets.remove(&file_name);
+        if source_meta_path.exists() {
+            write_folder_metadata(&source_meta_path, &source_metadata)?;
+        }
+
+        let destination = unique_dest_path(&folder_dir, &file_name);
+        fs::rename(&source, &destination).map_err(|error| format!("无法移动文件：{error}"))?;
+
+        if let Some(metadata) = asset_metadata {
+            if let Some(dest_name) = destination
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+            {
+                let dest_meta_path = folder_dir.join(FOLDER_METADATA_FILE_NAME);
+                let mut dest_metadata = read_folder_metadata(&dest_meta_path)?;
+                dest_metadata.version = 1;
+                dest_metadata.assets.insert(dest_name, metadata);
+                write_folder_metadata(&dest_meta_path, &dest_metadata)?;
+            }
+        }
+
+        moved.push(MovedAsset {
+            previous_relative_path: relative_path.clone(),
+            asset: build_collected_asset(&root, &destination)?,
+        });
+    }
+
+    Ok(moved)
+}
+
+#[tauri::command]
+fn rename_asset(
+    library_root: String,
+    relative_path: String,
+    new_name: String,
+) -> Result<ScannedAsset, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let source = safe_relative_path(&root, &relative_path)?;
+    if !source.is_file() {
+        return Err("文件不存在".to_string());
+    }
+
+    let folder = source.parent().ok_or_else(|| "文件夹无效".to_string())?;
+    let old_name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| "文件名无效".to_string())?;
+    let original_ext = source
+        .extension()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("文件名不能为空".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("文件名不能包含路径分隔符".to_string());
+    }
+
+    let new_file_name = if Path::new(trimmed).extension().is_some() || original_ext.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.{original_ext}")
+    };
+
+    let destination = folder.join(&new_file_name);
+    if destination == source {
+        return build_collected_asset(&root, &source);
+    }
+    if destination.exists() {
+        return Err("已存在同名文件".to_string());
+    }
+
+    fs::rename(&source, &destination).map_err(|error| format!("无法重命名文件：{error}"))?;
+
+    let metadata_path = folder.join(FOLDER_METADATA_FILE_NAME);
+    let mut folder_metadata = read_folder_metadata(&metadata_path)?;
+    if let Some(asset_metadata) = folder_metadata.assets.remove(&old_name) {
+        folder_metadata.version = 1;
+        folder_metadata.assets.insert(new_file_name, asset_metadata);
+        write_folder_metadata(&metadata_path, &folder_metadata)?;
+    }
+
+    build_collected_asset(&root, &destination)
+}
+
+#[tauri::command]
+fn rename_folder(
+    library_root: String,
+    folder_relative_path: String,
+    new_name: String,
+) -> Result<Vec<MovedAsset>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+
+    let trimmed = folder_relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("无法重命名库根目录".to_string());
+    }
+
+    let source = safe_library_path(&root, trimmed)?;
+    if !source.is_dir() {
+        return Err("文件夹不存在".to_string());
+    }
+
+    let name = new_name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".picman" {
+        return Err("文件夹名无效".to_string());
+    }
+
+    let parent = source.parent().ok_or_else(|| "文件夹无效".to_string())?;
+    let destination = parent.join(name);
+    if destination == source {
+        return Ok(Vec::new());
+    }
+    if destination.exists() {
+        return Err("已存在同名文件夹".to_string());
+    }
+
+    fs::rename(&source, &destination).map_err(|error| format!("无法重命名文件夹：{error}"))?;
+
+    // The whole directory (assets + nested .picman.folder.json) moved together;
+    // re-scan it so the frontend can remap every affected asset's id/path.
+    let mut folder_metadata = FolderMetadataCache::default();
+    let cache_probe = ThumbnailCacheProbe::new(&root);
+    let mut remaps = Vec::new();
+    let mut index = 0usize;
+
+    for entry in WalkDir::new(&destination)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".picman")
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if get_kind(path).is_none() {
+            continue;
+        }
+
+        if let Some(asset) =
+            scanned_asset_from_path(&root, path, index, &mut folder_metadata, &cache_probe)
+        {
+            index += 1;
+            let relative_to_dest = path
+                .strip_prefix(&destination)
+                .map(normalize_relative_path)
+                .unwrap_or_default();
+            remaps.push(MovedAsset {
+                previous_relative_path: format!("{trimmed}/{relative_to_dest}"),
+                asset,
+            });
+        }
+    }
+
+    Ok(remaps)
+}
+
+fn rotate_single_image(
+    root: &Path,
+    relative_path: &str,
+    quarter_turns: u32,
+) -> Result<MovedAsset, String> {
+    let source = safe_relative_path(root, relative_path)?;
+    let ext = source
+        .extension()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+        return Err("不支持的格式".to_string());
+    }
+
+    let decoded = image::open(&source).map_err(|error| format!("图片解码失败：{error}"))?;
+    let rotated = match quarter_turns % 4 {
+        1 => decoded.rotate90(),
+        2 => decoded.rotate180(),
+        3 => decoded.rotate270(),
+        _ => decoded,
+    };
+
+    // Re-encode at high quality to limit loss on JPEG; PNG/WebP stay lossless.
+    let mut temp_os = source.clone().into_os_string();
+    temp_os.push(".rotating");
+    let temp_path = PathBuf::from(temp_os);
+    encode_processed_image(&temp_path, &rotated, &ext, 95)?;
+    fs::rename(&temp_path, &source).map_err(|error| format!("无法写回图片：{error}"))?;
+
+    Ok(MovedAsset {
+        previous_relative_path: relative_path.to_string(),
+        asset: build_collected_asset(root, &source)?,
+    })
+}
+
+#[tauri::command]
+fn rotate_images(
+    library_root: String,
+    relative_paths: Vec<String>,
+    quarter_turns: u32,
+) -> Result<Vec<MovedAsset>, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+    if quarter_turns % 4 == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut rotated = Vec::new();
+    for relative_path in &relative_paths {
+        if let Ok(item) = rotate_single_image(&root, relative_path, quarter_turns) {
+            rotated.push(item);
+        }
+    }
+    Ok(rotated)
+}
+
 fn generate_thumbnail_result(
     root: &Path,
     source: &ThumbnailSource,
@@ -1979,13 +2291,26 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_drag::init())
         .manage(ThumbnailJobState::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             batch_process_images,
             cancel_thumbnail_generation,
             clear_thumbnail_cache,
             collect_image,
+            copy_image_to_clipboard,
             empty_trash,
+            move_assets,
+            rename_asset,
+            rename_folder,
+            rotate_images,
             generate_thumbnail,
             generate_thumbnails_stream,
             list_trash,
@@ -2009,8 +2334,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -2337,6 +2670,118 @@ mod tests {
         assert!(data_uri.starts_with("data:image/jpeg;base64,"));
         let payload = data_uri.trim_start_matches("data:image/jpeg;base64,");
         assert!(!payload.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_and_rename_carry_metadata() {
+        let root = test_root("move-rename");
+        let library = normalize_path(&root);
+        let icons = root.join("Icons");
+        fs::create_dir_all(&icons).unwrap();
+        let file = icons.join("home.png");
+        write_rgba_png(&file, 32, 32, false);
+        write_folder_asset_metadata(
+            library.clone(),
+            "Icons/home.png".to_string(),
+            FolderAssetMetadata {
+                favorite: true,
+                tags: vec!["icon".to_string()],
+                ..FolderAssetMetadata::default()
+            },
+        )
+        .unwrap();
+
+        // Move into a new folder (created on demand).
+        let moved = move_assets(
+            library.clone(),
+            vec!["Icons/home.png".to_string()],
+            "Web".to_string(),
+        )
+        .unwrap();
+        assert_eq!(moved.len(), 1);
+        assert!(!file.exists());
+        assert!(root.join("Web").join("home.png").is_file());
+        assert_eq!(moved[0].asset.folder, "/Web");
+        assert!(moved[0].asset.favorite);
+        assert_eq!(moved[0].asset.tags, vec!["icon".to_string()]);
+
+        // Rename within the new folder, preserving metadata.
+        let renamed = rename_asset(library, "Web/home.png".to_string(), "house".to_string()).unwrap();
+        assert!(root.join("Web").join("house.png").is_file());
+        assert!(!root.join("Web").join("home.png").exists());
+        assert_eq!(renamed.name, "house.png");
+        assert!(renamed.favorite);
+        assert_eq!(renamed.tags, vec!["icon".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_folder_remaps_contained_assets() {
+        let root = test_root("rename-folder");
+        let library = normalize_path(&root);
+        let icons = root.join("Icons");
+        let nested = icons.join("Web");
+        fs::create_dir_all(&nested).unwrap();
+        write_rgba_png(&icons.join("home.png"), 16, 16, false);
+        write_rgba_png(&nested.join("cart.png"), 16, 16, false);
+        write_folder_asset_metadata(
+            library.clone(),
+            "Icons/home.png".to_string(),
+            FolderAssetMetadata {
+                tags: vec!["ui".to_string()],
+                ..FolderAssetMetadata::default()
+            },
+        )
+        .unwrap();
+
+        let remaps = rename_folder(library, "Icons".to_string(), "Symbols".to_string()).unwrap();
+
+        assert!(!icons.exists());
+        assert!(root.join("Symbols").join("home.png").is_file());
+        assert!(root.join("Symbols").join("Web").join("cart.png").is_file());
+        assert_eq!(remaps.len(), 2);
+
+        let home = remaps
+            .iter()
+            .find(|item| item.previous_relative_path == "Icons/home.png")
+            .unwrap();
+        assert_eq!(home.asset.folder, "/Symbols");
+        assert_eq!(home.asset.tags, vec!["ui".to_string()]);
+        assert!(remaps
+            .iter()
+            .any(|item| item.previous_relative_path == "Icons/Web/cart.png"
+                && item.asset.folder == "/Symbols/Web"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rotate_swaps_dimensions_and_keeps_metadata() {
+        let root = test_root("rotate");
+        let library = normalize_path(&root);
+        let folder = root.join("Photos");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("shot.png");
+        write_rgba_png(&file, 60, 40, false);
+        write_folder_asset_metadata(
+            library.clone(),
+            "Photos/shot.png".to_string(),
+            FolderAssetMetadata {
+                favorite: true,
+                ..FolderAssetMetadata::default()
+            },
+        )
+        .unwrap();
+
+        let rotated = rotate_images(library, vec!["Photos/shot.png".to_string()], 1).unwrap();
+        assert_eq!(rotated.len(), 1);
+        assert!(rotated[0].asset.favorite);
+
+        let (width, height) = image::image_dimensions(&file).unwrap();
+        assert_eq!((width, height), (40, 60));
 
         let _ = fs::remove_dir_all(root);
     }

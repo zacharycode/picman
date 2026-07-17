@@ -9,7 +9,6 @@ type TrashViewProps = {
   thumbSize: number
   onToggleSelect: (id: string, event: MouseEvent) => void
   onRestore: (ids: string[]) => void
-  onEmpty: () => void
   onBack: () => void
 }
 
@@ -19,7 +18,6 @@ export function TrashView({
   thumbSize,
   onToggleSelect,
   onRestore,
-  onEmpty,
   onBack,
 }: TrashViewProps) {
   const selectedCount = selectedIds.size
@@ -38,9 +36,6 @@ export function TrashView({
             onClick={() => onRestore([...selectedIds])}
           >
             <RotateCcw size={13} /> 恢复所选{selectedCount > 0 ? `（${selectedCount}）` : ''}
-          </button>
-          <button className="trash-action danger" disabled={items.length === 0} onClick={onEmpty}>
-            <Trash2 size={13} /> 清空回收站
           </button>
         </div>
       </div>

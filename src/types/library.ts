@@ -54,6 +54,7 @@ export type SortField = 'name' | 'date' | 'size' | 'type'
 export type SortDir = 'asc' | 'desc'
 export type AssetViewMode = 'adaptive' | 'masonry' | 'list'
 export type SelectionKeyAxis = 'horizontal' | 'vertical'
+export type ScrollJumpCommand = { edge: 'bottom' | 'top'; id: number }
 export type ThumbnailFormat = 'jpeg' | 'png' | 'svg' | 'webp'
 export type ThumbnailQuality = 'compact' | 'standard' | 'high'
 export type AppUpdateStatus =

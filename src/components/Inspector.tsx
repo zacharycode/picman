@@ -1,4 +1,4 @@
-import { FileImage, Heart, Plus, ScanText, Smile, Tag, X } from 'lucide-react'
+import { FileImage, Heart, Plus, RotateCcw, RotateCw, ScanText, Smile, Tag, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset } from '../types/library'
@@ -34,6 +34,7 @@ type InspectorProps = {
   asset: Asset
   onAddTag: (assetId: string, tag: string) => void
   onOcr: (asset: Asset) => void
+  onRotate: (asset: Asset, quarterTurns: number) => void
   onRemoveTag: (assetId: string, tag: string) => void
   onSetFavorite: (assetId: string, favorite: boolean) => void
   onSelectTag: (tag: string) => void
@@ -46,11 +47,13 @@ export function Inspector({
   asset,
   onAddTag,
   onOcr,
+  onRotate,
   onRemoveTag,
   onSetFavorite,
   onSelectTag,
   onUpdateNote,
 }: InspectorProps) {
+  const canRotate = asset.kind === 'png' || asset.kind === 'jpg' || asset.kind === 'webp'
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [failedPreviewKey, setFailedPreviewKey] = useState<string | null>(null)
   const [noteDraft, setNoteDraft] = useState(asset.note)
@@ -113,15 +116,35 @@ export function Inspector({
           </button>
         </div>
         <div className="insp-path">{asset.relativePath}</div>
-        <button
-          className="insp-ocr-btn"
-          disabled={asset.kind === 'svg'}
-          title={asset.kind === 'svg' ? '矢量图暂不支持文字识别' : '识别图片中的文字'}
-          type="button"
-          onClick={() => onOcr(asset)}
-        >
-          <ScanText size={13} /> 识别文字
-        </button>
+        <div className="insp-actions-row">
+          <button
+            className="insp-ocr-btn"
+            disabled={asset.kind === 'svg'}
+            title={asset.kind === 'svg' ? '矢量图暂不支持文字识别' : '识别图片中的文字'}
+            type="button"
+            onClick={() => onOcr(asset)}
+          >
+            <ScanText size={13} /> 识别文字
+          </button>
+          <button
+            className="insp-rotate-btn"
+            disabled={!canRotate}
+            title={canRotate ? '向左旋转 90°（保存）' : '该格式暂不支持旋转'}
+            type="button"
+            onClick={() => onRotate(asset, 3)}
+          >
+            <RotateCcw size={14} />
+          </button>
+          <button
+            className="insp-rotate-btn"
+            disabled={!canRotate}
+            title={canRotate ? '向右旋转 90°（保存）' : '该格式暂不支持旋转'}
+            type="button"
+            onClick={() => onRotate(asset, 1)}
+          >
+            <RotateCw size={14} />
+          </button>
+        </div>
       </div>
       <div className="insp-section">
         <div className="insp-title">素材信息</div>

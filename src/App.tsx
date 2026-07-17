@@ -4,33 +4,45 @@ import { listen } from '@tauri-apps/api/event'
 import { confirm as tauriConfirm, open } from '@tauri-apps/plugin-dialog'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
-import type { MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import type { DragEvent as ReactDragEvent, MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import './App.css'
+import { Copy, FolderInput, Pencil, Trash2 } from 'lucide-react'
 import { BatchModal } from './components/BatchModal'
 import type { BatchOptions } from './components/BatchModal'
 import { CollectOverlay } from './components/CollectOverlay'
+import { ContextMenu } from './components/ContextMenu'
+import type { ContextMenuItem } from './components/ContextMenu'
 import { Lightbox } from './components/Lightbox'
 import { LibraryView } from './components/LibraryView'
+import { MovePicker } from './components/MovePicker'
 import { OcrModal } from './components/OcrModal'
+import { RenameModal } from './components/RenameModal'
 import { SettingsPanel } from './components/SettingsPanel'
 import { Sidebar } from './components/Sidebar'
+import { ThumbnailPromptModal } from './components/ThumbnailPromptModal'
 import { TopBar } from './components/TopBar'
 import { TrashView } from './components/TrashView'
 import { assets as sampleAssets } from './data/mockLibrary'
 import { dataTransferHasImage, extractImagePayload } from './lib/collect'
 import type { CollectPayload } from './lib/collect'
 import { formatMb } from './lib/format'
-import { folderName, revokePreviewUrls, revokeThumbnailUrls, scanFilesInBatches } from './lib/library'
+import { folderName, revokePreviewUrls, scanFilesInBatches } from './lib/library'
 import { imageUrlToJpegDataUri, recognizeText } from './lib/ocr'
+import { readAppPrefs, updateAppPrefs, writeAppPrefs } from './lib/prefs'
+import type { PicmanAppPrefs } from './lib/prefs'
+import { createRafNumberCommitter } from './lib/rafState'
+import { startAssetDrag } from './lib/drag'
 import { createAssetSearchText, normalizeSearchText, withAssetSearchText } from './lib/search'
 import { eventToShortcut } from './lib/shortcut'
-import { sortAssets } from './lib/sort'
+import { sortAssetIds } from './lib/sort'
 import type {
   Asset,
   AssetKind,
   AssetViewMode,
   AppUpdateState,
   FolderNode,
+  ScrollJumpCommand,
   SelectionKeyAxis,
   SortDir,
   SortField,
@@ -62,6 +74,7 @@ const THUMBNAIL_BATCH_EVENT = 'picman-thumbnail-batch'
 const THUMBNAIL_FINISHED_EVENT = 'picman-thumbnail-finished'
 const THUMBNAIL_UPDATE_FLUSH_MS = 180
 const THUMBNAIL_UPDATE_FLUSH_THRESHOLD = 256
+const SCROLL_POSITION_SAVE_MS = 320
 
 type EncodedThumbnail = {
   format: ThumbnailFormat
@@ -112,6 +125,13 @@ type NativeThumbnailJobStartResponse = {
   total: number
 }
 
+type NativeThumbnailSource = {
+  id: string
+  kind: Asset['kind']
+  relativePath: string
+  sourcePath: string
+}
+
 type NativeThumbnailUpdate = {
   assetId: string
   error?: string | null
@@ -146,6 +166,7 @@ type ActiveNativeScan = {
   firstSelected: boolean
   flushTimer?: number
   id: string
+  lastStatusAt: number
   libraryName: string
   mode: NativeScanMode
   pendingAssets: Asset[]
@@ -186,8 +207,10 @@ type FolderAssetMetadataPayload = {
 
 type LibraryCatalogState = {
   allTags: string[]
+  folderCounts: Map<string, number>
   folders: FolderNode[]
   sourceSize: number
+  tagCounts: Map<string, number>
   thumbnailFolders: FolderNode[]
 }
 
@@ -200,6 +223,11 @@ type LibrarySettings = {
   folderOrder: string[]
 }
 
+type RestoreLibraryOptions = {
+  activeFolder?: string
+  activeTag?: string
+}
+
 const BATCH_PROCESSABLE_KINDS: ReadonlySet<AssetKind> = new Set<AssetKind>(['png', 'jpg', 'webp'])
 
 type BatchProcessResult = {
@@ -209,10 +237,24 @@ type BatchProcessResult = {
 
 type AssetStore = {
   byId: Map<string, Asset>
+  layoutVersion: number
   version: number
 }
 
+type VisibleLookupCache = {
+  idSet?: Set<string>
+  ids: string[]
+  indexById?: Map<string, number>
+}
+
 const LARGE_SCAN_SORT_THRESHOLD = 2000
+const OPEN_SCAN_FAST_FLUSH_MS = 90
+const OPEN_SCAN_STEADY_FLUSH_MS = 180
+const OPEN_SCAN_STEADY_PENDING_THRESHOLD = 1500
+const OPEN_SCAN_FORCE_FLUSH_THRESHOLD = 4000
+const SCAN_STATUS_UPDATE_MS = 240
+const SAMPLE_LIBRARY_NAME = 'DesignAssets'
+const VISIBLE_LOOKUP_LINEAR_THRESHOLD = 160
 
 function createAssetMap(assets: Asset[]): Map<string, Asset> {
   const assetMap = new Map<string, Asset>()
@@ -230,6 +272,47 @@ function createAssetIndexMap(assets: Asset[]): Map<string, number> {
 
 function appendAssetsToAssetMap(assetMap: Map<string, Asset>, incoming: Asset[]) {
   for (const asset of incoming) assetMap.set(asset.id, asset)
+  return incoming.length > 0
+}
+
+function assetIdsFromAssets(assets: Asset[]) {
+  const assetIds = new Array<string>(assets.length)
+  for (let index = 0; index < assets.length; index += 1) {
+    assetIds[index] = assets[index].id
+  }
+  return assetIds
+}
+
+function appendItems<T>(current: T[], incoming: T[]) {
+  if (incoming.length === 0) return current
+
+  const currentLength = current.length
+  const next = new Array<T>(currentLength + incoming.length)
+  for (let index = 0; index < currentLength; index += 1) next[index] = current[index]
+  for (let index = 0; index < incoming.length; index += 1) next[currentLength + index] = incoming[index]
+  return next
+}
+
+function pushItems<T>(target: T[], incoming: T[]) {
+  for (const item of incoming) target.push(item)
+}
+
+function appendAssetIds(current: string[], incoming: Asset[]) {
+  if (incoming.length === 0) return current
+
+  const currentLength = current.length
+  const next = new Array<string>(currentLength + incoming.length)
+  for (let index = 0; index < currentLength; index += 1) next[index] = current[index]
+  for (let index = 0; index < incoming.length; index += 1) next[currentLength + index] = incoming[index].id
+  return next
+}
+
+function createVisibleIndexMap(assetIds: string[]) {
+  const indexById = new Map<string, number>()
+  for (let index = 0; index < assetIds.length; index += 1) {
+    indexById.set(assetIds[index], index)
+  }
+  return indexById
 }
 
 function appendAssetIndexes(indexById: Map<string, number>, startIndex: number, incoming: Asset[]) {
@@ -258,44 +341,115 @@ function applyAssetUpdatesToArray(
   return next ?? assets
 }
 
+function assetUpdateAffectsLayout(asset: Asset, update: Partial<Asset>) {
+  return (
+    (update.dimensions !== undefined && update.dimensions !== asset.dimensions) ||
+    (update.height !== undefined && update.height !== asset.height) ||
+    (update.thumbnailHeight !== undefined && update.thumbnailHeight !== asset.thumbnailHeight) ||
+    (update.thumbnailWidth !== undefined && update.thumbnailWidth !== asset.thumbnailWidth) ||
+    (update.width !== undefined && update.width !== asset.width)
+  )
+}
+
+function sameTags(a: string[], b: string[]) {
+  if (a.length !== b.length) return false
+
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false
+  }
+
+  return true
+}
+
+function assetUpdateAffectsCatalog(previous: Asset | undefined, next: Asset) {
+  return (
+    !previous ||
+    previous.folder !== next.folder ||
+    previous.sizeKb !== next.sizeKb ||
+    !sameTags(previous.tags, next.tags)
+  )
+}
+
+function assetUpdateCanPatchCatalogTags(previous: Asset | undefined, next: Asset) {
+  return Boolean(previous && previous.folder === next.folder && previous.sizeKb === next.sizeKb)
+}
+
 function applyAssetUpdatesToMap(assetMap: Map<string, Asset>, updates: Map<string, Partial<Asset>>) {
+  let layoutChanged = false
+
   for (const [assetId, update] of updates) {
     const asset = assetMap.get(assetId)
     if (!asset) continue
 
+    if (assetUpdateAffectsLayout(asset, update)) layoutChanged = true
     assetMap.set(assetId, { ...asset, ...update })
+  }
+
+  return layoutChanged
+}
+
+function clearThumbnailUpdate(): Partial<Asset> {
+  return {
+    thumbnailError: undefined,
+    thumbnailFormat: undefined,
+    thumbnailHeight: undefined,
+    thumbnailPath: undefined,
+    thumbnailQuality: undefined,
+    thumbnailReady: false,
+    thumbnailSizeKb: undefined,
+    thumbnailUrl: undefined,
+    thumbnailVersion: undefined,
+    thumbnailWidth: undefined,
   }
 }
 
-function buildThumbnailClearUpdates(assets: Asset[]) {
+function prepareThumbnailClearPatch(assets: Iterable<Asset>) {
+  const metrics: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }
   const updates = new Map<string, Partial<Asset>>()
 
   for (const asset of assets) {
-    updates.set(asset.id, {
-      thumbnailError: undefined,
-      thumbnailFormat: undefined,
-      thumbnailHeight: undefined,
-      thumbnailPath: undefined,
-      thumbnailQuality: undefined,
-      thumbnailReady: false,
-      thumbnailSizeKb: undefined,
-      thumbnailUrl: undefined,
-      thumbnailVersion: undefined,
-      thumbnailWidth: undefined,
-    })
+    if (asset.thumbnailUrl?.startsWith('blob:')) URL.revokeObjectURL(asset.thumbnailUrl)
+    if (asset.thumbnailReady) {
+      metrics.generatedCount += 1
+      metrics.cacheSize += asset.thumbnailSizeKb ?? 0
+    }
+    updates.set(asset.id, clearThumbnailUpdate())
   }
 
-  return updates
+  return { metrics, updates }
 }
 
 function getLiveAssets(sourceAssets: Asset[], assetById: Map<string, Asset>) {
-  return sourceAssets.map((asset) => assetById.get(asset.id) ?? asset)
+  const liveAssets = new Array<Asset>(sourceAssets.length)
+  for (let index = 0; index < sourceAssets.length; index += 1) {
+    const asset = sourceAssets[index]
+    liveAssets[index] = assetById.get(asset.id) ?? asset
+  }
+  return liveAssets
 }
 
-function updateAssetStore(store: AssetStore, update: (assetMap: Map<string, Asset>) => void): AssetStore {
-  update(store.byId)
+function createNativeThumbnailSources(targetAssets: Asset[]) {
+  const sources = new Array<NativeThumbnailSource>(targetAssets.length)
+  for (let index = 0; index < targetAssets.length; index += 1) {
+    const asset = targetAssets[index]
+    const sourcePath = asset.sourcePath
+    if (!sourcePath) return null
+
+    sources[index] = {
+      id: asset.id,
+      kind: asset.kind,
+      relativePath: asset.relativePath,
+      sourcePath,
+    }
+  }
+  return sources
+}
+
+function updateAssetStore(store: AssetStore, update: (assetMap: Map<string, Asset>) => boolean | void): AssetStore {
+  const layoutChanged = Boolean(update(store.byId))
   return {
     byId: store.byId,
+    layoutVersion: layoutChanged ? store.layoutVersion + 1 : store.layoutVersion,
     version: store.version + 1,
   }
 }
@@ -303,6 +457,7 @@ function updateAssetStore(store: AssetStore, update: (assetMap: Map<string, Asse
 function replaceAssetStore(store: AssetStore, assets: Asset[]): AssetStore {
   return {
     byId: createAssetMap(assets),
+    layoutVersion: store.layoutVersion + 1,
     version: store.version + 1,
   }
 }
@@ -314,6 +469,57 @@ function blurActiveElement() {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
+}
+
+function clampedPrefNumber(value: unknown, fallback: number, min: number, max: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? clamp(value, min, max) : fallback
+}
+
+function prefViewMode(value: unknown): AssetViewMode {
+  return value === 'adaptive' || value === 'masonry' || value === 'list' ? value : 'adaptive'
+}
+
+function prefSortDir(value: unknown): SortDir {
+  return value === 'desc' ? 'desc' : 'asc'
+}
+
+function prefSortField(value: unknown): SortField {
+  return value === 'date' || value === 'size' || value === 'type' ? value : 'name'
+}
+
+function createScrollRestoreKey(
+  libraryRootPath: string | null,
+  activeFolder: string,
+  activeTag: string,
+  viewMode: AssetViewMode,
+  typeFilter: 'all' | AssetKind,
+  thumbnailState: ThumbnailState,
+  sortField: SortField,
+  sortDir: SortDir,
+) {
+  return [libraryRootPath ?? 'sample', activeFolder, activeTag, viewMode, typeFilter, thumbnailState, sortField, sortDir].join(
+    '\u001f',
+  )
+}
+
+async function hideCurrentWindow() {
+  try {
+    await getCurrentWindowSafely()?.hide()
+  } catch {
+    // Browser previews cannot hide a native window.
+  }
+}
+
+function getCurrentWindowSafely() {
+  try {
+    return getCurrentWindow()
+  } catch {
+    return null
+  }
+}
+
+function isTauriRuntime() {
+  return typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
 }
 
 function loadPreviewImage(url: string) {
@@ -416,19 +622,29 @@ function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
 }
 
 function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): RefreshMergeResult {
-  const previousById = new Map(previousAssets.map((asset) => [asset.id, asset]))
-  const previousSourcePaths = new Set(
-    previousAssets.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
-  )
-  const scannedSourcePaths = new Set(
-    scannedAssets.map((asset) => asset.sourcePath).filter((path): path is string => Boolean(path)),
-  )
-  const idSet = new Set(scannedAssets.map((asset) => asset.id))
-  const assets = scannedAssets.map((asset) => {
+  const previousById = new Map<string, Asset>()
+  const previousSourcePaths = new Set<string>()
+  for (const asset of previousAssets) {
+    previousById.set(asset.id, asset)
+    if (asset.sourcePath) previousSourcePaths.add(asset.sourcePath)
+  }
+
+  const scannedSourcePaths = new Set<string>()
+  const idSet = new Set<string>()
+  const assets: Asset[] = []
+  let added = 0
+
+  for (const asset of scannedAssets) {
+    idSet.add(asset.id)
+    if (asset.sourcePath) {
+      scannedSourcePaths.add(asset.sourcePath)
+      if (!previousSourcePaths.has(asset.sourcePath)) added += 1
+    }
+
     const previous = previousById.get(asset.id)
 
     if (previous?.thumbnailReady) {
-      return {
+      assets.push({
         ...asset,
         previewUrl: previous.previewUrl,
         thumbnailError: previous.thumbnailError,
@@ -441,13 +657,16 @@ function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): 
         thumbnailUrl: previous.thumbnailUrl,
         thumbnailVersion: previous.thumbnailVersion,
         thumbnailWidth: previous.thumbnailWidth,
-      }
+      })
+    } else {
+      assets.push(asset)
     }
+  }
 
-    return asset
-  })
-  const removedAssets = previousAssets.filter((asset) => asset.sourcePath && !scannedSourcePaths.has(asset.sourcePath))
-  const added = scannedAssets.filter((asset) => asset.sourcePath && !previousSourcePaths.has(asset.sourcePath)).length
+  const removedAssets: Asset[] = []
+  for (const asset of previousAssets) {
+    if (asset.sourcePath && !scannedSourcePaths.has(asset.sourcePath)) removedAssets.push(asset)
+  }
 
   return {
     added,
@@ -463,9 +682,36 @@ function libraryNameFromPath(path: string) {
   return parts.at(-1) ?? 'Local Library'
 }
 
+function buildLibraryCatalogState(
+  libraryName: string,
+  folderCounts: Map<string, number>,
+  tagCounts: Map<string, number>,
+  sourceSize: number,
+): LibraryCatalogState {
+  if (!folderCounts.has('/')) folderCounts.set('/', 0)
+  const folderItems = Array.from(folderCounts.entries()).sort(([a], [b]) =>
+    a === '/' ? -1 : b === '/' ? 1 : a.localeCompare(b),
+  )
+  const liveTagCounts = new Map<string, number>()
+  for (const [tag, count] of tagCounts) {
+    if (count > 0) liveTagCounts.set(tag, count)
+  }
+
+  return {
+    allTags: Array.from(liveTagCounts.keys()).sort(),
+    folderCounts,
+    folders: folderItems.map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    sourceSize,
+    tagCounts: liveTagCounts,
+    thumbnailFolders: folderItems
+      .filter(([path]) => path !== '/')
+      .map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+  }
+}
+
 function deriveLibraryCatalogState(libraryName: string, assets: Asset[]): LibraryCatalogState {
   const folderCounts = new Map<string, number>()
-  const tags = new Set<string>()
+  const tagCounts = new Map<string, number>()
   let sourceSize = 0
 
   folderCounts.set('/', assets.length)
@@ -474,21 +720,135 @@ function deriveLibraryCatalogState(libraryName: string, assets: Asset[]): Librar
     folderCounts.set(asset.folder, (folderCounts.get(asset.folder) ?? 0) + 1)
     sourceSize += asset.sizeKb
 
-    for (const tag of asset.tags) tags.add(tag)
+    for (const tag of asset.tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1)
   }
 
-  const folderItems = Array.from(folderCounts.entries()).sort(([a], [b]) =>
-    a === '/' ? -1 : b === '/' ? 1 : a.localeCompare(b),
-  )
+  return buildLibraryCatalogState(libraryName, folderCounts, tagCounts, sourceSize)
+}
 
+function assetMatchesVisibleFilters(
+  asset: Asset,
+  activeFolder: string,
+  activeTag: string,
+  typeFilter: 'all' | AssetKind,
+  thumbnailState: ThumbnailState,
+  searchQuery: string,
+) {
+  if (activeFolder !== '/' && asset.folder !== activeFolder) return false
+  if (activeTag !== 'all' && !asset.tags.includes(activeTag)) return false
+  if (typeFilter !== 'all' && asset.kind !== typeFilter) return false
+  if (thumbnailState === 'generated' && !asset.thumbnailReady) return false
+  if (thumbnailState === 'pending' && asset.thumbnailReady) return false
+  if (searchQuery && !(asset.searchText ?? createAssetSearchText(asset)).includes(searchQuery)) return false
+
+  return true
+}
+
+function patchFolderNodeCounts(
+  folders: FolderNode[],
+  folderCounts: Map<string, number>,
+  touchedFolderPaths: Set<string>,
+) {
+  let changed = false
+  const nextFolders = folders.map((folder) => {
+    if (!touchedFolderPaths.has(folder.path)) return folder
+
+    const count = folderCounts.get(folder.path) ?? 0
+    if (folder.count === count) return folder
+
+    changed = true
+    return { ...folder, count }
+  })
+
+  return changed ? nextFolders : folders
+}
+
+function patchLibraryCatalogCounts(
+  catalog: LibraryCatalogState,
+  folderCounts: Map<string, number>,
+  tagCounts: Map<string, number>,
+  sourceSize: number,
+  touchedFolderPaths: Set<string>,
+): LibraryCatalogState {
   return {
-    allTags: Array.from(tags).sort(),
-    folders: folderItems.map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    ...catalog,
+    folderCounts,
+    folders: patchFolderNodeCounts(catalog.folders, folderCounts, touchedFolderPaths),
     sourceSize,
-    thumbnailFolders: folderItems
-      .filter(([path]) => path !== '/')
-      .map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    tagCounts,
+    thumbnailFolders: patchFolderNodeCounts(catalog.thumbnailFolders, folderCounts, touchedFolderPaths),
   }
+}
+
+function appendAssetsToLibraryCatalogState(
+  libraryName: string,
+  catalog: LibraryCatalogState,
+  incoming: Asset[],
+): LibraryCatalogState {
+  if (incoming.length === 0) return catalog
+
+  const folderCounts = new Map(catalog.folderCounts)
+  const tagCounts = new Map(catalog.tagCounts)
+  const touchedFolderPaths = new Set<string>(['/'])
+  let hasNewFolder = false
+  let hasNewTag = false
+  let sourceSize = catalog.sourceSize
+
+  folderCounts.set('/', (folderCounts.get('/') ?? 0) + incoming.length)
+  for (const asset of incoming) {
+    const previousFolderCount = folderCounts.get(asset.folder) ?? 0
+    if (previousFolderCount === 0 && asset.folder !== '/') hasNewFolder = true
+    folderCounts.set(asset.folder, previousFolderCount + 1)
+    touchedFolderPaths.add(asset.folder)
+    sourceSize += asset.sizeKb
+
+    for (const tag of asset.tags) {
+      const previousTagCount = tagCounts.get(tag) ?? 0
+      if (previousTagCount === 0) hasNewTag = true
+      tagCounts.set(tag, previousTagCount + 1)
+    }
+  }
+
+  if (hasNewFolder || hasNewTag) {
+    return buildLibraryCatalogState(libraryName, folderCounts, tagCounts, sourceSize)
+  }
+
+  return patchLibraryCatalogCounts(catalog, folderCounts, tagCounts, sourceSize, touchedFolderPaths)
+}
+
+function updateCatalogTagsForAssetMetadata(
+  libraryName: string,
+  catalog: LibraryCatalogState,
+  previous: Asset,
+  next: Asset,
+): LibraryCatalogState {
+  if (sameTags(previous.tags, next.tags)) return catalog
+
+  const tagCounts = new Map(catalog.tagCounts)
+
+  for (const tag of previous.tags) {
+    if (!next.tags.includes(tag)) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) - 1)
+  }
+
+  for (const tag of next.tags) {
+    if (!previous.tags.includes(tag)) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1)
+  }
+
+  return buildLibraryCatalogState(
+    libraryName,
+    new Map(catalog.folderCounts),
+    tagCounts,
+    catalog.sourceSize,
+  )
+}
+
+function renameLibraryCatalogState(libraryName: string, catalog: LibraryCatalogState): LibraryCatalogState {
+  return buildLibraryCatalogState(
+    libraryName,
+    new Map(catalog.folderCounts),
+    new Map(catalog.tagCounts),
+    catalog.sourceSize,
+  )
 }
 
 function applyFolderOrder(folders: FolderNode[], order: string[]): FolderNode[] {
@@ -556,6 +916,119 @@ function thumbnailMetricsFromUpdates(updates: Iterable<Partial<Asset>>): Thumbna
     cacheSize,
     generatedCount,
   }
+}
+
+function removeIdsFromSet(current: Set<string>, removedIds: Set<string>) {
+  let next: Set<string> | undefined
+  for (const id of current) {
+    if (!removedIds.has(id)) continue
+
+    next ??= new Set(current)
+    next.delete(id)
+  }
+
+  return next ?? current
+}
+
+function retainIdsInSet(current: Set<string>, allowedIds: Set<string>) {
+  let hasRemoved = false
+  for (const id of current) {
+    if (!allowedIds.has(id)) {
+      hasRemoved = true
+      break
+    }
+  }
+
+  if (!hasRemoved) return current
+
+  const next = new Set<string>()
+  for (const id of current) {
+    if (allowedIds.has(id)) next.add(id)
+  }
+  return next
+}
+
+function lastIdInSet(ids: Set<string>) {
+  let lastId: string | null = null
+  for (const id of ids) lastId = id
+  return lastId
+}
+
+function createIdRangeSet(assetIds: string[], from: number, to: number) {
+  const ids = new Set<string>()
+  for (let index = from; index <= to; index += 1) {
+    const id = assetIds[index]
+    if (id) ids.add(id)
+  }
+  return ids
+}
+
+function createAssetOperationTargets(
+  assets: Iterable<Asset | undefined>,
+  canUseAsset: (asset: Asset) => boolean,
+) {
+  const assetByRelativePath = new Map<string, Asset>()
+  const idByRelativePath = new Map<string, string>()
+  const ids = new Set<string>()
+  const relativePaths: string[] = []
+  const targets: Asset[] = []
+
+  for (const asset of assets) {
+    if (!asset || !canUseAsset(asset)) continue
+
+    targets.push(asset)
+    relativePaths.push(asset.relativePath)
+    ids.add(asset.id)
+    assetByRelativePath.set(asset.relativePath, asset)
+    idByRelativePath.set(asset.relativePath, asset.id)
+  }
+
+  return {
+    assetByRelativePath,
+    idByRelativePath,
+    ids,
+    relativePaths,
+    targets,
+  }
+}
+
+function assetsByIds(assetIds: Iterable<string>, assetById: Map<string, Asset>) {
+  return {
+    *[Symbol.iterator]() {
+      for (const id of assetIds) yield assetById.get(id)
+    },
+  }
+}
+
+function countProcessableAssets(assetIds: Iterable<string>, assetById: Map<string, Asset>) {
+  let count = 0
+  for (const id of assetIds) {
+    const asset = assetById.get(id)
+    if (asset && BATCH_PROCESSABLE_KINDS.has(asset.kind)) count += 1
+  }
+  return count
+}
+
+function dragSourcePathsForSelection(asset: Asset, selectedIds: Set<string>, assetById: Map<string, Asset>) {
+  if (!selectedIds.has(asset.id)) return asset.sourcePath ? [asset.sourcePath] : []
+
+  const paths: string[] = []
+  for (const id of selectedIds) {
+    const sourcePath = assetById.get(id)?.sourcePath
+    if (sourcePath) paths.push(sourcePath)
+  }
+  return paths
+}
+
+type AssetReplacement = { asset: Asset; oldAsset?: Asset; oldId: string }
+
+function createLiveAssetByRelativePath(sourceAssets: Asset[], assetById: Map<string, Asset>) {
+  const byRelativePath = new Map<string, Asset>()
+  for (const asset of sourceAssets) {
+    const liveAsset = assetById.get(asset.id) ?? asset
+    byRelativePath.set(liveAsset.relativePath, liveAsset)
+  }
+  return byRelativePath
 }
 
 async function encodeOptimizedThumbnail(canvas: HTMLCanvasElement, asset: Asset, quality: ThumbnailQuality) {
@@ -633,21 +1106,34 @@ export default function App() {
   const thumbnailRunRef = useRef(0)
   const ocrRunRef = useRef(0)
   const runDeleteRef = useRef<() => void>(() => {})
-  const visualAssetIdsRef = useRef<string[]>(sampleAssets.map((asset) => asset.id))
+  const restoredThumbnailCountRef = useRef(0)
+  const visibleLookupRef = useRef<VisibleLookupCache>({ ids: sampleAssets.map((asset) => asset.id) })
+  const scrollJumpIdRef = useRef(0)
+  const persistedPrefsRef = useRef<PicmanAppPrefs>(readAppPrefs())
+  const restoreLastLibraryAttemptedRef = useRef(false)
+  const scrollPositionsRef = useRef<Record<string, number>>(persistedPrefsRef.current.scrollPositions ?? {})
+  const scrollSaveTimerRef = useRef<number | undefined>(undefined)
+  const persistedPrefs = persistedPrefsRef.current
 
-  const [activeFolder, setActiveFolder] = useState('/')
-  const [activeTag, setActiveTag] = useState('all')
+  const [activeFolder, setActiveFolder] = useState(persistedPrefs.activeFolder ?? '/')
+  const [activeTag, setActiveTag] = useState(persistedPrefs.activeTag ?? 'all')
   const [cacheLimit, setCacheLimit] = useState(5)
   const [collectPending, setCollectPending] = useState<{ payload: CollectPayload; previewUrl: string } | null>(null)
   const [lastCollectFolder, setLastCollectFolder] = useState('/Inbox')
   const [folderOrder, setFolderOrder] = useState<string[]>([])
   const [filtersOpen, setFiltersOpen] = useState(false)
+  const [assetMetadataVersion, setAssetMetadataVersion] = useState(0)
   const [libraryAssets, setLibraryAssets] = useState<Asset[]>(sampleAssets)
+  const [libraryAssetIds, setLibraryAssetIds] = useState<string[]>(() => assetIdsFromAssets(sampleAssets))
   const [assetStore, setAssetStore] = useState<AssetStore>(() => ({
     byId: createAssetMap(sampleAssets),
+    layoutVersion: 0,
     version: 0,
   }))
-  const [libraryName, setLibraryName] = useState('DesignAssets')
+  const [libraryCatalog, setLibraryCatalog] = useState<LibraryCatalogState>(() =>
+    deriveLibraryCatalogState(SAMPLE_LIBRARY_NAME, sampleAssets),
+  )
+  const [libraryName, setLibraryName] = useState(SAMPLE_LIBRARY_NAME)
   const [libraryRootPath, setLibraryRootPath] = useState<string | null>(null)
   const [libraryScanStatus, setLibraryScanStatus] = useState<LibraryScanStatus>('idle')
   const [lightboxOpen, setLightboxOpen] = useState(false)
@@ -657,6 +1143,7 @@ export default function App() {
   const [selectionKeyAxis, setSelectionKeyAxis] = useState<SelectionKeyAxis>('horizontal')
   const [keyboardScrollTargetId, setKeyboardScrollTargetId] = useState<string | null>(null)
   const [keyboardScrollVersion, setKeyboardScrollVersion] = useState(0)
+  const [scrollJump, setScrollJump] = useState<ScrollJumpCommand | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [themePref, setThemePref] = useState<ThemePref>(
     () => (localStorage.getItem('picman-theme') as ThemePref | null) ?? 'system',
@@ -672,10 +1159,18 @@ export default function App() {
   )
   const [batchOpen, setBatchOpen] = useState(false)
   const [batchProcessing, setBatchProcessing] = useState(false)
-  const [sidebarWidth, setSidebarWidth] = useState(218)
-  const [inspectorVisible, setInspectorVisible] = useState(true)
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
-  const [sortField, setSortField] = useState<SortField>('name')
+  const [assetMenu, setAssetMenu] = useState<{ x: number; y: number } | null>(null)
+  const [moveOpen, setMoveOpen] = useState(false)
+  const [renameTarget, setRenameTarget] = useState<Asset | null>(null)
+  const [renameFolderTarget, setRenameFolderTarget] = useState<FolderNode | null>(null)
+  const [thumbnailPromptOpen, setThumbnailPromptOpen] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(() => clampedPrefNumber(persistedPrefs.sidebarWidth, 218, 176, 340))
+  const [folderPaneHeight, setFolderPaneHeight] = useState(() =>
+    clampedPrefNumber(persistedPrefs.folderPaneHeight, 226, 48, 700),
+  )
+  const [inspectorVisible, setInspectorVisible] = useState(persistedPrefs.inspectorVisible ?? true)
+  const [sortDir, setSortDir] = useState<SortDir>(() => prefSortDir(persistedPrefs.sortDir))
+  const [sortField, setSortField] = useState<SortField>(() => prefSortField(persistedPrefs.sortField))
   const [sortOpen, setSortOpen] = useState(false)
   const [statusMessage, setStatusMessage] = useState('示例资源库已加载')
   const [thumbnailMetrics, setThumbnailMetrics] = useState<ThumbnailMetrics>(() =>
@@ -691,80 +1186,147 @@ export default function App() {
   })
   const [thumbnailQuality, setThumbnailQuality] = useState<ThumbnailQuality>('standard')
   const [thumbnailState, setThumbnailState] = useState<ThumbnailState>('all')
-  const [thumbSize, setThumbSize] = useState(150)
+  const [thumbSize, setThumbSize] = useState(() => clampedPrefNumber(persistedPrefs.thumbSize, 150, 90, 240))
   const [typeFilter, setTypeFilter] = useState<'all' | AssetKind>('all')
   const [updateState, setUpdateState] = useState<AppUpdateState>({
     message: '从 GitHub Releases 检查 Picman 测试版更新。',
     status: 'idle',
   })
-  const [viewMode, setViewMode] = useState<AssetViewMode>('adaptive')
+  const [viewMode, setViewMode] = useState<AssetViewMode>(() => prefViewMode(persistedPrefs.viewMode))
   const deferredQuery = useDeferredValue(query)
   const assetById = assetStore.byId
-  const libraryCatalog = useMemo(
-    () => deriveLibraryCatalogState(libraryName, libraryAssets),
-    [libraryAssets, libraryName],
-  )
   const { allTags, folders, sourceSize, thumbnailFolders } = libraryCatalog
   const orderedFolders = useMemo(() => applyFolderOrder(folders, folderOrder), [folders, folderOrder])
   const { cacheSize, generatedCount } = thumbnailMetrics
-  const pendingCount = Math.max(0, libraryAssets.length - generatedCount)
+  const totalAssetCount = libraryAssetIds.length
+  const pendingCount = Math.max(0, totalAssetCount - generatedCount)
   const thumbnailFilterVersion = thumbnailState === 'all' ? 0 : assetStore.version
+  const normalizedQuery = useMemo(() => normalizeSearchText(deferredQuery).trim(), [deferredQuery])
+  const hasVisibleFilters =
+    activeFolder !== '/' ||
+    activeTag !== 'all' ||
+    typeFilter !== 'all' ||
+    thumbnailState !== 'all' ||
+    normalizedQuery.length > 0
+  const useOpenScanIdFastPath =
+    libraryScanStatus === 'open' && !hasVisibleFilters && libraryAssetIds.length > LARGE_SCAN_SORT_THRESHOLD
+  const shouldDeferSortDuringOpenScan =
+    libraryScanStatus === 'open' && libraryAssetIds.length > LARGE_SCAN_SORT_THRESHOLD
+  const sortedAssetIds = useMemo(
+    () =>
+      shouldDeferSortDuringOpenScan
+        ? libraryAssetIds
+        : sortAssetIds(libraryAssetIds, assetById, sortField, sortDir),
+    [assetById, libraryAssetIds, shouldDeferSortDuringOpenScan, sortDir, sortField],
+  )
 
   const visibleAssetIds = useMemo(() => {
-    const searchQuery = normalizeSearchText(deferredQuery).trim()
-    const shouldUseLiveThumbnailState = thumbnailState !== 'all' && thumbnailFilterVersion >= 0
-    const filtered = libraryAssets.filter((asset) => {
-      const inFolder = activeFolder === '/' || asset.folder === activeFolder
-      const inTag = activeTag === 'all' || asset.tags.includes(activeTag)
-      const inType = typeFilter === 'all' || asset.kind === typeFilter
-      const liveAsset = shouldUseLiveThumbnailState ? (assetById.get(asset.id) ?? asset) : asset
-      const inThumb =
-        thumbnailState === 'all' ||
-        (thumbnailState === 'generated' && liveAsset.thumbnailReady) ||
-        (thumbnailState === 'pending' && !liveAsset.thumbnailReady)
-      const inSearch = !searchQuery || (asset.searchText ?? createAssetSearchText(asset)).includes(searchQuery)
+    void assetMetadataVersion
+    void thumbnailFilterVersion
 
-      return inFolder && inTag && inType && inThumb && inSearch
-    })
+    if (useOpenScanIdFastPath) return libraryAssetIds
+    if (!hasVisibleFilters) return sortedAssetIds
 
-    const ordered =
-      libraryScanStatus === 'open' && filtered.length > LARGE_SCAN_SORT_THRESHOLD
-        ? filtered
-        : sortAssets(filtered, sortField, sortDir)
+    const searchQuery = normalizedQuery
+    const ids: string[] = []
 
-    return ordered.map((asset) => asset.id)
+    for (const assetId of sortedAssetIds) {
+      const asset = assetById.get(assetId)
+      if (!asset) continue
+
+      if (assetMatchesVisibleFilters(asset, activeFolder, activeTag, typeFilter, thumbnailState, searchQuery)) {
+        ids.push(asset.id)
+      }
+    }
+
+    if (shouldDeferSortDuringOpenScan && ids.length <= LARGE_SCAN_SORT_THRESHOLD) {
+      return sortAssetIds(ids, assetById, sortField, sortDir)
+    }
+
+    return ids
   }, [
     activeFolder,
     activeTag,
+    assetMetadataVersion,
     assetById,
-    deferredQuery,
-    libraryAssets,
-    libraryScanStatus,
+    hasVisibleFilters,
+    libraryAssetIds,
+    normalizedQuery,
+    shouldDeferSortDuringOpenScan,
+    sortedAssetIds,
     sortDir,
     sortField,
     thumbnailState,
     thumbnailFilterVersion,
     typeFilter,
+    useOpenScanIdFastPath,
   ])
 
   const visibleCount = visibleAssetIds.length
-  const visibleIdSet = useMemo(() => new Set(visibleAssetIds), [visibleAssetIds])
-  const visibleIndexById = useMemo(
-    () => {
-      const indexById = new Map<string, number>()
-      for (let index = 0; index < visibleAssetIds.length; index += 1) {
-        indexById.set(visibleAssetIds[index], index)
-      }
-      return indexById
+  const getVisibleLookup = useCallback(() => {
+    const cached = visibleLookupRef.current
+    if (cached.ids === visibleAssetIds) return cached
+
+    const next: VisibleLookupCache = { ids: visibleAssetIds }
+    visibleLookupRef.current = next
+    return next
+  }, [visibleAssetIds])
+  const getVisibleAssetIndex = useCallback(
+    (assetId: string) => {
+      if (visibleAssetIds.length <= VISIBLE_LOOKUP_LINEAR_THRESHOLD) return visibleAssetIds.indexOf(assetId)
+
+      const lookup = getVisibleLookup()
+      lookup.indexById ??= createVisibleIndexMap(visibleAssetIds)
+      return lookup.indexById.get(assetId) ?? -1
     },
-    [visibleAssetIds],
+    [getVisibleLookup, visibleAssetIds],
   )
   const visibleSelectedIds = useMemo(
-    () => new Set([...selectedIds].filter((id) => visibleIdSet.has(id))),
-    [selectedIds, visibleIdSet],
+    () => {
+      void assetMetadataVersion
+      void thumbnailFilterVersion
+
+      if (selectedIds.size === 0) return selectedIds
+      if (!hasVisibleFilters) return selectedIds
+
+      const next = new Set<string>()
+      if (visibleAssetIds.length <= selectedIds.size) {
+        for (const id of visibleAssetIds) {
+          if (selectedIds.has(id)) next.add(id)
+        }
+        return next
+      }
+
+      for (const id of selectedIds) {
+        const asset = assetById.get(id)
+        if (asset && assetMatchesVisibleFilters(asset, activeFolder, activeTag, typeFilter, thumbnailState, normalizedQuery)) {
+          next.add(id)
+        }
+      }
+      return next
+    },
+    [
+      activeFolder,
+      activeTag,
+      assetById,
+      assetMetadataVersion,
+      hasVisibleFilters,
+      normalizedQuery,
+      selectedIds,
+      thumbnailFilterVersion,
+      thumbnailState,
+      typeFilter,
+      visibleAssetIds,
+    ],
   )
-  const primaryAsset = primaryId && visibleIdSet.has(primaryId) ? assetById.get(primaryId) : undefined
-  const lightboxIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
+  const primaryCandidate = primaryId ? assetById.get(primaryId) : undefined
+  const primaryAsset =
+    primaryCandidate &&
+    (!hasVisibleFilters ||
+      assetMatchesVisibleFilters(primaryCandidate, activeFolder, activeTag, typeFilter, thumbnailState, normalizedQuery))
+      ? primaryCandidate
+      : undefined
+  const lightboxIndex = lightboxOpen && primaryId ? getVisibleAssetIndex(primaryId) : -1
   const activeFilterCount =
     Number(activeTag !== 'all') +
     Number(typeFilter !== 'all') +
@@ -772,6 +1334,21 @@ export default function App() {
     Number(query.trim().length > 0)
   const breadcrumb =
     activeFolder === '/' ? libraryName : (activeFolder.split('/').filter(Boolean).at(-1) ?? libraryName)
+  const scrollRestoreKey = useMemo(
+    () =>
+      createScrollRestoreKey(
+        libraryRootPath,
+        activeFolder,
+        activeTag,
+        viewMode,
+        typeFilter,
+        thumbnailState,
+        sortField,
+        sortDir,
+      ),
+    [activeFolder, activeTag, libraryRootPath, sortDir, sortField, thumbnailState, typeFilter, viewMode],
+  )
+  const restoredScrollTop = scrollPositionsRef.current[scrollRestoreKey] ?? 0
 
   useEffect(() => {
     libraryAssetsRef.current = libraryAssets
@@ -788,6 +1365,51 @@ export default function App() {
   useEffect(() => {
     selectedIdsRef.current = selectedIds
   }, [selectedIds])
+
+  useEffect(() => {
+    const nextPrefs: PicmanAppPrefs = {
+      ...readAppPrefs(),
+      activeFolder,
+      activeTag,
+      folderPaneHeight,
+      inspectorVisible,
+      scrollPositions: scrollPositionsRef.current,
+      sidebarWidth,
+      sortDir,
+      sortField,
+      thumbSize,
+      viewMode,
+    }
+    if (libraryRootPath) nextPrefs.lastLibraryRootPath = libraryRootPath
+    writeAppPrefs(nextPrefs)
+  }, [
+    activeFolder,
+    activeTag,
+    folderPaneHeight,
+    inspectorVisible,
+    libraryRootPath,
+    sidebarWidth,
+    sortDir,
+    sortField,
+    thumbSize,
+    viewMode,
+  ])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return
+    if (restoreLastLibraryAttemptedRef.current) return
+    restoreLastLibraryAttemptedRef.current = true
+
+    const lastLibraryRootPath = persistedPrefsRef.current.lastLibraryRootPath
+    if (!lastLibraryRootPath) return
+
+    void handleNativeFolderSelection(lastLibraryRootPath, {
+      activeFolder: persistedPrefsRef.current.activeFolder,
+      activeTag: persistedPrefsRef.current.activeTag,
+    })
+    // Run only once on app startup; the restore target comes from persisted prefs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     return () => revokePreviewUrls(libraryAssetsRef.current)
@@ -822,6 +1444,30 @@ export default function App() {
     localStorage.setItem('picman-delete-shortcut', deleteShortcut)
   }, [deleteShortcut])
 
+  useEffect(() => {
+    const appWindow = getCurrentWindowSafely()
+    if (!appWindow) return
+
+    let disposed = false
+    let removeCloseListener: (() => void) | undefined
+
+    void appWindow
+      .onCloseRequested(async (event) => {
+        event.preventDefault()
+        await hideCurrentWindow()
+      })
+      .then((unlisten) => {
+        if (disposed) unlisten()
+        else removeCloseListener = unlisten
+      })
+      .catch(() => undefined)
+
+    return () => {
+      disposed = true
+      removeCloseListener?.()
+    }
+  }, [])
+
   const clearScanFlushTimer = useCallback((scan: ActiveNativeScan | null) => {
     if (!scan?.flushTimer) return
 
@@ -848,9 +1494,12 @@ export default function App() {
 
       appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
       const restoredThumbnailMetrics = deriveThumbnailMetrics(incoming)
+      restoredThumbnailCountRef.current += restoredThumbnailMetrics.generatedCount
       startTransition(() => {
         setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
-        setLibraryAssets((current) => [...current, ...incoming])
+        setLibraryCatalog((current) => appendAssetsToLibraryCatalogState(scan.libraryName, current, incoming))
+        setLibraryAssetIds((current) => appendAssetIds(current, incoming))
+        setLibraryAssets((current) => appendItems(current, incoming))
         if (restoredThumbnailMetrics.generatedCount > 0 || restoredThumbnailMetrics.cacheSize > 0) {
           setThumbnailMetrics((current) => addThumbnailMetrics(current, restoredThumbnailMetrics))
         }
@@ -867,11 +1516,23 @@ export default function App() {
   const scheduleOpenScanFlush = useCallback(
     (scanId: string) => {
       const scan = activeNativeScanRef.current
-      if (!scan || scan.id !== scanId || scan.mode !== 'open' || scan.flushTimer) return
+      if (!scan || scan.id !== scanId || scan.mode !== 'open') return
 
-      scan.flushTimer = window.setTimeout(() => flushOpenScanAssets(scanId), 80)
+      if (scan.pendingAssets.length >= OPEN_SCAN_FORCE_FLUSH_THRESHOLD) {
+        clearScanFlushTimer(scan)
+        flushOpenScanAssets(scanId)
+        return
+      }
+
+      if (scan.flushTimer) return
+
+      const delay =
+        scan.pendingAssets.length >= OPEN_SCAN_STEADY_PENDING_THRESHOLD
+          ? OPEN_SCAN_STEADY_FLUSH_MS
+          : OPEN_SCAN_FAST_FLUSH_MS
+      scan.flushTimer = window.setTimeout(() => flushOpenScanAssets(scanId), delay)
     },
-    [flushOpenScanAssets],
+    [clearScanFlushTimer, flushOpenScanAssets],
   )
 
   const finishRefreshScan = useCallback((scan: ActiveNativeScan, payload: ScanLibraryFinishedPayload) => {
@@ -887,6 +1548,8 @@ export default function App() {
 
     startTransition(() => {
       setAssetStore((current) => replaceAssetStore(current, merged.assets))
+      setLibraryCatalog(deriveLibraryCatalogState(payload.libraryName, merged.assets))
+      setLibraryAssetIds(assetIdsFromAssets(merged.assets))
       setLibraryAssets(merged.assets)
       setLibraryName(payload.libraryName)
       setLibraryRootPath(payload.rootPath)
@@ -894,7 +1557,7 @@ export default function App() {
       setThumbnailMetrics(deriveThumbnailMetrics(merged.assets))
     })
 
-    const survivingSelectedIds = new Set([...currentSelectedIds].filter((id) => merged.idSet.has(id)))
+    const survivingSelectedIds = retainIdsInSet(currentSelectedIds, merged.idSet)
     if (survivingSelectedIds.size === 0 && merged.assets.length > 0) {
       setSelectedIds(new Set([merged.assets[0].id]))
       setPrimaryId(merged.assets[0].id)
@@ -999,6 +1662,8 @@ export default function App() {
   )
 
   useEffect(() => {
+    if (!isTauriRuntime()) return
+
     let disposed = false
     const unlisteners: Array<() => void> = []
 
@@ -1009,14 +1674,17 @@ export default function App() {
 
         const incoming = event.payload.assets.map(nativeAssetToFrontend)
         if (incoming.length === 0) return
+        const now = window.performance.now()
+        const shouldUpdateStatus = now - scan.lastStatusAt >= SCAN_STATUS_UPDATE_MS
+        if (shouldUpdateStatus) scan.lastStatusAt = now
 
         if (scan.mode === 'refresh') {
-          scan.collectedAssets.push(...incoming)
-          setStatusMessage(`${scan.libraryName} · 正在后台刷新 ${event.payload.total} 个素材`)
+          pushItems(scan.collectedAssets, incoming)
+          if (shouldUpdateStatus) setStatusMessage(`${scan.libraryName} · 正在后台刷新 ${event.payload.total} 个素材`)
         } else {
-          scan.pendingAssets.push(...incoming)
+          pushItems(scan.pendingAssets, incoming)
           scheduleOpenScanFlush(scan.id)
-          setStatusMessage(`${scan.libraryName} · 正在扫描 ${event.payload.total} 个素材`)
+          if (shouldUpdateStatus) setStatusMessage(`${scan.libraryName} · 正在扫描 ${event.payload.total} 个素材`)
         }
       })
       const unlistenFinished = await listen<ScanLibraryFinishedPayload>(SCAN_FINISHED_EVENT, (event) => {
@@ -1033,12 +1701,16 @@ export default function App() {
         disposeActiveNativeScan()
         setLibraryScanStatus('idle')
         setLibraryName(event.payload.libraryName)
+        setLibraryCatalog((current) => renameLibraryCatalogState(event.payload.libraryName, current))
         setLibraryRootPath(event.payload.rootPath)
         setStatusMessage(`${event.payload.libraryName} · ${event.payload.total} 个素材`)
 
         if (event.payload.total === 0) {
           setSelectedIds(new Set())
           setPrimaryId(null)
+        } else if (restoredThumbnailCountRef.current === 0) {
+          // Freshly opened a library that has no thumbnails yet — offer to generate.
+          setThumbnailPromptOpen(true)
         }
       })
       const unlistenError = await listen<ScanLibraryErrorPayload>(SCAN_ERROR_EVENT, (event) => {
@@ -1067,6 +1739,8 @@ export default function App() {
   }, [disposeActiveNativeScan, finishRefreshScan, flushOpenScanAssets, scheduleOpenScanFlush])
 
   useEffect(() => {
+    if (!isTauriRuntime()) return
+
     let disposed = false
     const unlisteners: Array<() => void> = []
 
@@ -1195,18 +1869,6 @@ export default function App() {
     }
   }, [beginCollect])
 
-  const handleVisualOrderChange = useCallback(
-    (ids: string[]) => {
-      visualAssetIdsRef.current = ids.length === visibleCount ? ids : visibleAssetIds
-    },
-    [visibleAssetIds, visibleCount],
-  )
-
-  const getCurrentVisualIds = useCallback(() => {
-    const visualIds = visualAssetIdsRef.current
-    return visualIds.length === visibleCount ? visualIds : visibleAssetIds
-  }, [visibleAssetIds, visibleCount])
-
   useEffect(() => {
     if (!sortOpen) return
 
@@ -1230,7 +1892,7 @@ export default function App() {
     (dir: 'prev' | 'next') => {
       if (visibleCount === 0) return
 
-      const currentIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
+      const currentIndex = primaryId ? getVisibleAssetIndex(primaryId) : -1
       const current = currentIndex === -1 ? 0 : currentIndex
       const nextIndex = dir === 'prev' ? Math.max(0, current - 1) : Math.min(visibleCount - 1, current + 1)
       const nextAsset = getVisibleAssetAt(nextIndex)
@@ -1240,11 +1902,17 @@ export default function App() {
       setSelectedIds(new Set([nextAsset.id]))
       blurActiveElement()
     },
-    [getVisibleAssetAt, primaryId, visibleCount, visibleIndexById],
+    [getVisibleAssetAt, getVisibleAssetIndex, primaryId, visibleCount],
   )
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'w') {
+        event.preventDefault()
+        void hideCurrentWindow()
+        return
+      }
+
       const tag = (event.target as HTMLElement).tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
 
@@ -1278,6 +1946,26 @@ export default function App() {
         return
       }
 
+      if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+        const edge = event.key === 'ArrowUp' ? 'top' : event.key === 'ArrowDown' ? 'bottom' : null
+        if (edge) {
+          event.preventDefault()
+          if (visibleCount === 0) return
+
+          const targetId = edge === 'top' ? visibleAssetIds[0] : visibleAssetIds.at(-1)
+          if (!targetId) return
+
+          setSelectedIds(new Set([targetId]))
+          setPrimaryId(targetId)
+          setKeyboardScrollTargetId(targetId)
+          setKeyboardScrollVersion((version) => version + 1)
+          scrollJumpIdRef.current += 1
+          setScrollJump({ edge, id: scrollJumpIdRef.current })
+          blurActiveElement()
+          return
+        }
+      }
+
       const isArrowKey =
         event.key === 'ArrowLeft' ||
         event.key === 'ArrowRight' ||
@@ -1304,8 +1992,7 @@ export default function App() {
       if (isSelectionKey) {
         if (visibleCount === 0) return
 
-        const visualIds = getCurrentVisualIds()
-        const currentIndex = primaryId ? visualIds.indexOf(primaryId) : -1
+        const currentIndex = primaryId ? getVisibleAssetIndex(primaryId) : -1
         const isPrevKey = selectionKeyAxis === 'horizontal' ? event.key === 'ArrowLeft' : event.key === 'ArrowUp'
 
         const nextIndex =
@@ -1313,8 +2000,8 @@ export default function App() {
             ? 0
             : isPrevKey
             ? Math.max(0, currentIndex - 1)
-            : Math.min(visualIds.length - 1, currentIndex + 1)
-        const nextId = visualIds[nextIndex]
+            : Math.min(visibleAssetIds.length - 1, currentIndex + 1)
+        const nextId = visibleAssetIds[nextIndex]
         const nextAsset = assetByIdRef.current.get(nextId) ?? getVisibleAssetAt(nextIndex)
         if (!nextAsset) return
 
@@ -1341,8 +2028,8 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [
     deleteShortcut,
-    getCurrentVisualIds,
     getVisibleAssetAt,
+    getVisibleAssetIndex,
     lightboxOpen,
     navigateLightbox,
     primaryAsset,
@@ -1357,19 +2044,19 @@ export default function App() {
       const next = new Set(visibleSelectedIds)
       if (next.has(asset.id)) {
         next.delete(asset.id)
-        setPrimaryId(next.has(primaryId ?? '') ? primaryId : (Array.from(next).at(-1) ?? null))
+        setPrimaryId(primaryId && next.has(primaryId) ? primaryId : lastIdInSet(next))
       } else {
         next.add(asset.id)
         setPrimaryId(asset.id)
       }
       setSelectedIds(next)
     } else if (event.shiftKey) {
-      const startIndex = primaryId ? (visibleIndexById.get(primaryId) ?? -1) : -1
-      const endIndex = visibleIndexById.get(asset.id) ?? -1
+      const startIndex = primaryId ? getVisibleAssetIndex(primaryId) : -1
+      const endIndex = getVisibleAssetIndex(asset.id)
       const safeStart = startIndex === -1 ? endIndex : startIndex
       const [from, to] = safeStart <= endIndex ? [safeStart, endIndex] : [endIndex, safeStart]
 
-      setSelectedIds(new Set(visibleAssetIds.slice(from, to + 1)))
+      setSelectedIds(createIdRangeSet(visibleAssetIds, from, to))
       setPrimaryId(asset.id)
     } else {
       setSelectedIds(new Set([asset.id]))
@@ -1383,9 +2070,11 @@ export default function App() {
     setLightboxOpen(true)
   }
 
-  async function handleNativeFolderSelection(rootPath: string) {
+  async function handleNativeFolderSelection(rootPath: string, restoreOptions: RestoreLibraryOptions = {}) {
     const scanId = createScanId()
     const optimisticLibraryName = libraryNameFromPath(rootPath)
+    const nextActiveFolder = restoreOptions.activeFolder ?? '/'
+    const nextActiveTag = restoreOptions.activeTag ?? 'all'
 
     activeBrowserScanRef.current = null
     disposeActiveNativeScan()
@@ -1394,23 +2083,28 @@ export default function App() {
       collectedAssets: [],
       firstSelected: false,
       id: scanId,
+      lastStatusAt: 0,
       libraryName: optimisticLibraryName,
       mode: 'open',
       pendingAssets: [],
     }
     thumbnailRunRef.current += 1
+    restoredThumbnailCountRef.current = 0
+    setThumbnailPromptOpen(false)
     setLibraryScanStatus('open')
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     libraryAssetIndexByIdRef.current = new Map<string, number>()
     setAssetStore((current) => replaceAssetStore(current, []))
+    setLibraryCatalog(deriveLibraryCatalogState(optimisticLibraryName, []))
+    setLibraryAssetIds([])
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
       return []
     })
     setLibraryRootPath(rootPath)
     setLibraryName(optimisticLibraryName)
-    setActiveFolder('/')
-    setActiveTag('all')
+    setActiveFolder(nextActiveFolder)
+    setActiveTag(nextActiveTag)
     setTypeFilter('all')
     setThumbnailState('all')
     setFolderOrder([])
@@ -1438,6 +2132,7 @@ export default function App() {
       activeScan.libraryName = scan.libraryName
       setLibraryRootPath(scan.rootPath)
       setLibraryName(scan.libraryName)
+      setLibraryCatalog((current) => renameLibraryCatalogState(scan.libraryName, current))
       setStatusMessage(`${scan.libraryName} · 正在扫描资源目录...`)
 
       void invoke<LibrarySettings>('read_library_settings', { libraryRoot: scan.rootPath })
@@ -1494,6 +2189,8 @@ export default function App() {
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     libraryAssetIndexByIdRef.current = new Map<string, number>()
     setAssetStore((current) => replaceAssetStore(current, []))
+    setLibraryCatalog(deriveLibraryCatalogState(nextLibraryName, []))
+    setLibraryAssetIds([])
 
     setLibraryAssets((current) => {
       revokePreviewUrls(current)
@@ -1528,7 +2225,9 @@ export default function App() {
         appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
         startTransition(() => {
           setAssetStore((current) => updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, incoming)))
-          setLibraryAssets((current) => [...current, ...incoming])
+          setLibraryCatalog((current) => appendAssetsToLibraryCatalogState(nextLibraryName, current, incoming))
+          setLibraryAssetIds((current) => appendAssetIds(current, incoming))
+          setLibraryAssets((current) => appendItems(current, incoming))
         })
 
         if (!firstAssetSelected && incoming[0]) {
@@ -1570,6 +2269,7 @@ export default function App() {
       collectedAssets: [],
       firstSelected: true,
       id: scanId,
+      lastStatusAt: 0,
       libraryName: libraryName || optimisticLibraryName,
       mode: 'refresh',
       pendingAssets: [],
@@ -1587,6 +2287,7 @@ export default function App() {
       activeScan.libraryName = scan.libraryName
       setLibraryRootPath(scan.rootPath)
       setLibraryName(scan.libraryName)
+      setLibraryCatalog((current) => renameLibraryCatalogState(scan.libraryName, current))
       setStatusMessage(`${scan.libraryName} · 正在后台刷新资源目录...`)
     } catch (error) {
       if (activeNativeScanRef.current?.id !== scanId) return
@@ -1607,19 +2308,15 @@ export default function App() {
     const runId = thumbnailRunRef.current + 1
     thumbnailRunRef.current = runId
     const quality = thumbnailQuality
-    const targetIds = new Set(targetAssets.map((asset) => asset.id))
-    const clearedThumbnailMetrics = deriveThumbnailMetrics(targetAssets)
+    const thumbnailClear = prepareThumbnailClearPatch(targetAssets)
     const firstName = targetAssets[0]?.name
     const pendingAssetUpdates = new Map<string, Partial<Asset>>()
     let failedCount = 0
     let lastProgressAt = 0
 
-    const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
-    revokeThumbnailUrls(liveAssets.filter((asset) => targetIds.has(asset.id)))
-    const clearedUpdates = buildThumbnailClearUpdates(targetAssets)
-    setThumbnailMetrics((current) => subtractThumbnailMetrics(current, clearedThumbnailMetrics))
+    setThumbnailMetrics((current) => subtractThumbnailMetrics(current, thumbnailClear.metrics))
     setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, thumbnailClear.updates)),
     )
     setThumbnailGeneration({
       completed: 0,
@@ -1632,7 +2329,8 @@ export default function App() {
     })
     setStatusMessage(`正在生成缩略图：${scopeLabel}`)
 
-    if (libraryRootPath && targetAssets.every((asset) => asset.sourcePath)) {
+    const nativeSources = libraryRootPath ? createNativeThumbnailSources(targetAssets) : null
+    if (libraryRootPath && nativeSources) {
       const jobId = createThumbnailJobId(runId)
       activeNativeThumbnailJobRef.current = {
         id: jobId,
@@ -1653,12 +2351,7 @@ export default function App() {
           jobId,
           libraryRoot: libraryRootPath,
           quality,
-          sources: targetAssets.map((asset) => ({
-            id: asset.id,
-            kind: asset.kind,
-            relativePath: asset.relativePath,
-            sourcePath: asset.sourcePath,
-          })),
+          sources: nativeSources,
         })
 
         const activeJob = activeNativeThumbnailJobRef.current
@@ -1785,9 +2478,11 @@ export default function App() {
 
   function generateFolderThumbnails(folderPaths: string[]) {
     const selectedFolders = new Set(folderPaths)
-    const selectedAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current).filter((asset) =>
-      selectedFolders.has(asset.folder),
-    )
+    const selectedAssets: Asset[] = []
+    for (const asset of libraryAssetsRef.current) {
+      const liveAsset = assetByIdRef.current.get(asset.id) ?? asset
+      if (selectedFolders.has(liveAsset.folder)) selectedAssets.push(liveAsset)
+    }
     const label =
       folderPaths.length === 1
         ? folderName(folderPaths[0], libraryName)
@@ -1796,18 +2491,23 @@ export default function App() {
     void generateThumbnailAssets(selectedAssets, label)
   }
 
+  function confirmThumbnailPrompt(selection: string[] | 'all') {
+    setThumbnailPromptOpen(false)
+    if (selection === 'all') generateAllThumbnails()
+    else if (selection.length > 0) generateFolderThumbnails(selection)
+  }
+
   function clearThumbnailCache() {
     thumbnailRunRef.current += 1
     cancelNativeThumbnailGeneration()
     const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
-    revokeThumbnailUrls(liveAssets)
+    const thumbnailClear = prepareThumbnailClearPatch(liveAssets)
     setThumbnailMetrics({ cacheSize: 0, generatedCount: 0 })
     if (libraryRootPath) {
       void invoke('clear_thumbnail_cache', { libraryRoot: libraryRootPath }).catch(() => undefined)
     }
-    const clearedUpdates = buildThumbnailClearUpdates(liveAssets)
     setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, clearedUpdates)),
+      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, thumbnailClear.updates)),
     )
     setThumbnailGeneration({
       completed: 0,
@@ -1899,12 +2599,20 @@ export default function App() {
     })
   }
 
-  function insertCollectedAsset(asset: Asset) {
-    appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, [asset])
+  function insertCollectedAssets(assets: Asset[]) {
+    if (assets.length === 0) return
+
+    appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, assets)
     setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, [asset])),
+      updateAssetStore(current, (assetMap) => appendAssetsToAssetMap(assetMap, assets)),
     )
-    setLibraryAssets((current) => [...current, asset])
+    setLibraryCatalog((current) => appendAssetsToLibraryCatalogState(libraryName, current, assets))
+    setLibraryAssetIds((current) => appendAssetIds(current, assets))
+    setLibraryAssets((current) => appendItems(current, assets))
+  }
+
+  function insertCollectedAsset(asset: Asset) {
+    insertCollectedAssets([asset])
   }
 
   async function generateCollectedThumbnail(asset: Asset) {
@@ -2060,23 +2768,40 @@ export default function App() {
   function removeAssetsFromLibrary(removedIds: Set<string>) {
     if (removedIds.size === 0) return
 
-    const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
-    const removedAssets = liveAssets.filter((asset) => removedIds.has(asset.id))
+    const removedAssets: Asset[] = []
+    const nextAssets: Asset[] = []
+    const removedMetrics: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }
+
+    for (const asset of libraryAssetsRef.current) {
+      if (!removedIds.has(asset.id)) {
+        nextAssets.push(asset)
+        continue
+      }
+
+      const liveAsset = assetByIdRef.current.get(asset.id) ?? asset
+      removedAssets.push(liveAsset)
+      if (liveAsset.thumbnailReady) {
+        removedMetrics.generatedCount += 1
+        removedMetrics.cacheSize += liveAsset.thumbnailSizeKb ?? 0
+      }
+    }
+
     revokePreviewUrls(removedAssets)
-    const removedMetrics = deriveThumbnailMetrics(removedAssets)
-    const nextAssets = libraryAssetsRef.current.filter((asset) => !removedIds.has(asset.id))
     libraryAssetIndexByIdRef.current = createAssetIndexMap(nextAssets)
 
     setAssetStore((current) =>
       updateAssetStore(current, (assetMap) => {
         for (const id of removedIds) assetMap.delete(id)
+        return true
       }),
     )
+    setLibraryCatalog(deriveLibraryCatalogState(libraryName, nextAssets))
+    setLibraryAssetIds(assetIdsFromAssets(nextAssets))
     setLibraryAssets(nextAssets)
     if (removedMetrics.generatedCount > 0 || removedMetrics.cacheSize > 0) {
       setThumbnailMetrics((current) => subtractThumbnailMetrics(current, removedMetrics))
     }
-    setSelectedIds((current) => new Set([...current].filter((id) => !removedIds.has(id))))
+    setSelectedIds((current) => removeIdsFromSet(current, removedIds))
     setPrimaryId((current) => (current && removedIds.has(current) ? null : current))
   }
 
@@ -2086,17 +2811,18 @@ export default function App() {
       return
     }
 
-    const targets = [...visibleSelectedIds]
-      .map((id) => assetByIdRef.current.get(id))
-      .filter((asset): asset is Asset => Boolean(asset?.relativePath && asset.sourcePath))
-    if (targets.length === 0) return
+    const targets = createAssetOperationTargets(
+      assetsByIds(visibleSelectedIds, assetByIdRef.current),
+      (asset) => Boolean(asset.sourcePath),
+    )
+    if (targets.targets.length === 0) return
 
     try {
       const created = await invoke<TrashItem[]>('move_to_trash', {
         libraryRoot: libraryRootPath,
-        relativePaths: targets.map((asset) => asset.relativePath),
+        relativePaths: targets.relativePaths,
       })
-      removeAssetsFromLibrary(new Set(targets.map((asset) => asset.id)))
+      removeAssetsFromLibrary(targets.ids)
       setTrashItems((current) => [...created, ...current])
       setStatusMessage(`已删除 ${created.length} 项到回收站`)
     } catch (error) {
@@ -2113,13 +2839,15 @@ export default function App() {
         libraryRoot: libraryRootPath,
         ids,
       })
+      const restoredAssets: Asset[] = []
       for (const scanned of restored) {
         const asset = nativeAssetToFrontend(scanned)
-        if (!assetByIdRef.current.has(asset.id)) insertCollectedAsset(asset)
+        if (!assetByIdRef.current.has(asset.id)) restoredAssets.push(asset)
       }
+      insertCollectedAssets(restoredAssets)
       const idSet = new Set(ids)
       setTrashItems((current) => current.filter((item) => !idSet.has(item.id)))
-      setTrashSelectedIds((current) => new Set([...current].filter((id) => !idSet.has(id))))
+      setTrashSelectedIds((current) => removeIdsFromSet(current, idSet))
       setStatusMessage(`已恢复 ${restored.length} 项`)
     } catch (error) {
       const message = error instanceof Error ? error.message : '恢复失败'
@@ -2189,10 +2917,11 @@ export default function App() {
   async function runBatchProcess(options: BatchOptions) {
     if (!libraryRootPath) return
 
-    const targets = [...visibleSelectedIds]
-      .map((id) => assetByIdRef.current.get(id))
-      .filter((asset): asset is Asset => Boolean(asset?.sourcePath && BATCH_PROCESSABLE_KINDS.has(asset.kind)))
-    if (targets.length === 0) {
+    const targets = createAssetOperationTargets(
+      assetsByIds(visibleSelectedIds, assetByIdRef.current),
+      (asset) => Boolean(asset.sourcePath && BATCH_PROCESSABLE_KINDS.has(asset.kind)),
+    )
+    if (targets.targets.length === 0) {
       setStatusMessage('所选素材中没有可处理的图片（仅支持 PNG/JPG/WebP）')
       return
     }
@@ -2201,7 +2930,7 @@ export default function App() {
     try {
       const result = await invoke<BatchProcessResult>('batch_process_images', {
         libraryRoot: libraryRootPath,
-        relativePaths: targets.map((asset) => asset.relativePath),
+        relativePaths: targets.relativePaths,
         options: {
           maxEdge: options.resizeMode === 'maxEdge' ? options.maxEdge : null,
           scalePercent: options.resizeMode === 'percent' ? options.percent : null,
@@ -2209,19 +2938,27 @@ export default function App() {
         },
       })
 
-      const processedPaths = new Set(result.processed.map((entry) => entry.previousRelativePath))
-      const removedIds = new Set(
-        targets.filter((asset) => processedPaths.has(asset.relativePath)).map((asset) => asset.id),
-      )
+      const removedIds = new Set<string>()
+      const newAssets: Asset[] = []
+      const newAssetIds = new Set<string>()
+      let previousKb = 0
+      let nextKb = 0
+      for (const entry of result.processed) {
+        const removedId = targets.idByRelativePath.get(entry.previousRelativePath)
+        if (removedId) removedIds.add(removedId)
+
+        const asset = nativeAssetToFrontend(entry.asset)
+        newAssets.push(asset)
+        newAssetIds.add(asset.id)
+        previousKb += entry.previousSizeKb
+        nextKb += asset.sizeKb
+      }
       removeAssetsFromLibrary(removedIds)
 
-      const newAssets = result.processed.map((entry) => nativeAssetToFrontend(entry.asset))
-      for (const asset of newAssets) insertCollectedAsset(asset)
-      setSelectedIds(new Set(newAssets.map((asset) => asset.id)))
+      insertCollectedAssets(newAssets)
+      setSelectedIds(newAssetIds)
       setPrimaryId(newAssets[0]?.id ?? null)
 
-      const previousKb = result.processed.reduce((sum, entry) => sum + entry.previousSizeKb, 0)
-      const nextKb = newAssets.reduce((sum, asset) => sum + asset.sizeKb, 0)
       const savedPercent = previousKb > 0 ? Math.max(0, Math.round((1 - nextKb / previousKb) * 100)) : 0
       setStatusMessage(
         `已处理 ${result.processed.length} 张${result.failed ? ` · 失败 ${result.failed}` : ''} · ${formatMb(previousKb)} → ${formatMb(nextKb)}（省 ${savedPercent}%）`,
@@ -2236,6 +2973,242 @@ export default function App() {
     }
   }
 
+  async function rotateAssets(assets: Asset[], quarterTurns: number) {
+    if (!libraryRootPath) return
+
+    const targets = createAssetOperationTargets(
+      assets,
+      (asset) => Boolean(asset.sourcePath && BATCH_PROCESSABLE_KINDS.has(asset.kind)),
+    )
+    if (targets.targets.length === 0) {
+      setStatusMessage('所选素材中没有可旋转的图片（仅支持 PNG/JPG/WebP）')
+      return
+    }
+
+    try {
+      const results = await invoke<{ previousRelativePath: string; asset: NativeScannedAsset }[]>('rotate_images', {
+        libraryRoot: libraryRootPath,
+        relativePaths: targets.relativePaths,
+        quarterTurns,
+      })
+      if (results.length === 0) {
+        setStatusMessage('旋转失败')
+        return
+      }
+
+      const removedIds = new Set<string>()
+      const newAssets: Asset[] = []
+      const newAssetIds = new Set<string>()
+      for (const entry of results) {
+        const removedId = targets.idByRelativePath.get(entry.previousRelativePath)
+        if (removedId) removedIds.add(removedId)
+
+        const asset = nativeAssetToFrontend(entry.asset)
+        newAssets.push(asset)
+        newAssetIds.add(asset.id)
+      }
+      removeAssetsFromLibrary(removedIds)
+
+      insertCollectedAssets(newAssets)
+      setSelectedIds(newAssetIds)
+      setPrimaryId(newAssets[0]?.id ?? null)
+      void regenerateThumbnailsSequentially(newAssets)
+      setStatusMessage(`已旋转 ${newAssets.length} 张`)
+    } catch (error) {
+      setStatusMessage(`旋转失败：${error instanceof Error ? error.message : ''}`)
+    }
+  }
+
+  function handleAssetDragStart(asset: Asset, event: ReactDragEvent<HTMLDivElement>) {
+    if (!libraryRootPath) return
+
+    const paths = dragSourcePathsForSelection(asset, visibleSelectedIds, assetByIdRef.current)
+    if (paths.length === 0) return
+
+    event.preventDefault()
+    void startAssetDrag(paths).catch(() => undefined)
+  }
+
+  function handleAssetContextMenu(asset: Asset, event: MouseEvent<HTMLDivElement>) {
+    event.preventDefault()
+    if (!visibleSelectedIds.has(asset.id)) {
+      setSelectedIds(new Set([asset.id]))
+      setPrimaryId(asset.id)
+    }
+    setAssetMenu({ x: event.clientX, y: event.clientY })
+  }
+
+  function copyAssetImage(asset: Asset) {
+    if (!asset.sourcePath) {
+      setStatusMessage('该素材无法复制图片')
+      return
+    }
+    void invoke('copy_image_to_clipboard', { sourcePath: asset.sourcePath })
+      .then(() => setStatusMessage(`已复制图片到剪贴板：${asset.name}`))
+      .catch((error) => setStatusMessage(`复制失败：${error instanceof Error ? error.message : ''}`))
+  }
+
+  function replaceLibraryAssets(replacements: AssetReplacement[]) {
+    if (replacements.length === 0) return
+
+    const oldIds = new Set<string>()
+    const oldToNew = new Map<string, string>()
+    const merged: Asset[] = []
+    for (const { oldAsset, oldId, asset } of replacements) {
+      oldIds.add(oldId)
+      const nextAsset = oldAsset?.thumbnailReady
+        ? {
+            ...asset,
+            thumbnailReady: true,
+            thumbnailUrl: oldAsset.thumbnailUrl,
+            thumbnailPath: oldAsset.thumbnailPath,
+            thumbnailFormat: oldAsset.thumbnailFormat,
+            thumbnailWidth: oldAsset.thumbnailWidth,
+            thumbnailHeight: oldAsset.thumbnailHeight,
+            thumbnailSizeKb: oldAsset.thumbnailSizeKb,
+            thumbnailQuality: oldAsset.thumbnailQuality,
+            thumbnailVersion: oldAsset.thumbnailVersion,
+          }
+        : asset
+
+      merged.push(nextAsset)
+      oldToNew.set(oldId, nextAsset.id)
+    }
+
+    const nextAssets: Asset[] = []
+    for (const asset of libraryAssetsRef.current) {
+      if (!oldIds.has(asset.id)) nextAssets.push(asset)
+    }
+    pushItems(nextAssets, merged)
+    libraryAssetIndexByIdRef.current = createAssetIndexMap(nextAssets)
+
+    setAssetStore((current) =>
+      updateAssetStore(current, (assetMap) => {
+        for (const id of oldIds) assetMap.delete(id)
+        for (const asset of merged) assetMap.set(asset.id, asset)
+        return true
+      }),
+    )
+    setLibraryCatalog(deriveLibraryCatalogState(libraryName, nextAssets))
+    setLibraryAssetIds(assetIdsFromAssets(nextAssets))
+    setLibraryAssets(nextAssets)
+    setSelectedIds((current) => {
+      const next = new Set<string>()
+      for (const id of current) next.add(oldToNew.get(id) ?? id)
+      return next
+    })
+    setPrimaryId((current) => (current ? (oldToNew.get(current) ?? current) : current))
+  }
+
+  async function moveSelectedTo(targetFolder: string) {
+    setMoveOpen(false)
+    if (!libraryRootPath) return
+
+    const targets = createAssetOperationTargets(
+      assetsByIds(visibleSelectedIds, assetByIdRef.current),
+      (asset) => Boolean(asset.sourcePath),
+    )
+    if (targets.targets.length === 0) return
+
+    try {
+      const moved = await invoke<{ previousRelativePath: string; asset: NativeScannedAsset }[]>('move_assets', {
+        libraryRoot: libraryRootPath,
+        relativePaths: targets.relativePaths,
+        targetFolder,
+      })
+      if (moved.length === 0) {
+        setStatusMessage('未移动（已在目标文件夹）')
+        return
+      }
+
+      const replacements: AssetReplacement[] = []
+      for (const entry of moved) {
+        const oldAsset = targets.assetByRelativePath.get(entry.previousRelativePath)
+        if (oldAsset) replacements.push({ oldId: oldAsset.id, oldAsset, asset: nativeAssetToFrontend(entry.asset) })
+      }
+      replaceLibraryAssets(replacements)
+      setStatusMessage(`已移动 ${replacements.length} 项`)
+    } catch (error) {
+      setStatusMessage(`移动失败：${error instanceof Error ? error.message : ''}`)
+    }
+  }
+
+  async function renameSelectedAsset(newName: string) {
+    const target = renameTarget
+    setRenameTarget(null)
+    if (!target || !libraryRootPath) return
+
+    try {
+      const scanned = await invoke<NativeScannedAsset>('rename_asset', {
+        libraryRoot: libraryRootPath,
+        relativePath: target.relativePath,
+        newName,
+      })
+      replaceLibraryAssets([{ oldId: target.id, oldAsset: target, asset: nativeAssetToFrontend(scanned) }])
+      setStatusMessage(`已重命名为 ${scanned.name}`)
+    } catch (error) {
+      setStatusMessage(`重命名失败：${error instanceof Error ? error.message : ''}`)
+    }
+  }
+
+  function revealFolderInFinder(folder: FolderNode) {
+    if (!libraryRootPath) return
+    const path = folder.path === '/' ? libraryRootPath : `${libraryRootPath}${folder.path}`
+    void invoke('reveal_in_finder', { path }).catch((error) => {
+      setStatusMessage(`无法打开 Finder：${error instanceof Error ? error.message : ''}`)
+    })
+  }
+
+  function remapFolderPath(path: string, oldPath: string, newPath: string) {
+    if (path === oldPath) return newPath
+    if (path.startsWith(`${oldPath}/`)) return `${newPath}${path.slice(oldPath.length)}`
+    return path
+  }
+
+  async function renameFolderTo(newName: string) {
+    const folder = renameFolderTarget
+    setRenameFolderTarget(null)
+    if (!folder || !libraryRootPath || folder.path === '/') return
+
+    const oldPath = folder.path
+    const cleanName = newName.trim()
+    if (!cleanName || cleanName === folder.name) return
+
+    try {
+      const remaps = await invoke<{ previousRelativePath: string; asset: NativeScannedAsset }[]>('rename_folder', {
+        libraryRoot: libraryRootPath,
+        folderRelativePath: oldPath.replace(/^\/+/, ''),
+        newName: cleanName,
+      })
+
+      const parent = oldPath.slice(0, oldPath.lastIndexOf('/'))
+      const newPath = `${parent}/${cleanName}`
+
+      const byRelativePath = createLiveAssetByRelativePath(libraryAssetsRef.current, assetByIdRef.current)
+      const replacements: AssetReplacement[] = []
+      for (const entry of remaps) {
+        const oldAsset = byRelativePath.get(entry.previousRelativePath)
+        if (oldAsset) replacements.push({ oldId: oldAsset.id, oldAsset, asset: nativeAssetToFrontend(entry.asset) })
+      }
+      replaceLibraryAssets(replacements)
+
+      setActiveFolder((current) => remapFolderPath(current, oldPath, newPath))
+      setFolderOrder((current) => {
+        const next = current.map((path) => remapFolderPath(path, oldPath, newPath))
+        if (libraryRootPath) {
+          void invoke('write_library_settings', {
+            libraryRoot: libraryRootPath,
+            settings: { folderOrder: next },
+          }).catch(() => undefined)
+        }
+        return next
+      })
+      setStatusMessage(`已重命名文件夹为 ${cleanName}`)
+    } catch (error) {
+      setStatusMessage(`重命名文件夹失败：${error instanceof Error ? error.message : ''}`)
+    }
+  }
+
   function writeAssetToStore(updatedAsset: Asset) {
     const updates = new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]])
     setAssetStore((current) =>
@@ -2244,14 +3217,27 @@ export default function App() {
   }
 
   function commitAssetMetadataUpdate(updatedAsset: Asset) {
+    const previousAsset = assetByIdRef.current.get(updatedAsset.id)
+    const affectsCatalog = assetUpdateAffectsCatalog(previousAsset, updatedAsset)
+
     writeAssetToStore(updatedAsset)
-    setLibraryAssets((current) =>
-      applyAssetUpdatesToArray(
-        current,
-        new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]]),
-        libraryAssetIndexByIdRef.current,
-      ),
+    setAssetMetadataVersion((version) => version + 1)
+
+    if (!affectsCatalog) return
+
+    const nextAssets = applyAssetUpdatesToArray(
+      libraryAssetsRef.current,
+      new Map<string, Partial<Asset>>([[updatedAsset.id, updatedAsset]]),
+      libraryAssetIndexByIdRef.current,
     )
+    if (assetUpdateCanPatchCatalogTags(previousAsset, updatedAsset) && previousAsset) {
+      setLibraryCatalog((current) =>
+        updateCatalogTagsForAssetMetadata(libraryName, current, previousAsset, updatedAsset),
+      )
+    } else {
+      setLibraryCatalog(deriveLibraryCatalogState(libraryName, nextAssets))
+    }
+    setLibraryAssets(nextAssets)
   }
 
   function saveFolderAssetMetadata(asset: Asset) {
@@ -2293,7 +3279,8 @@ export default function App() {
     const target = assetByIdRef.current.get(assetId)
     if (!target?.tags.includes(tag)) return
 
-    const tagStillUsed = libraryAssets.some((asset) => asset.id !== assetId && asset.tags.includes(tag))
+    const tagStillUsed =
+      activeTag === tag && (libraryCatalog.tagCounts.get(tag) ?? 0) > 1
     const updatedAsset = withAssetSearchText({
       ...target,
       tags: target.tags.filter((assetTag) => assetTag !== tag),
@@ -2329,21 +3316,81 @@ export default function App() {
 
     const startX = event.clientX
     const startWidth = sidebarWidth
+    const sidebarWidthCommitter = createRafNumberCommitter(setSidebarWidth, startWidth)
 
     document.body.classList.add('is-resizing-col')
 
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      setSidebarWidth(clamp(startWidth + moveEvent.clientX - startX, 176, 340))
+    const updateWidthFromPointer = (clientX: number) => {
+      sidebarWidthCommitter.update(clamp(startWidth + clientX - startX, 176, 340))
     }
 
-    const stopResize = () => {
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      updateWidthFromPointer(moveEvent.clientX)
+    }
+
+    const stopResize = (pointerEvent: PointerEvent) => {
+      updateWidthFromPointer(pointerEvent.clientX)
+      sidebarWidthCommitter.flush()
       document.body.classList.remove('is-resizing-col')
       window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResize)
+      window.removeEventListener('pointercancel', stopResize)
     }
 
     window.addEventListener('pointermove', handlePointerMove)
     window.addEventListener('pointerup', stopResize, { once: true })
+    window.addEventListener('pointercancel', stopResize, { once: true })
   }
+
+  const rememberScrollPosition = useCallback((key: string, nextScrollTop: number) => {
+    scrollPositionsRef.current[key] = Math.max(0, Math.round(nextScrollTop))
+    if (scrollSaveTimerRef.current) return
+
+    scrollSaveTimerRef.current = window.setTimeout(() => {
+      updateAppPrefs((prefs) => ({
+        ...prefs,
+        scrollPositions: scrollPositionsRef.current,
+      }))
+      scrollSaveTimerRef.current = undefined
+    }, SCROLL_POSITION_SAVE_MS)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (scrollSaveTimerRef.current) window.clearTimeout(scrollSaveTimerRef.current)
+    }
+  }, [])
+
+  const assetMenuSingle = visibleSelectedIds.size === 1 ? primaryAsset : undefined
+  function getVisibleSelectedAssets() {
+    const assets: Asset[] = []
+    for (const id of visibleSelectedIds) {
+      const asset = assetByIdRef.current.get(id)
+      if (asset) assets.push(asset)
+    }
+    return assets
+  }
+  const assetMenuItems: ContextMenuItem[] = [
+    ...(assetMenuSingle
+      ? [
+          { label: '复制图片', icon: <Copy size={13} />, onSelect: () => copyAssetImage(assetMenuSingle) },
+          { label: '重命名', icon: <Pencil size={13} />, onSelect: () => setRenameTarget(assetMenuSingle) },
+        ]
+      : []),
+    {
+      label: '移动到…',
+      icon: <FolderInput size={13} />,
+      disabled: visibleSelectedIds.size === 0,
+      onSelect: () => setMoveOpen(true),
+    },
+    {
+      label: '删除到回收站',
+      icon: <Trash2 size={13} />,
+      danger: true,
+      disabled: visibleSelectedIds.size === 0,
+      onSelect: deleteSelectedToTrash,
+    },
+  ]
 
   return (
     <div className="app-shell">
@@ -2370,12 +3417,16 @@ export default function App() {
           allTags={allTags}
           canReveal={Boolean(libraryRootPath)}
           folders={orderedFolders}
+          folderPaneHeight={folderPaneHeight}
           libraryName={libraryName}
           trashActive={trashView}
           trashCount={trashItems.length}
           onEmptyTrash={emptyTrash}
+          onRenameFolder={setRenameFolderTarget}
+          onRevealFolder={revealFolderInFinder}
           onRevealLibrary={revealLibraryInFinder}
           onReorderFolders={reorderFolders}
+          onSetFolderPaneHeight={setFolderPaneHeight}
           onSetActiveFolder={selectFolder}
           onSetActiveTag={selectTag}
           onShowTrash={showTrashView}
@@ -2396,7 +3447,6 @@ export default function App() {
               selectedIds={trashSelectedIds}
               thumbSize={thumbSize}
               onBack={() => setTrashView(false)}
-              onEmpty={emptyTrash}
               onRestore={restoreTrashItems}
               onToggleSelect={(id) => toggleTrashSelect(id)}
             />
@@ -2406,12 +3456,16 @@ export default function App() {
             activeFilterCount={activeFilterCount}
             allTags={allTags}
             assetById={assetById}
-            assetIndexById={visibleIndexById}
+            getAssetIndex={getVisibleAssetIndex}
+            assetLayoutVersion={assetStore.layoutVersion}
             breadcrumb={breadcrumb}
             filtersOpen={filtersOpen}
             inspectorVisible={inspectorVisible}
             keyboardScrollTargetId={keyboardScrollTargetId}
             keyboardScrollVersion={keyboardScrollVersion}
+            scrollJump={scrollJump}
+            scrollRestoreKey={scrollRestoreKey}
+            scrollTop={restoredScrollTop}
             primaryAsset={primaryAsset}
             query={query}
             selectedIds={visibleSelectedIds}
@@ -2426,11 +3480,15 @@ export default function App() {
             visibleAssetIds={visibleAssetIds}
             onAddAssetTag={addAssetTag}
             onAssetClick={handleAssetClick}
+            onAssetContextMenu={handleAssetContextMenu}
             onAssetDoubleClick={handleAssetDoubleClick}
+            onAssetDragStart={handleAssetDragStart}
             onOpenFolder={openLibraryFolder}
             onRefresh={refreshLibrary}
             onRemoveAssetTag={removeAssetTag}
             onOcr={runOcr}
+            onRotate={(asset, quarterTurns) => rotateAssets([asset], quarterTurns)}
+            onRotateSelected={(quarterTurns) => rotateAssets(getVisibleSelectedAssets(), quarterTurns)}
             onDeleteSelected={deleteSelectedToTrash}
             onOpenBatch={() => setBatchOpen(true)}
             onSetActiveTag={selectTag}
@@ -2444,8 +3502,8 @@ export default function App() {
             onSetThumbSize={setThumbSize}
             onSetTypeFilter={setTypeFilter}
             onSetViewMode={setViewMode}
+            onScrollPositionChange={rememberScrollPosition}
             onUpdateAssetNote={updateAssetNote}
-            onVisualOrderChange={handleVisualOrderChange}
           />
           )}
         </div>
@@ -2484,17 +3542,47 @@ export default function App() {
         />
       )}
 
+      {assetMenu && (
+        <ContextMenu x={assetMenu.x} y={assetMenu.y} items={assetMenuItems} onClose={() => setAssetMenu(null)} />
+      )}
+
+      {moveOpen && (
+        <MovePicker
+          count={visibleSelectedIds.size}
+          folders={orderedFolders}
+          libraryName={libraryName}
+          onCancel={() => setMoveOpen(false)}
+          onConfirm={moveSelectedTo}
+        />
+      )}
+
+      {renameTarget && (
+        <RenameModal name={renameTarget.name} onCancel={() => setRenameTarget(null)} onConfirm={renameSelectedAsset} />
+      )}
+
+      {renameFolderTarget && (
+        <RenameModal
+          name={renameFolderTarget.name}
+          onCancel={() => setRenameFolderTarget(null)}
+          onConfirm={renameFolderTo}
+        />
+      )}
+
+      {thumbnailPromptOpen && (
+        <ThumbnailPromptModal
+          totalCount={totalAssetCount}
+          folders={thumbnailFolders}
+          onConfirm={confirmThumbnailPrompt}
+          onDismiss={() => setThumbnailPromptOpen(false)}
+        />
+      )}
+
       {ocr && <OcrModal status={ocr.status} text={ocr.text} error={ocr.error} onClose={closeOcr} />}
 
       {batchOpen && (
         <BatchModal
           selectedCount={visibleSelectedIds.size}
-          processableCount={
-            [...visibleSelectedIds].filter((id) => {
-              const asset = assetById.get(id)
-              return Boolean(asset && BATCH_PROCESSABLE_KINDS.has(asset.kind))
-            }).length
-          }
+          processableCount={countProcessableAssets(visibleSelectedIds, assetById)}
           processing={batchProcessing}
           onClose={() => !batchProcessing && setBatchOpen(false)}
           onStart={runBatchProcess}

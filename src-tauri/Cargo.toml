@@ -1,6 +1,6 @@
 [package]
 name = "picman"
-version = "0.1.26"
+version = "0.1.86"
 description = "File-first image asset manager"
 authors = ["Picman"]
 license = ""
@@ -30,3 +30,5 @@ sha2 = "0.10"
 walkdir = "2"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-drag = "2"

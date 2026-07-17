@@ -1,8 +1,10 @@
-import { Folder, FolderOpen, Search, Tag, Trash2, X } from 'lucide-react'
+import { Folder, FolderOpen, Pencil, Search, Tag, Trash2, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
-import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type { DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
+import { createRafNumberCommitter } from '../lib/rafState'
 import { normalizeSearchText } from '../lib/search'
 import type { FolderNode } from '../types/library'
+import { ContextMenu } from './ContextMenu'
 
 type SidebarProps = {
   activeFolder: string
@@ -10,12 +12,16 @@ type SidebarProps = {
   allTags: string[]
   canReveal: boolean
   folders: FolderNode[]
+  folderPaneHeight: number
   libraryName: string
   trashActive: boolean
   trashCount: number
   onEmptyTrash: () => void
+  onRenameFolder: (folder: FolderNode) => void
+  onRevealFolder: (folder: FolderNode) => void
   onRevealLibrary: () => void
   onReorderFolders: (orderedChildPaths: string[]) => void
+  onSetFolderPaneHeight: (height: number) => void
   onSetActiveFolder: (folder: string) => void
   onSetActiveTag: (tag: string) => void
   onShowTrash: () => void
@@ -34,23 +40,32 @@ export function Sidebar({
   allTags,
   canReveal,
   folders,
+  folderPaneHeight,
   libraryName,
   trashActive,
   trashCount,
   onEmptyTrash,
+  onRenameFolder,
+  onRevealFolder,
   onRevealLibrary,
   onReorderFolders,
+  onSetFolderPaneHeight,
   onSetActiveFolder,
   onSetActiveTag,
   onShowTrash,
 }: SidebarProps) {
-  const [folderPaneHeight, setFolderPaneHeight] = useState(226)
   const [folderSearchOpen, setFolderSearchOpen] = useState(false)
   const [folderQuery, setFolderQuery] = useState('')
   const [folderSearchText, setFolderSearchText] = useState('')
   const [draggingPath, setDraggingPath] = useState<string | null>(null)
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null)
   const [trashMenu, setTrashMenu] = useState<{ x: number; y: number } | null>(null)
+  const [folderMenu, setFolderMenu] = useState<{ folder: FolderNode; x: number; y: number } | null>(null)
+
+  function handleFolderContextMenu(event: ReactMouseEvent, folder: FolderNode) {
+    event.preventDefault()
+    setFolderMenu({ folder, x: event.clientX, y: event.clientY })
+  }
   const folderSearchComposingRef = useRef(false)
   const folderSearch = normalizeSearchText(folderQuery).trim()
   const allChildFolders = useMemo(() => folders.filter((folder) => folder.path !== '/'), [folders])
@@ -124,20 +139,30 @@ export function Sidebar({
     const startY = event.clientY
     const startHeight = folderPaneHeight
     const maxHeight = Math.max(FOLDER_PANE_MIN, window.innerHeight - TAG_PANE_MIN - 92)
+    const folderPaneHeightCommitter = createRafNumberCommitter(onSetFolderPaneHeight, startHeight)
 
     document.body.classList.add('is-resizing-row')
 
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      setFolderPaneHeight(clamp(startHeight + moveEvent.clientY - startY, FOLDER_PANE_MIN, maxHeight))
+    const updateHeightFromPointer = (clientY: number) => {
+      folderPaneHeightCommitter.update(clamp(startHeight + clientY - startY, FOLDER_PANE_MIN, maxHeight))
     }
 
-    const stopResize = () => {
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      updateHeightFromPointer(moveEvent.clientY)
+    }
+
+    const stopResize = (pointerEvent: PointerEvent) => {
+      updateHeightFromPointer(pointerEvent.clientY)
+      folderPaneHeightCommitter.flush()
       document.body.classList.remove('is-resizing-row')
       window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResize)
+      window.removeEventListener('pointercancel', stopResize)
     }
 
     window.addEventListener('pointermove', handlePointerMove)
     window.addEventListener('pointerup', stopResize, { once: true })
+    window.addEventListener('pointercancel', stopResize, { once: true })
   }
 
   return (
@@ -195,6 +220,7 @@ export function Sidebar({
               } ${dropTargetPath === folder.path && draggingPath !== folder.path ? 'drag-over' : ''}`}
               draggable={canReorder}
               onClick={() => onSetActiveFolder(folder.path)}
+              onContextMenu={(event) => handleFolderContextMenu(event, folder)}
               onDragStart={(event) => handleFolderDragStart(event, folder.path)}
               onDragOver={(event) => handleFolderDragOver(event, folder.path)}
               onDrop={(event) => handleFolderDrop(event, folder.path)}
@@ -276,6 +302,18 @@ export function Sidebar({
         <div className="sb-dot" />
         <span>文件优先资源库</span>
       </div>
+
+      {folderMenu && (
+        <ContextMenu
+          x={folderMenu.x}
+          y={folderMenu.y}
+          items={[
+            { label: '重命名', icon: <Pencil size={13} />, onSelect: () => onRenameFolder(folderMenu.folder) },
+            { label: '在 Finder 中显示', icon: <FolderOpen size={13} />, onSelect: () => onRevealFolder(folderMenu.folder) },
+          ]}
+          onClose={() => setFolderMenu(null)}
+        />
+      )}
     </aside>
   )
 }
