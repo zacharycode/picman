@@ -34,6 +34,44 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
 }
 
+function childFoldersFromFolders(folders: FolderNode[]) {
+  const childFolders = new Array<FolderNode>(folders.length)
+  let childCount = 0
+  for (let index = 0; index < folders.length; index += 1) {
+    const folder = folders[index]
+    if (folder.path === '/') continue
+
+    childFolders[childCount] = folder
+    childCount += 1
+  }
+  childFolders.length = childCount
+  return childFolders
+}
+
+function filterFoldersBySearch(folders: FolderNode[], folderSearch: string) {
+  if (!folderSearch) return folders
+
+  const filteredFolders = new Array<FolderNode>(folders.length)
+  let folderCount = 0
+  for (let index = 0; index < folders.length; index += 1) {
+    const folder = folders[index]
+    if (!normalizeSearchText(`${folder.name} ${folder.path}`).includes(folderSearch)) continue
+
+    filteredFolders[folderCount] = folder
+    folderCount += 1
+  }
+  filteredFolders.length = folderCount
+  return filteredFolders
+}
+
+function folderPathsFromFolders(folders: FolderNode[]) {
+  const paths = new Array<string>(folders.length)
+  for (let index = 0; index < folders.length; index += 1) {
+    paths[index] = folders[index].path
+  }
+  return paths
+}
+
 export function Sidebar({
   activeFolder,
   activeTag,
@@ -68,13 +106,9 @@ export function Sidebar({
   }
   const folderSearchComposingRef = useRef(false)
   const folderSearch = normalizeSearchText(folderQuery).trim()
-  const allChildFolders = useMemo(() => folders.filter((folder) => folder.path !== '/'), [folders])
+  const allChildFolders = useMemo(() => childFoldersFromFolders(folders), [folders])
   const childFolders = useMemo(
-    () =>
-      allChildFolders.filter((folder) => {
-        if (!folderSearch) return true
-        return normalizeSearchText(`${folder.name} ${folder.path}`).includes(folderSearch)
-      }),
+    () => filterFoldersBySearch(allChildFolders, folderSearch),
     [allChildFolders, folderSearch],
   )
   // Manual reordering only makes sense on the full, unfiltered list.
@@ -105,7 +139,7 @@ export function Sidebar({
     clearFolderDrag()
     if (!sourcePath || sourcePath === targetPath) return
 
-    const paths = allChildFolders.map((folder) => folder.path)
+    const paths = folderPathsFromFolders(allChildFolders)
     const from = paths.indexOf(sourcePath)
     const to = paths.indexOf(targetPath)
     if (from === -1 || to === -1) return

@@ -293,6 +293,43 @@ function appendItems<T>(current: T[], incoming: T[]) {
   return next
 }
 
+function prependItems<T>(incoming: T[], current: T[]) {
+  if (incoming.length === 0) return current
+  if (current.length === 0) return incoming
+
+  const incomingLength = incoming.length
+  const next = new Array<T>(incomingLength + current.length)
+  for (let index = 0; index < incomingLength; index += 1) next[index] = incoming[index]
+  for (let index = 0; index < current.length; index += 1) next[incomingLength + index] = current[index]
+  return next
+}
+
+function removeItemsById<T extends { id: string }>(current: T[], removedIds: Set<string>) {
+  let next: T[] | undefined
+  let nextIndex = 0
+
+  for (let index = 0; index < current.length; index += 1) {
+    const item = current[index]
+    if (removedIds.has(item.id)) {
+      if (!next) {
+        next = new Array<T>(current.length)
+        for (let copyIndex = 0; copyIndex < index; copyIndex += 1) next[copyIndex] = current[copyIndex]
+        nextIndex = index
+      }
+      continue
+    }
+
+    if (next) {
+      next[nextIndex] = item
+      nextIndex += 1
+    }
+  }
+
+  if (!next) return current
+  next.length = nextIndex
+  return next
+}
+
 function pushItems<T>(target: T[], incoming: T[]) {
   for (const item of incoming) target.push(item)
 }
@@ -621,6 +658,22 @@ function nativeAssetToFrontend(asset: NativeScannedAsset): Asset {
   })
 }
 
+function frontendAssetsFromNative(nativeAssets: NativeScannedAsset[]) {
+  const assets = new Array<Asset>(nativeAssets.length)
+  for (let index = 0; index < nativeAssets.length; index += 1) {
+    assets[index] = nativeAssetToFrontend(nativeAssets[index])
+  }
+  return assets
+}
+
+function assetsWithSearchText(assets: Asset[]) {
+  const nextAssets = new Array<Asset>(assets.length)
+  for (let index = 0; index < assets.length; index += 1) {
+    nextAssets[index] = withAssetSearchText(assets[index])
+  }
+  return nextAssets
+}
+
 function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): RefreshMergeResult {
   const previousById = new Map<string, Asset>()
   const previousSourcePaths = new Set<string>()
@@ -631,10 +684,11 @@ function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): 
 
   const scannedSourcePaths = new Set<string>()
   const idSet = new Set<string>()
-  const assets: Asset[] = []
+  const assets = new Array<Asset>(scannedAssets.length)
   let added = 0
 
-  for (const asset of scannedAssets) {
+  for (let index = 0; index < scannedAssets.length; index += 1) {
+    const asset = scannedAssets[index]
     idSet.add(asset.id)
     if (asset.sourcePath) {
       scannedSourcePaths.add(asset.sourcePath)
@@ -644,7 +698,7 @@ function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): 
     const previous = previousById.get(asset.id)
 
     if (previous?.thumbnailReady) {
-      assets.push({
+      assets[index] = {
         ...asset,
         previewUrl: previous.previewUrl,
         thumbnailError: previous.thumbnailError,
@@ -657,9 +711,9 @@ function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Asset[]): 
         thumbnailUrl: previous.thumbnailUrl,
         thumbnailVersion: previous.thumbnailVersion,
         thumbnailWidth: previous.thumbnailWidth,
-      })
+      }
     } else {
-      assets.push(asset)
+      assets[index] = asset
     }
   }
 
@@ -693,19 +747,39 @@ function buildLibraryCatalogState(
     a === '/' ? -1 : b === '/' ? 1 : a.localeCompare(b),
   )
   const liveTagCounts = new Map<string, number>()
+  const allTags = new Array<string>(tagCounts.size)
+  let tagIndex = 0
   for (const [tag, count] of tagCounts) {
-    if (count > 0) liveTagCounts.set(tag, count)
+    if (count <= 0) continue
+
+    liveTagCounts.set(tag, count)
+    allTags[tagIndex] = tag
+    tagIndex += 1
   }
+  allTags.length = tagIndex
+  allTags.sort()
+
+  const folders = new Array<FolderNode>(folderItems.length)
+  const thumbnailFolders = new Array<FolderNode>(Math.max(0, folderItems.length - 1))
+  let thumbnailFolderIndex = 0
+  for (let index = 0; index < folderItems.length; index += 1) {
+    const [path, count] = folderItems[index]
+    const node = { path, name: folderName(path, libraryName), count }
+    folders[index] = node
+    if (path !== '/') {
+      thumbnailFolders[thumbnailFolderIndex] = node
+      thumbnailFolderIndex += 1
+    }
+  }
+  thumbnailFolders.length = thumbnailFolderIndex
 
   return {
-    allTags: Array.from(liveTagCounts.keys()).sort(),
+    allTags,
     folderCounts,
-    folders: folderItems.map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    folders,
     sourceSize,
     tagCounts: liveTagCounts,
-    thumbnailFolders: folderItems
-      .filter(([path]) => path !== '/')
-      .map(([path, count]) => ({ path, name: folderName(path, libraryName), count })),
+    thumbnailFolders,
   }
 }
 
@@ -749,18 +823,20 @@ function patchFolderNodeCounts(
   folderCounts: Map<string, number>,
   touchedFolderPaths: Set<string>,
 ) {
-  let changed = false
-  const nextFolders = folders.map((folder) => {
-    if (!touchedFolderPaths.has(folder.path)) return folder
+  let nextFolders: FolderNode[] | undefined
+
+  for (let index = 0; index < folders.length; index += 1) {
+    const folder = folders[index]
+    if (!touchedFolderPaths.has(folder.path)) continue
 
     const count = folderCounts.get(folder.path) ?? 0
-    if (folder.count === count) return folder
+    if (folder.count === count) continue
 
-    changed = true
-    return { ...folder, count }
-  })
+    nextFolders ??= folders.slice()
+    nextFolders[index] = { ...folder, count }
+  }
 
-  return changed ? nextFolders : folders
+  return nextFolders ?? folders
 }
 
 function patchLibraryCatalogCounts(
@@ -854,20 +930,43 @@ function renameLibraryCatalogState(libraryName: string, catalog: LibraryCatalogS
 function applyFolderOrder(folders: FolderNode[], order: string[]): FolderNode[] {
   if (order.length === 0) return folders
 
-  const rank = new Map(order.map((path, index) => [path, index]))
-  const root = folders.filter((folder) => folder.path === '/')
-  const children = folders
-    .filter((folder) => folder.path !== '/')
-    .sort((a, b) => {
-      const rankA = rank.get(a.path)
-      const rankB = rank.get(b.path)
-      if (rankA !== undefined && rankB !== undefined) return rankA - rankB
-      if (rankA !== undefined) return -1
-      if (rankB !== undefined) return 1
-      return 0
-    })
+  const rank = new Map<string, number>()
+  for (let index = 0; index < order.length; index += 1) {
+    rank.set(order[index], index)
+  }
 
-  return [...root, ...children]
+  const rootFolders: FolderNode[] = []
+  const children = new Array<FolderNode>(folders.length)
+  let childCount = 0
+  for (let index = 0; index < folders.length; index += 1) {
+    const folder = folders[index]
+    if (folder.path === '/') rootFolders.push(folder)
+    else {
+      children[childCount] = folder
+      childCount += 1
+    }
+  }
+  children.length = childCount
+
+  children.sort((a, b) => {
+    const rankA = rank.get(a.path)
+    const rankB = rank.get(b.path)
+    if (rankA !== undefined && rankB !== undefined) return rankA - rankB
+    if (rankA !== undefined) return -1
+    if (rankB !== undefined) return 1
+    return 0
+  })
+
+  if (rootFolders.length === 0) return children
+
+  const orderedFolders = new Array<FolderNode>(rootFolders.length + children.length)
+  for (let index = 0; index < rootFolders.length; index += 1) {
+    orderedFolders[index] = rootFolders[index]
+  }
+  for (let index = 0; index < children.length; index += 1) {
+    orderedFolders[rootFolders.length + index] = children[index]
+  }
+  return orderedFolders
 }
 
 function deriveThumbnailMetrics(assets: Asset[]): ThumbnailMetrics {
@@ -1228,16 +1327,19 @@ export default function App() {
     if (!hasVisibleFilters) return sortedAssetIds
 
     const searchQuery = normalizedQuery
-    const ids: string[] = []
+    const ids = new Array<string>(sortedAssetIds.length)
+    let matchedCount = 0
 
     for (const assetId of sortedAssetIds) {
       const asset = assetById.get(assetId)
       if (!asset) continue
 
       if (assetMatchesVisibleFilters(asset, activeFolder, activeTag, typeFilter, thumbnailState, searchQuery)) {
-        ids.push(asset.id)
+        ids[matchedCount] = assetId
+        matchedCount += 1
       }
     }
+    ids.length = matchedCount
 
     if (shouldDeferSortDuringOpenScan && ids.length <= LARGE_SCAN_SORT_THRESHOLD) {
       return sortAssetIds(ids, assetById, sortField, sortDir)
@@ -1672,7 +1774,7 @@ export default function App() {
         const scan = activeNativeScanRef.current
         if (!scan || scan.id !== event.payload.scanId) return
 
-        const incoming = event.payload.assets.map(nativeAssetToFrontend)
+        const incoming = frontendAssetsFromNative(event.payload.assets)
         if (incoming.length === 0) return
         const now = window.performance.now()
         const shouldUpdateStatus = now - scan.lastStatusAt >= SCAN_STATUS_UPDATE_MS
@@ -2219,7 +2321,7 @@ export default function App() {
     const total = await scanFilesInBatches(
       files,
       (batch, scanned) => {
-        const incoming = batch.map(withAssetSearchText)
+        const incoming = assetsWithSearchText(batch)
         scannedTotal = scanned
 
         appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, incoming)
@@ -2768,23 +2870,30 @@ export default function App() {
   function removeAssetsFromLibrary(removedIds: Set<string>) {
     if (removedIds.size === 0) return
 
-    const removedAssets: Asset[] = []
-    const nextAssets: Asset[] = []
+    const sourceAssets = libraryAssetsRef.current
+    const removedAssets = new Array<Asset>(Math.min(removedIds.size, sourceAssets.length))
+    const nextAssets = new Array<Asset>(Math.max(0, sourceAssets.length - removedIds.size))
+    let nextAssetCount = 0
+    let removedAssetCount = 0
     const removedMetrics: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }
 
-    for (const asset of libraryAssetsRef.current) {
+    for (const asset of sourceAssets) {
       if (!removedIds.has(asset.id)) {
-        nextAssets.push(asset)
+        nextAssets[nextAssetCount] = asset
+        nextAssetCount += 1
         continue
       }
 
       const liveAsset = assetByIdRef.current.get(asset.id) ?? asset
-      removedAssets.push(liveAsset)
+      removedAssets[removedAssetCount] = liveAsset
+      removedAssetCount += 1
       if (liveAsset.thumbnailReady) {
         removedMetrics.generatedCount += 1
         removedMetrics.cacheSize += liveAsset.thumbnailSizeKb ?? 0
       }
     }
+    nextAssets.length = nextAssetCount
+    removedAssets.length = removedAssetCount
 
     revokePreviewUrls(removedAssets)
     libraryAssetIndexByIdRef.current = createAssetIndexMap(nextAssets)
@@ -2823,7 +2932,7 @@ export default function App() {
         relativePaths: targets.relativePaths,
       })
       removeAssetsFromLibrary(targets.ids)
-      setTrashItems((current) => [...created, ...current])
+      setTrashItems((current) => prependItems(created, current))
       setStatusMessage(`已删除 ${created.length} 项到回收站`)
     } catch (error) {
       const message = error instanceof Error ? error.message : '删除失败'
@@ -2839,14 +2948,19 @@ export default function App() {
         libraryRoot: libraryRootPath,
         ids,
       })
-      const restoredAssets: Asset[] = []
+      const restoredAssets = new Array<Asset>(restored.length)
+      let restoredAssetCount = 0
       for (const scanned of restored) {
         const asset = nativeAssetToFrontend(scanned)
-        if (!assetByIdRef.current.has(asset.id)) restoredAssets.push(asset)
+        if (!assetByIdRef.current.has(asset.id)) {
+          restoredAssets[restoredAssetCount] = asset
+          restoredAssetCount += 1
+        }
       }
+      restoredAssets.length = restoredAssetCount
       insertCollectedAssets(restoredAssets)
       const idSet = new Set(ids)
-      setTrashItems((current) => current.filter((item) => !idSet.has(item.id)))
+      setTrashItems((current) => removeItemsById(current, idSet))
       setTrashSelectedIds((current) => removeIdsFromSet(current, idSet))
       setStatusMessage(`已恢复 ${restored.length} 项`)
     } catch (error) {

@@ -113,10 +113,30 @@ async function main() {
     'function assetMatchesVisibleFilters',
     'function appendAssetsToLibraryCatalogState',
   )
+  const visibleAssetIdsSource = extractBetween(
+    appSource,
+    'const visibleAssetIds = useMemo',
+    'const visibleCount',
+  )
+  const catalogBuildSource = extractBetween(
+    appSource,
+    'function buildLibraryCatalogState',
+    'function deriveLibraryCatalogState',
+  )
   const catalogAppendSource = extractBetween(
     appSource,
     'function appendAssetsToLibraryCatalogState',
     'function updateCatalogTagsForAssetMetadata',
+  )
+  const folderNodePatchSource = extractBetween(
+    appSource,
+    'function patchFolderNodeCounts',
+    'function patchLibraryCatalogCounts',
+  )
+  const folderOrderSource = extractBetween(
+    appSource,
+    'function applyFolderOrder',
+    'function deriveThumbnailMetrics',
   )
   const refreshMergeSource = extractBetween(
     appSource,
@@ -132,6 +152,11 @@ async function main() {
     appSource,
     'function getLiveAssets',
     'function updateAssetStore',
+  )
+  const scanConversionSource = extractBetween(
+    appSource,
+    'function nativeAssetToFrontend',
+    'function mergeRefreshedAssets',
   )
   const appendHelpersSource = extractBetween(
     appSource,
@@ -444,32 +469,51 @@ async function main() {
   assertCheck(
     checks,
     appendHelpersSource.includes('function appendItems<T>') &&
+      scanConversionSource.includes('function frontendAssetsFromNative(nativeAssets: NativeScannedAsset[])') &&
+      scanConversionSource.includes('const assets = new Array<Asset>(nativeAssets.length)') &&
+      scanConversionSource.includes('assets[index] = nativeAssetToFrontend(nativeAssets[index])') &&
+      scanConversionSource.includes('function assetsWithSearchText(assets: Asset[])') &&
+      scanConversionSource.includes('const nextAssets = new Array<Asset>(assets.length)') &&
+      scanConversionSource.includes('nextAssets[index] = withAssetSearchText(assets[index])') &&
       appendHelpersSource.includes('const next = new Array<T>(currentLength + incoming.length)') &&
+      appendHelpersSource.includes('function prependItems<T>') &&
+      appendHelpersSource.includes('const next = new Array<T>(incomingLength + current.length)') &&
+      appendHelpersSource.includes('function removeItemsById<T extends { id: string }>') &&
+      appendHelpersSource.includes('next = new Array<T>(current.length)') &&
+      appendHelpersSource.includes('next.length = nextIndex') &&
       appendHelpersSource.includes('function appendAssetIds') &&
       appendHelpersSource.includes('const next = new Array<string>(currentLength + incoming.length)') &&
       appendHelpersSource.includes('function pushItems<T>') &&
       appSource.includes('setLibraryAssets((current) => appendItems(current, incoming))') &&
       appSource.includes('pushItems(scan.collectedAssets, incoming)') &&
       appSource.includes('pushItems(scan.pendingAssets, incoming)') &&
+      appSource.includes('const incoming = frontendAssetsFromNative(event.payload.assets)') &&
+      appSource.includes('const incoming = assetsWithSearchText(batch)') &&
       !appendHelpersSource.includes('incoming.map((asset) => asset.id)') &&
+      !appSource.includes('event.payload.assets.map(nativeAssetToFrontend)') &&
+      !appSource.includes('batch.map(withAssetSearchText)') &&
       !appSource.includes('setLibraryAssets((current) => [...current, ...incoming])') &&
       !appSource.includes('scan.collectedAssets.push(...incoming)') &&
       !appSource.includes('scan.pendingAssets.push(...incoming)'),
-    '打开大资源目录的批次追加使用预分配循环，避免 incoming.map、数组 spread 和 push 参数展开',
+    '打开大资源目录的批次转换与追加使用预分配循环，避免 batch map、数组 spread 和 push 参数展开',
     'open scan append preallocated loops',
   )
   assertCheck(
     checks,
     refreshMergeSource.includes('for (const asset of previousAssets)') &&
-      refreshMergeSource.includes('for (const asset of scannedAssets)') &&
+      refreshMergeSource.includes('const assets = new Array<Asset>(scannedAssets.length)') &&
+      refreshMergeSource.includes('for (let index = 0; index < scannedAssets.length; index += 1)') &&
+      refreshMergeSource.includes('const asset = scannedAssets[index]') &&
       refreshMergeSource.includes('for (const asset of previousAssets)') &&
       refreshMergeSource.includes('if (!previousSourcePaths.has(asset.sourcePath)) added += 1') &&
-      refreshMergeSource.includes('assets.push(asset)') &&
+      refreshMergeSource.includes('assets[index] = {') &&
+      refreshMergeSource.includes('assets[index] = asset') &&
+      !refreshMergeSource.includes('assets.push') &&
       !refreshMergeSource.includes('previousAssets.map') &&
       !refreshMergeSource.includes('scannedAssets.map') &&
       !refreshMergeSource.includes('previousAssets.filter') &&
       !refreshMergeSource.includes('scannedAssets.filter'),
-    '刷新扫描合并使用单向循环累积索引、结果和统计，避免大资源库多次 map/filter 分配',
+    '刷新扫描合并使用单向循环和预分配结果数组累积索引、结果和统计，避免大资源库多次 map/filter 或 push 动态增长',
     'refresh merge single-pass loops',
   )
   assertCheck(
@@ -482,6 +526,24 @@ async function main() {
   )
   assertCheck(
     checks,
+    catalogBuildSource.includes('const allTags = new Array<string>(tagCounts.size)') &&
+      catalogBuildSource.includes('let tagIndex = 0') &&
+      catalogBuildSource.includes('allTags[tagIndex] = tag') &&
+      catalogBuildSource.includes('allTags.length = tagIndex') &&
+      catalogBuildSource.includes('const folders = new Array<FolderNode>(folderItems.length)') &&
+      catalogBuildSource.includes('const thumbnailFolders = new Array<FolderNode>(Math.max(0, folderItems.length - 1))') &&
+      catalogBuildSource.includes('for (let index = 0; index < folderItems.length; index += 1)') &&
+      catalogBuildSource.includes('folders[index] = node') &&
+      catalogBuildSource.includes('thumbnailFolders[thumbnailFolderIndex] = node') &&
+      catalogBuildSource.includes('thumbnailFolders.length = thumbnailFolderIndex') &&
+      !catalogBuildSource.includes('Array.from(liveTagCounts.keys())') &&
+      !catalogBuildSource.includes('folders: folderItems.map') &&
+      !catalogBuildSource.includes('.filter(([path]) => path !== \'/\')'),
+    '目录统计构建一次循环生成标签、目录树和缩略图文件夹列表，避免重复 map/filter 分配',
+    'catalog build preallocated nodes',
+  )
+  assertCheck(
+    checks,
     appSource.includes('folderCounts: Map<string, number>') &&
       catalogAppendSource.includes('const folderCounts = new Map(catalog.folderCounts)') &&
       catalogAppendSource.includes('const touchedFolderPaths = new Set<string>([\'/\'])') &&
@@ -491,9 +553,54 @@ async function main() {
       catalogAppendSource.includes('return patchLibraryCatalogCounts(catalog, folderCounts, tagCounts, sourceSize, touchedFolderPaths)') &&
       appSource.includes('function patchLibraryCatalogCounts') &&
       appSource.includes('function patchFolderNodeCounts') &&
+      folderNodePatchSource.includes('let nextFolders: FolderNode[] | undefined') &&
+      folderNodePatchSource.includes('for (let index = 0; index < folders.length; index += 1)') &&
+      folderNodePatchSource.includes('if (!touchedFolderPaths.has(folder.path)) continue') &&
+      folderNodePatchSource.includes('nextFolders ??= folders.slice()') &&
+      folderNodePatchSource.includes('nextFolders[index] = { ...folder, count }') &&
+      folderNodePatchSource.includes('return nextFolders ?? folders') &&
+      !folderNodePatchSource.includes('folders.map') &&
       !catalogAppendSource.includes('new Map(catalog.folders.map'),
-    '扫描批次追加复用运行时 folderCounts，无新文件夹或标签时只局部更新计数并避免目录重排',
+    '扫描批次追加复用运行时 folderCounts，并通过懒复制局部更新文件夹计数，避免目录重排和全量 map 分配',
     'catalog folderCounts patch',
+  )
+  assertCheck(
+    checks,
+    folderOrderSource.includes('const rank = new Map<string, number>()') &&
+      folderOrderSource.includes('for (let index = 0; index < order.length; index += 1)') &&
+      folderOrderSource.includes('rank.set(order[index], index)') &&
+      folderOrderSource.includes('const children = new Array<FolderNode>(folders.length)') &&
+      folderOrderSource.includes('for (let index = 0; index < folders.length; index += 1)') &&
+      folderOrderSource.includes('children[childCount] = folder') &&
+      folderOrderSource.includes('children.length = childCount') &&
+      folderOrderSource.includes('const orderedFolders = new Array<FolderNode>(rootFolders.length + children.length)') &&
+      folderOrderSource.includes('orderedFolders[rootFolders.length + index] = children[index]') &&
+      !folderOrderSource.includes('order.map') &&
+      !folderOrderSource.includes('folders.filter') &&
+      !folderOrderSource.includes('return [...root'),
+    '文件夹自定义排序使用单次拆分与预分配合并，避免 order.map、双 filter 和 spread 分配',
+    'folder order preallocated merge',
+  )
+  assertCheck(
+    checks,
+    sidebarSource.includes('function childFoldersFromFolders(folders: FolderNode[])') &&
+      sidebarSource.includes('const childFolders = new Array<FolderNode>(folders.length)') &&
+      sidebarSource.includes('childFolders[childCount] = folder') &&
+      sidebarSource.includes('function filterFoldersBySearch(folders: FolderNode[], folderSearch: string)') &&
+      sidebarSource.includes('if (!folderSearch) return folders') &&
+      sidebarSource.includes('const filteredFolders = new Array<FolderNode>(folders.length)') &&
+      sidebarSource.includes('filteredFolders[folderCount] = folder') &&
+      sidebarSource.includes('function folderPathsFromFolders(folders: FolderNode[])') &&
+      sidebarSource.includes('const paths = new Array<string>(folders.length)') &&
+      sidebarSource.includes('paths[index] = folders[index].path') &&
+      sidebarSource.includes('const allChildFolders = useMemo(() => childFoldersFromFolders(folders), [folders])') &&
+      sidebarSource.includes('() => filterFoldersBySearch(allChildFolders, folderSearch)') &&
+      sidebarSource.includes('const paths = folderPathsFromFolders(allChildFolders)') &&
+      !sidebarSource.includes("folders.filter((folder) => folder.path !== '/')") &&
+      !sidebarSource.includes('allChildFolders.filter') &&
+      !sidebarSource.includes('allChildFolders.map((folder) => folder.path)'),
+    '侧边栏文件夹搜索和拖拽排序使用预分配循环，避免实时搜索时 filter/map 分配',
+    'sidebar folder search preallocated loops',
   )
   assertCheck(
     checks,
@@ -518,9 +625,16 @@ async function main() {
     checks,
     appSource.includes('sortedAssetIds') &&
       appSource.includes('sortAssetIds(libraryAssetIds, assetById, sortField, sortDir)') &&
-      appSource.includes('if (!hasVisibleFilters) return sortedAssetIds') &&
-      appSource.includes('for (const assetId of sortedAssetIds)'),
-    '筛选和搜索复用当前排序方式的素材 ID 顺序',
+      visibleAssetIdsSource.includes('if (!hasVisibleFilters) return sortedAssetIds') &&
+      visibleAssetIdsSource.includes('const ids = new Array<string>(sortedAssetIds.length)') &&
+      visibleAssetIdsSource.includes('let matchedCount = 0') &&
+      visibleAssetIdsSource.includes('for (const assetId of sortedAssetIds)') &&
+      visibleAssetIdsSource.includes('ids[matchedCount] = assetId') &&
+      visibleAssetIdsSource.includes('matchedCount += 1') &&
+      visibleAssetIdsSource.includes('ids.length = matchedCount') &&
+      !visibleAssetIdsSource.includes('const ids: string[] = []') &&
+      !visibleAssetIdsSource.includes('ids.push'),
+    '筛选和搜索复用当前排序方式的素材 ID 顺序，并预分配筛选结果数组避免动态 push 增长',
     'sorted id reuse for filtered views',
   )
   assertCheck(
@@ -586,20 +700,33 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function removeIdsFromSet') &&
+      appSource.includes('function removeIdsFromSet') &&
       appSource.includes('function retainIdsInSet') &&
       appSource.includes('next ??= new Set(current)') &&
-      removeAssetsSource.includes('const removedAssets: Asset[] = []') &&
-      removeAssetsSource.includes('const nextAssets: Asset[] = []') &&
+      removeAssetsSource.includes('const sourceAssets = libraryAssetsRef.current') &&
+      removeAssetsSource.includes('const removedAssets = new Array<Asset>(Math.min(removedIds.size, sourceAssets.length))') &&
+      removeAssetsSource.includes('const nextAssets = new Array<Asset>(Math.max(0, sourceAssets.length - removedIds.size))') &&
+      removeAssetsSource.includes('let nextAssetCount = 0') &&
+      removeAssetsSource.includes('let removedAssetCount = 0') &&
       removeAssetsSource.includes('const removedMetrics: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }') &&
-      removeAssetsSource.includes('for (const asset of libraryAssetsRef.current)') &&
+      removeAssetsSource.includes('for (const asset of sourceAssets)') &&
+      removeAssetsSource.includes('nextAssets[nextAssetCount] = asset') &&
+      removeAssetsSource.includes('nextAssetCount += 1') &&
       removeAssetsSource.includes('const liveAsset = assetByIdRef.current.get(asset.id) ?? asset') &&
+      removeAssetsSource.includes('removedAssets[removedAssetCount] = liveAsset') &&
+      removeAssetsSource.includes('removedAssetCount += 1') &&
+      removeAssetsSource.includes('nextAssets.length = nextAssetCount') &&
+      removeAssetsSource.includes('removedAssets.length = removedAssetCount') &&
       removeAssetsSource.includes('setSelectedIds((current) => removeIdsFromSet(current, removedIds))') &&
+      !removeAssetsSource.includes('const removedAssets: Asset[] = []') &&
+      !removeAssetsSource.includes('const nextAssets: Asset[] = []') &&
+      !removeAssetsSource.includes('nextAssets.push') &&
+      !removeAssetsSource.includes('removedAssets.push') &&
       !removeAssetsSource.includes('getLiveAssets(libraryAssetsRef.current') &&
       !removeAssetsSource.includes('liveAssets.filter') &&
       !removeAssetsSource.includes('libraryAssetsRef.current.filter') &&
       !removeAssetsSource.includes('[...current].filter'),
-    '批量删除从资源库移除素材时单次遍历生成保留项、移除项和缩略图统计，避免多轮 filter/map 分配',
+    '批量删除从资源库移除素材时单次遍历并预分配保留项、移除项和缩略图统计，避免多轮 filter/map 或 push 增长',
     'remove assets single-pass',
   )
   assertCheck(
@@ -679,16 +806,30 @@ async function main() {
       appSource.includes('setLibraryAssets((current) => appendItems(current, assets))') &&
       appSource.includes('function insertCollectedAsset(asset: Asset)') &&
       appSource.includes('insertCollectedAssets([asset])') &&
-      restoreTrashSource.includes('const restoredAssets: Asset[] = []') &&
-      restoreTrashSource.includes('restoredAssets.push(asset)') &&
+      restoreTrashSource.includes('const restoredAssets = new Array<Asset>(restored.length)') &&
+      restoreTrashSource.includes('let restoredAssetCount = 0') &&
+      restoreTrashSource.includes('restoredAssets[restoredAssetCount] = asset') &&
+      restoreTrashSource.includes('restoredAssetCount += 1') &&
+      restoreTrashSource.includes('restoredAssets.length = restoredAssetCount') &&
       restoreTrashSource.includes('insertCollectedAssets(restoredAssets)') &&
       batchProcessSource.includes('insertCollectedAssets(newAssets)') &&
       rotateAssetsSource.includes('insertCollectedAssets(newAssets)') &&
+      !restoreTrashSource.includes('const restoredAssets: Asset[] = []') &&
+      !restoreTrashSource.includes('restoredAssets.push(asset)') &&
       !restoreTrashSource.includes('insertCollectedAsset(asset)') &&
       !batchProcessSource.includes('for (const asset of newAssets) insertCollectedAsset(asset)') &&
       !rotateAssetsSource.includes('for (const asset of newAssets) insertCollectedAsset(asset)'),
     '恢复回收站、批量处理和旋转的新素材结果批量插入资源库，避免逐个素材触发多组状态更新',
     'batch insert collected assets',
+  )
+  assertCheck(
+    checks,
+    deleteSelectedSource.includes('setTrashItems((current) => prependItems(created, current))') &&
+      restoreTrashSource.includes('setTrashItems((current) => removeItemsById(current, idSet))') &&
+      !deleteSelectedSource.includes('setTrashItems((current) => [...created, ...current])') &&
+      !restoreTrashSource.includes('current.filter((item) => !idSet.has(item.id))'),
+    '回收站删除和恢复列表更新复用预分配 helper，避免 spread prepend 和 filter 重建',
+    'trash list preallocated updates',
   )
   assertCheck(
     checks,
