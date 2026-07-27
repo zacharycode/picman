@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://picman.app/schemas/library-settings.v1.schema.json",
+  "title": "Picman Library Settings v1",
+  "type": "object",
+  "required": ["version"],
+  "properties": {
+    "version": { "const": 1 },
+    "folderOrder": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^/" },
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": true
+}

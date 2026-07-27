@@ -54,6 +54,8 @@ const VIRTUAL_OVERSCAN_PX = 900
 const VIRTUAL_FAST_OVERSCAN_PX = 2400
 const VIRTUAL_SCROLL_STEP_PX = 48
 const FAST_SCROLL_VELOCITY_PX_PER_MS = 1.2
+const FAST_SCROLL_IMAGE_DEFER_THRESHOLD = 0.75
+const SCROLL_SETTLE_MS = 120
 const VIEW_MODE_LABELS: Record<AssetViewMode, string> = {
   adaptive: '自适应',
   masonry: '瀑布流',
@@ -520,6 +522,7 @@ export function LibraryView({
     width: 960,
   })
   const scrollSampleRef = useRef({ scrollTop: 0, time: 0 })
+  const scrollSettleTimerRef = useRef<number | undefined>(undefined)
   const scrollRestoreRef = useRef({ attempts: 0, done: false, key: '' })
   const lastNotifiedScrollRef = useRef({ key: '', top: -1 })
   const searchComposingRef = useRef(false)
@@ -587,6 +590,7 @@ export function LibraryView({
     }
     return createAdaptiveLayout(visibleAssetIds, viewport, adaptiveMetrics)
   }, [adaptiveMetrics, masonryLayoutData, viewMode, viewport, visibleAssetIds])
+  const deferThumbnailLoading = viewport.scrollSpeed >= FAST_SCROLL_IMAGE_DEFER_THRESHOLD
   const getVirtualPosition = useCallback(
     (assetId: string): VirtualPosition | undefined => {
       const index = getAssetIndex(assetId)
@@ -648,6 +652,13 @@ export function LibraryView({
           ? current
           : next
       })
+      if (scrollSettleTimerRef.current !== undefined) window.clearTimeout(scrollSettleTimerRef.current)
+      if (scrollSpeed > 0) {
+        scrollSettleTimerRef.current = window.setTimeout(() => {
+          scrollSettleTimerRef.current = undefined
+          setViewport((current) => (current.scrollSpeed === 0 ? current : { ...current, scrollSpeed: 0 }))
+        }, SCROLL_SETTLE_MS)
+      }
     }
     const scheduleMeasure = () => {
       if (frameId) return
@@ -661,6 +672,8 @@ export function LibraryView({
 
     return () => {
       if (frameId) window.cancelAnimationFrame(frameId)
+      if (scrollSettleTimerRef.current !== undefined) window.clearTimeout(scrollSettleTimerRef.current)
+      scrollSettleTimerRef.current = undefined
       resizeObserver.disconnect()
       container.removeEventListener('scroll', scheduleMeasure)
     }
@@ -1010,6 +1023,7 @@ export function LibraryView({
                   <AssetItem
                     key={asset.id}
                     asset={asset}
+                    deferThumbnailLoading={deferThumbnailLoading}
                     layout={item}
                     primary={primaryAsset?.id === asset.id}
                     selected={selectedIds.has(asset.id)}

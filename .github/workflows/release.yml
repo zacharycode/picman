@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 发布标签，留空时使用项目版本
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run stress:create -- --count=25000 --folders=120 --output=/tmp/picman-release-stress --clean
+      - run: npm run stress:audit -- --library=/tmp/picman-release-stress --min-count=25000
+      - name: 校验更新签名密钥
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "请先在仓库 Secrets 中配置 TAURI_SIGNING_PRIVATE_KEY"
+            exit 1
+          fi
+      - name: 校验发布版本
+        id: release
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ]; then TAG="v${VERSION}"; fi
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "标签 $TAG 与项目版本 v${VERSION} 不一致"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: 构建 Apple Silicon 更新包
+        run: npm run release:github
+      - name: 校验架构与签名
+        shell: bash
+        run: |
+          file src-tauri/target/release/bundle/macos/Picman.app/Contents/MacOS/picman | grep arm64
+          codesign --verify --deep --strict src-tauri/target/release/bundle/macos/Picman.app
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          FILES=(
+            release/github/"$TAG"/*.app.tar.gz
+            release/github/"$TAG"/*.sig
+            release/github/"$TAG"/*.dmg
+            release/github/"$TAG"/latest.json
+          )
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Picman ${TAG#v}" \
+              --notes "Picman ${TAG#v} 测试版更新。"
+          fi

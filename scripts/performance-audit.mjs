@@ -84,6 +84,8 @@ async function main() {
   const [
     packageJson,
     appSource,
+    libraryModelSource,
+    prefsSource,
     appCssSource,
     libraryViewSource,
     sidebarSource,
@@ -91,9 +93,15 @@ async function main() {
     sortSource,
     rafStateSource,
     tauriSource,
+    appSettingsSource,
+    libraryCatalogSource,
+    libraryWatchSource,
+    thumbnailCacheSource,
   ] = await Promise.all([
     readProjectFile('package.json'),
     readProjectFile('src/App.tsx'),
+    readProjectFile('src/lib/libraryModel.ts'),
+    readProjectFile('src/lib/prefs.ts'),
     readProjectFile('src/App.css'),
     readProjectFile('src/components/LibraryView.tsx'),
     readProjectFile('src/components/Sidebar.tsx'),
@@ -101,140 +109,145 @@ async function main() {
     readProjectFile('src/lib/sort.ts'),
     readProjectFile('src/lib/rafState.ts'),
     readProjectFile('src-tauri/src/lib.rs'),
+    readProjectFile('src-tauri/src/app_settings.rs'),
+    readProjectFile('src-tauri/src/library_catalog.rs'),
+    readProjectFile('src-tauri/src/library_watch.rs'),
+    readProjectFile('src-tauri/src/thumbnail_cache.rs'),
   ])
+  const logicSource = `${appSource}\n${libraryModelSource}`
   const packageConfig = JSON.parse(packageJson)
   const checks = []
   const scanBatchSize = constantNumber(tauriSource, 'SCAN_BATCH_SIZE')
   const thumbnailBatchSize = constantNumber(tauriSource, 'THUMBNAIL_BATCH_SIZE')
   const thumbnailWorkerLimit = constantNumber(tauriSource, 'THUMBNAIL_MAX_WORKERS')
-  const thumbnailFlush = extractBetween(appSource, 'const flushNativeThumbnailUpdates', 'const queueNativeThumbnailBatch')
+  const thumbnailFlush = extractBetween(logicSource, 'const flushNativeThumbnailUpdates', 'const queueNativeThumbnailBatch')
   const visibleFilterSource = extractBetween(
-    appSource,
+    logicSource,
     'function assetMatchesVisibleFilters',
     'function appendAssetsToLibraryCatalogState',
   )
   const visibleAssetIdsSource = extractBetween(
-    appSource,
+    logicSource,
     'const visibleAssetIds = useMemo',
     'const visibleCount',
   )
   const catalogBuildSource = extractBetween(
-    appSource,
+    logicSource,
     'function buildLibraryCatalogState',
     'function deriveLibraryCatalogState',
   )
   const catalogAppendSource = extractBetween(
-    appSource,
+    logicSource,
     'function appendAssetsToLibraryCatalogState',
     'function updateCatalogTagsForAssetMetadata',
   )
   const folderNodePatchSource = extractBetween(
-    appSource,
+    logicSource,
     'function patchFolderNodeCounts',
     'function patchLibraryCatalogCounts',
   )
   const folderOrderSource = extractBetween(
-    appSource,
+    logicSource,
     'function applyFolderOrder',
     'function deriveThumbnailMetrics',
   )
   const refreshMergeSource = extractBetween(
-    appSource,
+    logicSource,
     'function mergeRefreshedAssets',
     'function libraryNameFromPath',
   )
   const assetIdsFromAssetsSource = extractBetween(
-    appSource,
+    logicSource,
     'function assetIdsFromAssets',
     'function appendItems',
   )
   const liveAssetSource = extractBetween(
-    appSource,
+    logicSource,
     'function getLiveAssets',
     'function updateAssetStore',
   )
   const scanConversionSource = extractBetween(
-    appSource,
+    logicSource,
     'function nativeAssetToFrontend',
     'function mergeRefreshedAssets',
   )
   const appendHelpersSource = extractBetween(
-    appSource,
+    logicSource,
     'function appendItems',
     'function createVisibleIndexMap',
   )
   const metadataCommitSource = extractBetween(
-    appSource,
+    logicSource,
     'function commitAssetMetadataUpdate',
     'function saveFolderAssetMetadata',
   )
   const removeAssetTagSource = extractBetween(
-    appSource,
+    logicSource,
     'function removeAssetTag',
     'function setAssetFavorite',
   )
   const removeAssetsSource = extractBetween(
-    appSource,
+    logicSource,
     'function removeAssetsFromLibrary',
     'async function deleteSelectedToTrash',
   )
   const deleteSelectedSource = extractBetween(
-    appSource,
+    logicSource,
     'async function deleteSelectedToTrash',
     'async function restoreTrashItems',
   )
   const restoreTrashSource = extractBetween(
-    appSource,
+    logicSource,
     'async function restoreTrashItems',
     'async function emptyTrash',
   )
   const batchProcessSource = extractBetween(
-    appSource,
+    logicSource,
     'async function runBatchProcess',
     'async function rotateAssets',
   )
   const rotateAssetsSource = extractBetween(
-    appSource,
+    logicSource,
     'async function rotateAssets',
     'function handleAssetDragStart',
   )
   const replaceAssetsSource = extractBetween(
-    appSource,
+    logicSource,
     'function replaceLibraryAssets',
     'async function moveSelectedTo',
   )
   const moveSelectedSource = extractBetween(
-    appSource,
+    logicSource,
     'async function moveSelectedTo',
     'async function renameSelectedAsset',
   )
   const renameFolderSource = extractBetween(
-    appSource,
+    logicSource,
     'async function renameFolderTo',
     'function writeAssetToStore',
   )
   const visibleSelectedSource = extractBetween(
-    appSource,
+    logicSource,
     'const visibleSelectedIds = useMemo',
     'const primaryCandidate',
   )
   const selectedActionSource = extractBetween(
-    appSource,
+    logicSource,
     'const assetMenuSingle',
     'const assetMenuItems',
   )
   const assetClickSource = extractBetween(
-    appSource,
+    logicSource,
     'function handleAssetClick',
     'function handleAssetDoubleClick',
   )
   const dragStartSource = extractBetween(
-    appSource,
+    logicSource,
     'function handleAssetDragStart',
     'function handleAssetContextMenu',
   )
   const batchModalSource = extractBetween(
-    appSource,
+    logicSource,
     '{batchOpen && (',
     '{collectPending && libraryRootPath',
   )
@@ -268,40 +281,85 @@ async function main() {
     '{virtualLayout.items.map',
     '</div>\n          </div>',
   )
-  const sidebarResizeSource = extractBetween(appSource, 'function startSidebarResize', 'const rememberScrollPosition')
+  const sidebarResizeSource = extractBetween(logicSource, 'function startSidebarResize', 'const rememberScrollPosition')
   const inspectorResizeSource = extractBetween(libraryViewSource, 'function startInspectorResize', 'function adjustThumbSize')
   const verticalResizeSource = extractBetween(sidebarSource, 'function startVerticalResize', 'return (')
-  const thumbnailClearSource = extractBetween(appSource, 'function clearThumbnailUpdate', 'function getLiveAssets')
+  const thumbnailClearSource = extractBetween(logicSource, 'function clearThumbnailUpdate', 'function getLiveAssets')
   const generateThumbnailAssetsSource = extractBetween(
-    appSource,
+    logicSource,
     'async function generateThumbnailAssets',
     'function generateAllThumbnails',
   )
   const generateFolderThumbnailsSource = extractBetween(
-    appSource,
+    logicSource,
     'function generateFolderThumbnails',
     'function confirmThumbnailPrompt',
   )
   const clearThumbnailCacheSource = extractBetween(
-    appSource,
+    logicSource,
     'function clearThumbnailCache',
     'async function checkAndInstallUpdate',
   )
 
   assertCheck(checks, packageConfig.scripts?.['stress:create'], '压力素材库生成脚本存在', 'package.json scripts.stress:create')
   assertCheck(checks, packageConfig.scripts?.['stress:audit'], '性能审计脚本存在', 'package.json scripts.stress:audit')
+  assertCheck(checks, packageConfig.scripts?.test, '前端自动化测试命令存在', 'package.json scripts.test')
+  assertCheck(
+    checks,
+    appSource.split('\n').length < 3500 && libraryModelSource.includes('export function mergeRefreshedAssets'),
+    '应用组件与大资源库数据模型已拆分',
+    `App.tsx=${appSource.split('\n').length} lines`,
+  )
+  assertCheck(
+    checks,
+    appSettingsSource.includes('app_config_dir()') &&
+      appSettingsSource.includes('settings.json.tmp') &&
+      prefsSource.includes('NATIVE_WRITE_DEBOUNCE_MS') &&
+      prefsSource.includes('pendingNativePrefs') &&
+      prefsSource.includes('flushAppPrefs'),
+    '设备偏好使用原生 JSON，并合并高频写入后在隐藏窗口前刷新',
+    'app settings JSON + debounced writes',
+  )
+  assertCheck(
+    checks,
+    libraryCatalogSource.includes('catalog.jsonl') &&
+      libraryCatalogSource.includes('sanitize_catalog_asset') &&
+      tauriSource.includes('use_catalog_snapshot') &&
+      tauriSource.includes('write_catalog_assets'),
+    '资源库索引可删除重建，并在快照恢复后由真实文件扫描校验',
+    'catalog snapshot + background reconciliation',
+  )
+  assertCheck(
+    checks,
+    libraryWatchSource.includes('notify::recommended_watcher') &&
+      libraryWatchSource.includes('recv_timeout(Duration::from_millis(250))') &&
+      libraryWatchSource.includes('settings_changed') &&
+      libraryWatchSource.includes('content_changed') &&
+      libraryWatchSource.includes('name == "settings.json"'),
+    '原生文件监听合并突发事件，并区分设置与素材变化',
+    'notify watcher + coalesced change kinds',
+  )
+  assertCheck(
+    checks,
+    thumbnailCacheSource.includes('size_bytes <= max_bytes') &&
+      thumbnailCacheSource.includes('sort_unstable_by') &&
+      thumbnailCacheSource.includes('fs::remove_file') &&
+      tauriSource.includes('apply_thumbnail_cache_limit'),
+    '缩略图容量上限按真实字节统计并从最旧缓存开始清理',
+    'real cache byte limit',
+  )
   assertCheck(checks, tauriSource.includes('fn scan_library_folder_stream'), '本地资源目录扫描为后台流式命令', 'scan_library_folder_stream')
   assertCheck(checks, scanBatchSize !== null && scanBatchSize <= 500, '扫描结果按小批次发送', `SCAN_BATCH_SIZE=${scanBatchSize}`)
   assertCheck(checks, tauriSource.includes('SCAN_BATCH_EVENT') && tauriSource.includes('SCAN_FINISHED_EVENT'), '扫描有批次与完成事件', 'scan events')
   assertCheck(checks, libraryViewSource.includes('VIRTUAL_OVERSCAN_PX'), '素材墙使用虚拟滚动窗口', 'VIRTUAL_OVERSCAN_PX')
   assertCheck(checks, libraryViewSource.includes('visibleAssetIds: string[]'), '视图层传递可见 ID 而非全量对象数组', 'visibleAssetIds prop')
   assertCheck(checks, !libraryViewSource.includes('visibleAssets:'), '视图层不再接收 visibleAssets 全量数组', 'no visibleAssets prop')
-  assertCheck(checks, appSource.includes('assetStore') && appSource.includes('thumbnailFilterVersion'), '缩略图状态与源素材数组解耦', 'assetStore + thumbnailFilterVersion')
+  assertCheck(checks, logicSource.includes('assetStore') && logicSource.includes('thumbnailFilterVersion'), '缩略图状态与源素材数组解耦', 'assetStore + thumbnailFilterVersion')
   assertCheck(checks, !thumbnailFlush.includes('setLibraryAssets'), '缩略图批次写回不更新主素材数组', 'flushNativeThumbnailUpdates')
   assertCheck(checks, thumbnailBatchSize !== null && thumbnailBatchSize >= 128, '缩略图事件按批次聚合', `THUMBNAIL_BATCH_SIZE=${thumbnailBatchSize}`)
   assertCheck(checks, thumbnailWorkerLimit !== null && thumbnailWorkerLimit <= 3, '缩略图后台并发受控', `THUMBNAIL_MAX_WORKERS=${thumbnailWorkerLimit}`)
   assertCheck(checks, tauriSource.includes('available_parallelism') && tauriSource.includes('mpsc::channel'), '缩略图 worker 池按机器能力保守调度并聚合结果', 'available_parallelism + mpsc')
-  assertCheck(checks, tauriSource.includes('completed: usize') && appSource.includes('completed: number'), '缩略图取消/完成事件携带真实完成数量', 'completed payload')
+  assertCheck(checks, tauriSource.includes('completed: usize') && logicSource.includes('completed: number'), '缩略图取消/完成事件携带真实完成数量', 'completed payload')
   assertCheck(
     checks,
     tauriSource.includes('allow_library_asset_scope') &&
@@ -315,8 +373,8 @@ async function main() {
     checks,
     tauriSource.includes('existing_thumbnail_for_quality') &&
       tauriSource.includes('existing_thumbnail_cache_hit') &&
-      appSource.includes('thumbnailPath') &&
-      appSource.includes('convertFileSrc(asset.thumbnailPath)'),
+      logicSource.includes('thumbnailPath') &&
+      logicSource.includes('convertFileSrc(asset.thumbnailPath)'),
     '打开资源目录时恢复已有缩略图缓存',
     'existing thumbnail cache restore',
   )
@@ -335,6 +393,16 @@ async function main() {
   )
   assertCheck(
     checks,
+    libraryViewSource.includes('FAST_SCROLL_IMAGE_DEFER_THRESHOLD') &&
+      libraryViewSource.includes('SCROLL_SETTLE_MS') &&
+      libraryViewSource.includes('deferThumbnailLoading={deferThumbnailLoading}') &&
+      assetItemSource.includes('loadedThumbnailKey === thumbnailKey') &&
+      assetItemSource.includes('!deferThumbnailLoading'),
+    '快速滚动时保留已加载图片、延后新缩略图解码，并在滚动停止后补载',
+    'deferred thumbnail decode while fast scrolling',
+  )
+  assertCheck(
+    checks,
     libraryViewSource.includes('VIRTUAL_SCROLL_STEP_PX') &&
       libraryViewSource.includes('quantizeScrollTop') &&
       libraryViewSource.includes('quantizeScrollSpeed') &&
@@ -345,7 +413,7 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('layoutVersion') && libraryViewSource.includes('assetLayoutVersion'),
+    logicSource.includes('layoutVersion') && libraryViewSource.includes('assetLayoutVersion'),
     '瀑布流布局使用独立布局版本，避免非尺寸状态触发布局重算',
     'assetStore.layoutVersion + assetLayoutVersion',
   )
@@ -451,9 +519,9 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('OPEN_SCAN_FORCE_FLUSH_THRESHOLD') &&
-      appSource.includes('OPEN_SCAN_STEADY_FLUSH_MS') &&
-      appSource.includes('SCAN_STATUS_UPDATE_MS'),
+    logicSource.includes('OPEN_SCAN_FORCE_FLUSH_THRESHOLD') &&
+      logicSource.includes('OPEN_SCAN_STEADY_FLUSH_MS') &&
+      logicSource.includes('SCAN_STATUS_UPDATE_MS'),
     '打开大资源目录时扫描批次提交和状态文案有自适应节流',
     'adaptive scan flush + status throttle',
   )
@@ -484,17 +552,17 @@ async function main() {
       appendHelpersSource.includes('function appendAssetIds') &&
       appendHelpersSource.includes('const next = new Array<string>(currentLength + incoming.length)') &&
       appendHelpersSource.includes('function pushItems<T>') &&
-      appSource.includes('setLibraryAssets((current) => appendItems(current, incoming))') &&
-      appSource.includes('pushItems(scan.collectedAssets, incoming)') &&
-      appSource.includes('pushItems(scan.pendingAssets, incoming)') &&
-      appSource.includes('const incoming = frontendAssetsFromNative(event.payload.assets)') &&
-      appSource.includes('const incoming = assetsWithSearchText(batch)') &&
+      logicSource.includes('setLibraryAssets((current) => appendItems(current, incoming))') &&
+      logicSource.includes('pushItems(scan.collectedAssets, incoming)') &&
+      logicSource.includes('pushItems(scan.pendingAssets, incoming)') &&
+      logicSource.includes('const incoming = frontendAssetsFromNative(event.payload.assets)') &&
+      logicSource.includes('const incoming = assetsWithSearchText(batch)') &&
       !appendHelpersSource.includes('incoming.map((asset) => asset.id)') &&
-      !appSource.includes('event.payload.assets.map(nativeAssetToFrontend)') &&
-      !appSource.includes('batch.map(withAssetSearchText)') &&
-      !appSource.includes('setLibraryAssets((current) => [...current, ...incoming])') &&
-      !appSource.includes('scan.collectedAssets.push(...incoming)') &&
-      !appSource.includes('scan.pendingAssets.push(...incoming)'),
+      !logicSource.includes('event.payload.assets.map(nativeAssetToFrontend)') &&
+      !logicSource.includes('batch.map(withAssetSearchText)') &&
+      !logicSource.includes('setLibraryAssets((current) => [...current, ...incoming])') &&
+      !logicSource.includes('scan.collectedAssets.push(...incoming)') &&
+      !logicSource.includes('scan.pendingAssets.push(...incoming)'),
     '打开大资源目录的批次转换与追加使用预分配循环，避免 batch map、数组 spread 和 push 参数展开',
     'open scan append preallocated loops',
   )
@@ -518,9 +586,9 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function appendAssetsToLibraryCatalogState') &&
-      appSource.includes('setLibraryCatalog((current) => appendAssetsToLibraryCatalogState') &&
-      !appSource.includes('deriveLibraryCatalogState(libraryName, libraryAssets)'),
+    logicSource.includes('function appendAssetsToLibraryCatalogState') &&
+      logicSource.includes('setLibraryCatalog((current) => appendAssetsToLibraryCatalogState') &&
+      !logicSource.includes('deriveLibraryCatalogState(libraryName, libraryAssets)'),
     '目录树、标签和容量统计在扫描追加时增量更新',
     'incremental library catalog state',
   )
@@ -544,15 +612,15 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('folderCounts: Map<string, number>') &&
+    logicSource.includes('folderCounts: Map<string, number>') &&
       catalogAppendSource.includes('const folderCounts = new Map(catalog.folderCounts)') &&
       catalogAppendSource.includes('const touchedFolderPaths = new Set<string>([\'/\'])') &&
       catalogAppendSource.includes('let hasNewFolder = false') &&
       catalogAppendSource.includes('let hasNewTag = false') &&
       catalogAppendSource.includes('if (hasNewFolder || hasNewTag)') &&
       catalogAppendSource.includes('return patchLibraryCatalogCounts(catalog, folderCounts, tagCounts, sourceSize, touchedFolderPaths)') &&
-      appSource.includes('function patchLibraryCatalogCounts') &&
-      appSource.includes('function patchFolderNodeCounts') &&
+      logicSource.includes('function patchLibraryCatalogCounts') &&
+      logicSource.includes('function patchFolderNodeCounts') &&
       folderNodePatchSource.includes('let nextFolders: FolderNode[] | undefined') &&
       folderNodePatchSource.includes('for (let index = 0; index < folders.length; index += 1)') &&
       folderNodePatchSource.includes('if (!touchedFolderPaths.has(folder.path)) continue') &&
@@ -604,27 +672,27 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('libraryAssetIds') &&
-      appSource.includes('appendAssetIds') &&
-      appSource.includes('useOpenScanIdFastPath') &&
-      appSource.includes('if (useOpenScanIdFastPath) return libraryAssetIds'),
+    logicSource.includes('libraryAssetIds') &&
+      logicSource.includes('appendAssetIds') &&
+      logicSource.includes('useOpenScanIdFastPath') &&
+      logicSource.includes('if (useOpenScanIdFastPath) return libraryAssetIds'),
     '无筛选打开扫描时直接复用增量素材 ID 列表',
     'open scan visible id fast path',
   )
   assertCheck(
     checks,
-    appSource.includes('const totalAssetCount = libraryAssetIds.length') &&
-      appSource.includes('const pendingCount = Math.max(0, totalAssetCount - generatedCount)') &&
-      appSource.includes('totalCount={totalAssetCount}') &&
-      !appSource.includes('libraryAssets.length - generatedCount') &&
-      !appSource.includes('totalCount={libraryAssets.length}'),
+    logicSource.includes('const totalAssetCount = libraryAssetIds.length') &&
+      logicSource.includes('const pendingCount = Math.max(0, totalAssetCount - generatedCount)') &&
+      logicSource.includes('totalCount={totalAssetCount}') &&
+      !logicSource.includes('libraryAssets.length - generatedCount') &&
+      !logicSource.includes('totalCount={libraryAssets.length}'),
     '总数类 UI 使用轻量素材 ID 列表长度，避免依赖整张素材对象数组',
     'asset count from ids',
   )
   assertCheck(
     checks,
-    appSource.includes('sortedAssetIds') &&
-      appSource.includes('sortAssetIds(libraryAssetIds, assetById, sortField, sortDir)') &&
+    logicSource.includes('sortedAssetIds') &&
+      logicSource.includes('sortAssetIds(libraryAssetIds, assetById, sortField, sortDir)') &&
       visibleAssetIdsSource.includes('if (!hasVisibleFilters) return sortedAssetIds') &&
       visibleAssetIdsSource.includes('const ids = new Array<string>(sortedAssetIds.length)') &&
       visibleAssetIdsSource.includes('let matchedCount = 0') &&
@@ -665,8 +733,8 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function assetUpdateAffectsCatalog') &&
-      appSource.includes('function sameTags') &&
+    logicSource.includes('function assetUpdateAffectsCatalog') &&
+      logicSource.includes('function sameTags') &&
       metadataCommitSource.includes('const previousAsset = assetByIdRef.current.get(updatedAsset.id)') &&
       metadataCommitSource.includes('const affectsCatalog = assetUpdateAffectsCatalog(previousAsset, updatedAsset)') &&
       metadataCommitSource.includes('if (!affectsCatalog) return') &&
@@ -678,12 +746,12 @@ async function main() {
   )
   assertCheck(
     checks,
-      appSource.includes('function updateCatalogTagsForAssetMetadata') &&
-      appSource.includes('function assetUpdateCanPatchCatalogTags') &&
-      appSource.includes('tagCounts: Map<string, number>') &&
-      appSource.includes('folderCounts: Map<string, number>') &&
-      appSource.includes('const tagCounts = new Map(catalog.tagCounts)') &&
-      appSource.includes('new Map(catalog.folderCounts)') &&
+      logicSource.includes('function updateCatalogTagsForAssetMetadata') &&
+      logicSource.includes('function assetUpdateCanPatchCatalogTags') &&
+      logicSource.includes('tagCounts: Map<string, number>') &&
+      logicSource.includes('folderCounts: Map<string, number>') &&
+      logicSource.includes('const tagCounts = new Map(catalog.tagCounts)') &&
+      logicSource.includes('new Map(catalog.folderCounts)') &&
       metadataCommitSource.includes('if (assetUpdateCanPatchCatalogTags(previousAsset, updatedAsset) && previousAsset)') &&
       metadataCommitSource.includes('updateCatalogTagsForAssetMetadata(libraryName, current, previousAsset, updatedAsset)') &&
       metadataCommitSource.includes('setLibraryCatalog(deriveLibraryCatalogState(libraryName, nextAssets))'),
@@ -700,9 +768,9 @@ async function main() {
   )
   assertCheck(
     checks,
-      appSource.includes('function removeIdsFromSet') &&
-      appSource.includes('function retainIdsInSet') &&
-      appSource.includes('next ??= new Set(current)') &&
+      logicSource.includes('function removeIdsFromSet') &&
+      logicSource.includes('function retainIdsInSet') &&
+      logicSource.includes('next ??= new Set(current)') &&
       removeAssetsSource.includes('const sourceAssets = libraryAssetsRef.current') &&
       removeAssetsSource.includes('const removedAssets = new Array<Asset>(Math.min(removedIds.size, sourceAssets.length))') &&
       removeAssetsSource.includes('const nextAssets = new Array<Asset>(Math.max(0, sourceAssets.length - removedIds.size))') &&
@@ -731,21 +799,21 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('const survivingSelectedIds = retainIdsInSet(currentSelectedIds, merged.idSet)') &&
+    logicSource.includes('const survivingSelectedIds = retainIdsInSet(currentSelectedIds, merged.idSet)') &&
       restoreTrashSource.includes('setTrashSelectedIds((current) => removeIdsFromSet(current, idSet))') &&
-      !appSource.includes('[...currentSelectedIds]') &&
-      !appSource.includes('currentSelectedIds].filter') &&
+      !logicSource.includes('[...currentSelectedIds]') &&
+      !logicSource.includes('currentSelectedIds].filter') &&
       !restoreTrashSource.includes('[...current].filter'),
     '刷新合并和恢复回收站后的选中集合清理直接循环处理，避免展开 Set 再 filter',
     'selection cleanup direct set loops',
   )
   assertCheck(
     checks,
-    appSource.includes('visibleLookupRef') &&
-      appSource.includes('createVisibleIndexMap') &&
-      appSource.includes('getVisibleAssetIndex') &&
-      !appSource.includes('const visibleIdSet = useMemo') &&
-      !appSource.includes('const visibleIndexById = useMemo') &&
+    logicSource.includes('visibleLookupRef') &&
+      logicSource.includes('createVisibleIndexMap') &&
+      logicSource.includes('getVisibleAssetIndex') &&
+      !logicSource.includes('const visibleIdSet = useMemo') &&
+      !logicSource.includes('const visibleIndexById = useMemo') &&
       libraryViewSource.includes('getAssetIndex: (assetId: string) => number') &&
       !libraryViewSource.includes('assetIndexById'),
     '可见素材索引改为按需构建，避免大列表每次变化都生成 Set/Map',
@@ -762,8 +830,8 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function lastIdInSet') &&
-      appSource.includes('function createIdRangeSet') &&
+    logicSource.includes('function lastIdInSet') &&
+      logicSource.includes('function createIdRangeSet') &&
       assetClickSource.includes('lastIdInSet(next)') &&
       assetClickSource.includes('createIdRangeSet(visibleAssetIds, from, to)') &&
       !assetClickSource.includes('Array.from(next)') &&
@@ -775,21 +843,21 @@ async function main() {
     checks,
     selectedActionSource.includes('function getVisibleSelectedAssets()') &&
       selectedActionSource.includes('for (const id of visibleSelectedIds)') &&
-      appSource.includes('onRotateSelected={(quarterTurns) => rotateAssets(getVisibleSelectedAssets(), quarterTurns)}') &&
-      !appSource.includes('const selectedAssets = [...visibleSelectedIds]'),
+      logicSource.includes('onRotateSelected={(quarterTurns) => rotateAssets(getVisibleSelectedAssets(), quarterTurns)}') &&
+      !logicSource.includes('const selectedAssets = [...visibleSelectedIds]'),
     '批量旋转所需素材数组改为操作触发时生成，避免渲染阶段重建大选择数组',
     'lazy selected assets for actions',
   )
   assertCheck(
     checks,
-    appSource.includes('function dragSourcePathsForSelection') &&
-      appSource.includes('for (const id of selectedIds)') &&
+    logicSource.includes('function dragSourcePathsForSelection') &&
+      logicSource.includes('for (const id of selectedIds)') &&
       dragStartSource.includes('dragSourcePathsForSelection(asset, visibleSelectedIds, assetByIdRef.current)') &&
       !dragStartSource.includes('[...visibleSelectedIds]') &&
       !dragStartSource.includes('.map((id) =>') &&
       !dragStartSource.includes('.filter((path)') &&
-      appSource.includes('function countProcessableAssets') &&
-      appSource.includes('for (const id of assetIds)') &&
+      logicSource.includes('function countProcessableAssets') &&
+      logicSource.includes('for (const id of assetIds)') &&
       batchModalSource.includes('processableCount={countProcessableAssets(visibleSelectedIds, assetById)}') &&
       !batchModalSource.includes('[...visibleSelectedIds]') &&
       !batchModalSource.includes('.filter((id)'),
@@ -798,14 +866,14 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function insertCollectedAssets(assets: Asset[])') &&
-      appSource.includes('if (assets.length === 0) return') &&
-      appSource.includes('appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, assets)') &&
-      appSource.includes('appendAssetsToAssetMap(assetMap, assets)') &&
-      appSource.includes('appendAssetsToLibraryCatalogState(libraryName, current, assets)') &&
-      appSource.includes('setLibraryAssets((current) => appendItems(current, assets))') &&
-      appSource.includes('function insertCollectedAsset(asset: Asset)') &&
-      appSource.includes('insertCollectedAssets([asset])') &&
+    logicSource.includes('function insertCollectedAssets(assets: Asset[])') &&
+      logicSource.includes('if (assets.length === 0) return') &&
+      logicSource.includes('appendAssetIndexes(libraryAssetIndexByIdRef.current, libraryAssetIndexByIdRef.current.size, assets)') &&
+      logicSource.includes('appendAssetsToAssetMap(assetMap, assets)') &&
+      logicSource.includes('appendAssetsToLibraryCatalogState(libraryName, current, assets)') &&
+      logicSource.includes('setLibraryAssets((current) => appendItems(current, assets))') &&
+      logicSource.includes('function insertCollectedAsset(asset: Asset)') &&
+      logicSource.includes('insertCollectedAssets([asset])') &&
       restoreTrashSource.includes('const restoredAssets = new Array<Asset>(restored.length)') &&
       restoreTrashSource.includes('let restoredAssetCount = 0') &&
       restoreTrashSource.includes('restoredAssets[restoredAssetCount] = asset') &&
@@ -895,10 +963,10 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('function createAssetOperationTargets') &&
-      appSource.includes('idByRelativePath.set(asset.relativePath, asset.id)') &&
-      appSource.includes('assetByRelativePath.set(asset.relativePath, asset)') &&
-      appSource.includes('function assetsByIds') &&
+    logicSource.includes('function createAssetOperationTargets') &&
+      logicSource.includes('idByRelativePath.set(asset.relativePath, asset.id)') &&
+      logicSource.includes('assetByRelativePath.set(asset.relativePath, asset)') &&
+      logicSource.includes('function assetsByIds') &&
       deleteSelectedSource.includes('createAssetOperationTargets(') &&
       deleteSelectedSource.includes('relativePaths: targets.relativePaths') &&
       deleteSelectedSource.includes('removeAssetsFromLibrary(targets.ids)') &&
@@ -920,8 +988,8 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('type AssetReplacement') &&
-      appSource.includes('function createLiveAssetByRelativePath') &&
+    logicSource.includes('type AssetReplacement') &&
+      logicSource.includes('function createLiveAssetByRelativePath') &&
       replaceAssetsSource.includes('const oldIds = new Set<string>()') &&
       replaceAssetsSource.includes('const oldToNew = new Map<string, string>()') &&
       replaceAssetsSource.includes('for (const { oldAsset, oldId, asset } of replacements)') &&
@@ -943,16 +1011,16 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('getVisibleAssetIndex(primaryId)') &&
-      appSource.includes("const targetId = edge === 'top' ? visibleAssetIds[0] : visibleAssetIds.at(-1)") &&
-      appSource.includes('const nextId = visibleAssetIds[nextIndex]') &&
-      !appSource.includes('visualOrderRef') &&
-      !appSource.includes('VisualOrderCache') &&
-      !appSource.includes('getCurrentVisualIndex') &&
-      !appSource.includes('getCurrentVisualIds') &&
+    logicSource.includes('getVisibleAssetIndex(primaryId)') &&
+      logicSource.includes("const targetId = edge === 'top' ? visibleAssetIds[0] : visibleAssetIds.at(-1)") &&
+      logicSource.includes('const nextId = visibleAssetIds[nextIndex]') &&
+      !logicSource.includes('visualOrderRef') &&
+      !logicSource.includes('VisualOrderCache') &&
+      !logicSource.includes('getCurrentVisualIndex') &&
+      !logicSource.includes('getCurrentVisualIds') &&
       !libraryViewSource.includes('onVisualOrderChange') &&
-      !appSource.includes('visualIds.indexOf(primaryId)') &&
-      !appSource.includes('indexOf(primaryId)'),
+      !logicSource.includes('visualIds.indexOf(primaryId)') &&
+      !logicSource.includes('indexOf(primaryId)'),
     '连续键盘导航复用可见素材索引缓存，避免为同一可见顺序维护第二套视觉顺序索引',
     'lazy visual order lookup',
   )
@@ -997,9 +1065,9 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('SCROLL_POSITION_SAVE_MS') &&
-      appSource.includes('if (scrollSaveTimerRef.current) return') &&
-      appSource.includes('scrollPositionsRef.current[key]'),
+    logicSource.includes('SCROLL_POSITION_SAVE_MS') &&
+      logicSource.includes('if (scrollSaveTimerRef.current) return') &&
+      logicSource.includes('scrollPositionsRef.current[key]'),
     '滚动位置持久化使用单定时器节流，避免连续滚动时反复创建和清理保存任务',
     'single timer scroll position persistence',
   )
@@ -1052,8 +1120,8 @@ async function main() {
   )
   assertCheck(
     checks,
-    appSource.includes('saveFolderAssetMetadata') &&
-      appSource.includes('write_folder_asset_metadata') &&
+    logicSource.includes('saveFolderAssetMetadata') &&
+      logicSource.includes('write_folder_asset_metadata') &&
       (await readProjectFile('src/components/Inspector.tsx')).includes('onUpdateNote'),
     '标签收藏备注会写回文件夹级元数据',
     'tags favorite note persistence',

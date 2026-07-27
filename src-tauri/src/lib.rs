@@ -1,3 +1,8 @@
+mod app_settings;
+mod library_catalog;
+mod library_watch;
+mod thumbnail_cache;
+
 use chrono::{DateTime, Local};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
@@ -19,6 +24,16 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use walkdir::WalkDir;
 
+use app_settings::{read_app_settings, reveal_app_settings_file, write_app_settings};
+use library_catalog::{
+    clear_library_index, get_library_index_stats, has_valid_catalog, read_catalog_assets,
+    write_catalog_assets,
+};
+use library_watch::{stop_library_watch, watch_library, LibraryWatchState};
+use thumbnail_cache::{
+    prune_thumbnail_cache, thumbnail_cache_dir, thumbnail_cache_result, ThumbnailCacheResult,
+};
+
 const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v2-alpha-aware";
 const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
@@ -30,6 +45,7 @@ const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
 const THUMBNAIL_QUALITY_RESTORE_ORDER: [&str; 3] = ["standard", "high", "compact"];
 const FOLDER_METADATA_FILE_NAME: &str = ".picman.folder.json";
+const CATALOG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Default)]
 struct ThumbnailJobState {
@@ -49,14 +65,17 @@ struct ScanLibraryResponse {
 struct ScanLibraryStartResponse {
     library_name: String,
     root_path: String,
+    used_catalog: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanLibraryBatchPayload {
     assets: Vec<ScannedAsset>,
+    phase: String,
     scan_id: String,
     total: usize,
+    used_catalog: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +85,7 @@ struct ScanLibraryFinishedPayload {
     root_path: String,
     scan_id: String,
     total: usize,
+    used_catalog: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,7 +95,7 @@ struct ScanLibraryErrorPayload {
     scan_id: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScannedAsset {
     dimensions: String,
@@ -155,10 +175,13 @@ struct ThumbnailBatchPayload {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailFinishedPayload {
+    cache_file_count: usize,
+    cache_size_bytes: u64,
     cancelled: bool,
     completed: usize,
     failed: usize,
     job_id: String,
+    pruned_paths: Vec<String>,
     total: usize,
 }
 
@@ -181,6 +204,8 @@ struct FolderAssetMetadata {
     source_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captured_at: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -190,6 +215,8 @@ struct FolderMetadataFile {
     assets: BTreeMap<String, FolderAssetMetadata>,
     #[serde(default = "folder_metadata_version")]
     version: u32,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn folder_metadata_version() -> u32 {
@@ -200,6 +227,7 @@ impl Default for FolderMetadataFile {
     fn default() -> Self {
         Self {
             assets: BTreeMap::new(),
+            extra: BTreeMap::new(),
             version: 1,
         }
     }
@@ -364,7 +392,10 @@ fn read_folder_metadata(path: &Path) -> Result<FolderMetadataFile, String> {
         Ok(text) => serde_json::from_str::<FolderMetadataFile>(&text)
             .map_err(|error| format!("文件夹元数据解析失败：{}：{error}", normalize_path(path))),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(FolderMetadataFile::default()),
-        Err(error) => Err(format!("无法读取文件夹元数据：{}：{error}", normalize_path(path))),
+        Err(error) => Err(format!(
+            "无法读取文件夹元数据：{}：{error}",
+            normalize_path(path)
+        )),
     }
 }
 
@@ -392,7 +423,11 @@ impl FolderMetadataCache {
                     .unwrap_or_default()
             });
 
-        metadata.assets.get(file_name).cloned().map(normalize_folder_asset_metadata)
+        metadata
+            .assets
+            .get(file_name)
+            .cloned()
+            .map(normalize_folder_asset_metadata)
     }
 }
 
@@ -489,14 +524,9 @@ fn cache_hash(
     format!("{digest:x}")
 }
 
-fn thumbnail_cache_dir(root: &Path, quality: &str) -> PathBuf {
-    root.join(".picman")
-        .join("cache")
-        .join("thumbnails")
-        .join(quality)
-}
-
-fn cached_thumbnail_candidates(source: &ThumbnailSource) -> &'static [(&'static str, &'static str)] {
+fn cached_thumbnail_candidates(
+    source: &ThumbnailSource,
+) -> &'static [(&'static str, &'static str)] {
     if source.kind == "svg"
         || source
             .source_path
@@ -506,7 +536,12 @@ fn cached_thumbnail_candidates(source: &ThumbnailSource) -> &'static [(&'static 
     {
         &[("svg", "svg")]
     } else {
-        &[("jpg", "jpeg"), ("png", "png"), ("webp", "webp"), ("jpeg", "jpeg")]
+        &[
+            ("jpg", "jpeg"),
+            ("png", "png"),
+            ("webp", "webp"),
+            ("jpeg", "jpeg"),
+        ]
     }
 }
 
@@ -518,7 +553,10 @@ fn cached_thumbnail_dimensions(
 ) -> (u32, u32) {
     if format == "svg" {
         let (_, width, height) = image_dimensions(source_path);
-        return (width.unwrap_or(preset.max_edge), height.unwrap_or(preset.max_edge));
+        return (
+            width.unwrap_or(preset.max_edge),
+            height.unwrap_or(preset.max_edge),
+        );
     }
 
     image::image_dimensions(cached_path).unwrap_or((preset.max_edge, preset.max_edge))
@@ -644,9 +682,12 @@ fn safe_relative_path(root: &Path, relative_path: &str) -> Result<PathBuf, Strin
     let relative = PathBuf::from(relative_path);
 
     if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_) | Component::RootDir))
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
     {
         return Err("文件路径无效".to_string());
     }
@@ -779,6 +820,7 @@ fn scan_library_folder(root_path: String) -> Result<ScanLibraryResponse, String>
     }
 
     assets.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let _ = write_catalog_assets(&root, &assets);
 
     Ok(ScanLibraryResponse {
         assets,
@@ -792,6 +834,7 @@ fn scan_library_folder_stream(
     app: AppHandle,
     root_path: String,
     scan_id: String,
+    use_catalog_snapshot: bool,
 ) -> Result<ScanLibraryStartResponse, String> {
     let root = PathBuf::from(&root_path);
     if !root.is_dir() {
@@ -801,12 +844,31 @@ fn scan_library_folder_stream(
 
     let library_name = library_name_for(&root);
     let normalized_root = normalize_path(&root);
+    let used_catalog = use_catalog_snapshot && has_valid_catalog(&root);
     let thread_root = root.clone();
     let thread_library_name = library_name.clone();
     let thread_root_path = normalized_root.clone();
 
     thread::spawn(move || {
+        if used_catalog {
+            let cached_assets = read_catalog_assets(&thread_root);
+            let cached_total = cached_assets.len();
+            for chunk in cached_assets.chunks(SCAN_BATCH_SIZE) {
+                let _ = app.emit(
+                    SCAN_BATCH_EVENT,
+                    ScanLibraryBatchPayload {
+                        assets: chunk.to_vec(),
+                        phase: "catalog".to_string(),
+                        scan_id: scan_id.clone(),
+                        total: cached_total,
+                        used_catalog: true,
+                    },
+                );
+            }
+        }
+
         let mut assets = Vec::with_capacity(SCAN_BATCH_SIZE);
+        let mut catalog_assets = Vec::new();
         let mut folder_metadata = FolderMetadataCache::default();
         let cache_probe = ThumbnailCacheProbe::new(&thread_root);
         let mut total = 0usize;
@@ -841,6 +903,7 @@ fn scan_library_folder_stream(
                 &cache_probe,
             ) {
                 total += 1;
+                catalog_assets.push(asset.clone());
                 assets.push(asset);
             }
 
@@ -850,8 +913,10 @@ fn scan_library_folder_stream(
                     SCAN_BATCH_EVENT,
                     ScanLibraryBatchPayload {
                         assets: std::mem::take(&mut assets),
+                        phase: "scan".to_string(),
                         scan_id: scan_id.clone(),
                         total,
+                        used_catalog,
                     },
                 );
             }
@@ -863,8 +928,21 @@ fn scan_library_folder_stream(
                 SCAN_BATCH_EVENT,
                 ScanLibraryBatchPayload {
                     assets,
+                    phase: "scan".to_string(),
                     scan_id: scan_id.clone(),
                     total,
+                    used_catalog,
+                },
+            );
+        }
+
+        catalog_assets.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        if let Err(error) = write_catalog_assets(&thread_root, &catalog_assets) {
+            let _ = app.emit(
+                SCAN_ERROR_EVENT,
+                ScanLibraryErrorPayload {
+                    message: format!("目录索引保存失败：{error}"),
+                    scan_id: scan_id.clone(),
                 },
             );
         }
@@ -876,6 +954,7 @@ fn scan_library_folder_stream(
                 root_path: thread_root_path,
                 scan_id,
                 total,
+                used_catalog,
             },
         );
     });
@@ -883,6 +962,7 @@ fn scan_library_folder_stream(
     Ok(ScanLibraryStartResponse {
         library_name,
         root_path: normalized_root,
+        used_catalog,
     })
 }
 
@@ -934,6 +1014,11 @@ fn write_folder_asset_metadata(
         }
         if next.captured_at.is_none() {
             next.captured_at = previous.captured_at.clone();
+        }
+        for (key, value) in &previous.extra {
+            next.extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
     }
 
@@ -1135,11 +1220,29 @@ fn collect_image_into(
     build_collected_asset(root, &output_path)
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibrarySettings {
+    #[serde(default = "library_settings_version")]
+    version: u32,
     #[serde(default)]
     folder_order: Vec<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn library_settings_version() -> u32 {
+    1
+}
+
+impl Default for LibrarySettings {
+    fn default() -> Self {
+        Self {
+            extra: BTreeMap::new(),
+            version: library_settings_version(),
+            folder_order: Vec::new(),
+        }
+    }
 }
 
 fn library_settings_path(root: &Path) -> PathBuf {
@@ -1169,6 +1272,8 @@ fn write_library_settings(library_root: String, settings: LibrarySettings) -> Re
 
     let path = dir.join("settings.json");
     let temp = dir.join("settings.json.tmp");
+    let mut settings = settings;
+    settings.version = library_settings_version();
     let text = serde_json::to_string_pretty(&settings)
         .map_err(|error| format!("库设置序列化失败：{error}"))?;
 
@@ -1178,8 +1283,7 @@ fn write_library_settings(library_root: String, settings: LibrarySettings) -> Re
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
 
     for chunk in data.chunks(3) {
@@ -1190,8 +1294,16 @@ fn base64_encode(data: &[u8]) -> String {
 
         out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
 
     out
@@ -1299,7 +1411,9 @@ fn read_trash_manifest(root: &Path) -> Result<TrashManifest, String> {
     for item in &mut manifest.items {
         item.trash_file_path = normalize_path(&dir.join(&item.trash_file_name));
     }
-    manifest.items.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    manifest
+        .items
+        .sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
     Ok(manifest)
 }
 
@@ -1344,7 +1458,9 @@ fn restore_destination(root: &Path, relative_path: &str) -> Result<PathBuf, Stri
         .file_stem()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_default();
-    let ext = base.extension().map(|value| value.to_string_lossy().to_string());
+    let ext = base
+        .extension()
+        .map(|value| value.to_string_lossy().to_string());
 
     for suffix in 1..10000 {
         let name = match &ext {
@@ -1361,7 +1477,10 @@ fn restore_destination(root: &Path, relative_path: &str) -> Result<PathBuf, Stri
 }
 
 #[tauri::command]
-fn move_to_trash(library_root: String, relative_paths: Vec<String>) -> Result<Vec<TrashItem>, String> {
+fn move_to_trash(
+    library_root: String,
+    relative_paths: Vec<String>,
+) -> Result<Vec<TrashItem>, String> {
     let root = PathBuf::from(&library_root);
     if !root.is_dir() {
         return Err("资源目录无效".to_string());
@@ -1390,7 +1509,10 @@ fn move_to_trash(library_root: String, relative_paths: Vec<String>) -> Result<Ve
         let folder = source.parent().ok_or_else(|| "文件夹无效".to_string())?;
         let metadata_path = folder.join(FOLDER_METADATA_FILE_NAME);
         let mut folder_metadata = read_folder_metadata(&metadata_path)?;
-        let asset_metadata = folder_metadata.assets.remove(&file_name).unwrap_or_default();
+        let asset_metadata = folder_metadata
+            .assets
+            .remove(&file_name)
+            .unwrap_or_default();
         if metadata_path.exists() {
             write_folder_metadata(&metadata_path, &folder_metadata)?;
         }
@@ -1469,12 +1591,17 @@ fn restore_from_trash(library_root: String, ids: Vec<String>) -> Result<Vec<Scan
         }
         fs::rename(&trash_path, &destination).map_err(|error| format!("无法恢复文件：{error}"))?;
 
-        if let Some(file_name) = destination.file_name().map(|name| name.to_string_lossy().to_string()) {
+        if let Some(file_name) = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        {
             if let Some(folder) = destination.parent() {
                 let metadata_path = folder.join(FOLDER_METADATA_FILE_NAME);
                 let mut folder_metadata = read_folder_metadata(&metadata_path)?;
                 folder_metadata.version = 1;
-                folder_metadata.assets.insert(file_name, item.metadata.clone());
+                folder_metadata
+                    .assets
+                    .insert(file_name, item.metadata.clone());
                 write_folder_metadata(&metadata_path, &folder_metadata)?;
             }
         }
@@ -1539,8 +1666,14 @@ fn batch_target_dims(width: u32, height: u32, options: &BatchProcessOptions) -> 
         ));
     }
 
-    if let Some(percent) = options.scale_percent.filter(|value| *value > 0 && *value < 100) {
-        return Some(((width * percent / 100).max(1), (height * percent / 100).max(1)));
+    if let Some(percent) = options
+        .scale_percent
+        .filter(|value| *value > 0 && *value < 100)
+    {
+        return Some((
+            (width * percent / 100).max(1),
+            (height * percent / 100).max(1),
+        ));
     }
 
     None
@@ -1666,7 +1799,9 @@ fn unique_dest_path(folder_dir: &Path, file_name: &str) -> PathBuf {
         .file_stem()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_default();
-    let ext = name.extension().map(|value| value.to_string_lossy().to_string());
+    let ext = name
+        .extension()
+        .map(|value| value.to_string_lossy().to_string());
 
     for suffix in 1..10000 {
         let candidate_name = match &ext {
@@ -1941,10 +2076,11 @@ fn rotate_images(
     Ok(rotated)
 }
 
-fn generate_thumbnail_result(
+fn generate_thumbnail_file(
     root: &Path,
     source: &ThumbnailSource,
     quality: &str,
+    force: bool,
 ) -> Result<ThumbnailResult, String> {
     let source_path = PathBuf::from(&source.source_path);
     ensure_inside(root, &source_path)?;
@@ -1956,8 +2092,10 @@ fn generate_thumbnail_result(
     let cache_dir = thumbnail_cache_dir(root, quality);
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建缩略图缓存目录：{error}"))?;
 
-    if let Some(existing) = existing_thumbnail_for_quality(root, source, quality, &metadata) {
-        return Ok(existing);
+    if !force {
+        if let Some(existing) = existing_thumbnail_for_quality(root, source, quality, &metadata) {
+            return Ok(existing);
+        }
     }
 
     if source.kind == "svg"
@@ -2043,6 +2181,44 @@ fn generate_thumbnail_result(
     })
 }
 
+fn remove_other_thumbnail_variants(root: &Path, source: &ThumbnailSource, keep_path: &str) {
+    let source_path = PathBuf::from(&source.source_path);
+    let Ok(metadata) = fs::metadata(source_path) else {
+        return;
+    };
+    let normalized_keep = normalize_path(Path::new(keep_path));
+
+    for quality in THUMBNAIL_QUALITY_RESTORE_ORDER {
+        let hash = cache_hash(root, source, quality, &metadata);
+        let cache_dir = thumbnail_cache_dir(root, quality);
+        for (extension, _) in cached_thumbnail_candidates(source) {
+            let candidate = cache_dir.join(format!("{hash}.{extension}"));
+            if normalize_path(&candidate) != normalized_keep && candidate.is_file() {
+                let _ = fs::remove_file(candidate);
+            }
+        }
+    }
+}
+
+fn generate_thumbnail_result_with_force(
+    root: &Path,
+    source: &ThumbnailSource,
+    quality: &str,
+    force: bool,
+) -> Result<ThumbnailResult, String> {
+    let result = generate_thumbnail_file(root, source, quality, force)?;
+    remove_other_thumbnail_variants(root, source, &result.path);
+    Ok(result)
+}
+
+fn generate_thumbnail_result(
+    root: &Path,
+    source: &ThumbnailSource,
+    quality: &str,
+) -> Result<ThumbnailResult, String> {
+    generate_thumbnail_result_with_force(root, source, quality, false)
+}
+
 fn is_thumbnail_job_active(active_job_id: &Arc<Mutex<Option<String>>>, job_id: &str) -> bool {
     active_job_id
         .lock()
@@ -2107,6 +2283,8 @@ fn thumbnail_update_from_result(
 fn generate_thumbnails_stream(
     app: AppHandle,
     state: State<ThumbnailJobState>,
+    cache_limit_bytes: u64,
+    force: bool,
     library_root: String,
     sources: Vec<ThumbnailSource>,
     quality: String,
@@ -2147,6 +2325,7 @@ fn generate_thumbnails_stream(
                 let result_tx = result_tx.clone();
                 let root = root.clone();
                 let quality = quality.clone();
+                let force = force;
                 let sources = sources.clone();
                 let next_index = next_index.clone();
                 let worker_job_id = thread_job_id.clone();
@@ -2168,7 +2347,7 @@ fn generate_thumbnails_stream(
                         .or_else(|| Some(source.relative_path.clone()));
                     let (update, is_failed) = thumbnail_update_from_result(
                         source,
-                        generate_thumbnail_result(&root, source, &quality),
+                        generate_thumbnail_result_with_force(&root, source, &quality, force),
                     );
 
                     if result_tx
@@ -2227,16 +2406,20 @@ fn generate_thumbnails_stream(
 
         let cancelled =
             completed < total && !is_thumbnail_job_active(&active_job_id, &thread_job_id);
+        let cache_result = prune_thumbnail_cache(&root, cache_limit_bytes);
 
         clear_thumbnail_job_if_active(&active_job_id, &thread_job_id);
 
         let _ = app.emit(
             THUMBNAIL_FINISHED_EVENT,
             ThumbnailFinishedPayload {
+                cache_file_count: cache_result.file_count,
+                cache_size_bytes: cache_result.size_bytes,
                 cancelled,
                 completed,
                 failed,
                 job_id: thread_job_id,
+                pruned_paths: cache_result.removed_paths,
                 total,
             },
         );
@@ -2267,6 +2450,27 @@ fn cancel_thumbnail_generation(
 }
 
 #[tauri::command]
+fn get_thumbnail_cache_stats(library_root: String) -> Result<ThumbnailCacheResult, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+    Ok(thumbnail_cache_result(&root))
+}
+
+#[tauri::command]
+fn apply_thumbnail_cache_limit(
+    library_root: String,
+    max_bytes: u64,
+) -> Result<ThumbnailCacheResult, String> {
+    let root = PathBuf::from(&library_root);
+    if !root.is_dir() {
+        return Err("资源目录无效".to_string());
+    }
+    Ok(prune_thumbnail_cache(&root, max_bytes))
+}
+
+#[tauri::command]
 fn clear_thumbnail_cache(
     state: State<ThumbnailJobState>,
     library_root: String,
@@ -2293,6 +2497,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_drag::init())
+        .manage(LibraryWatchState::default())
         .manage(ThumbnailJobState::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -2301,9 +2506,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            apply_thumbnail_cache_limit,
             batch_process_images,
             cancel_thumbnail_generation,
             clear_thumbnail_cache,
+            clear_library_index,
             collect_image,
             copy_image_to_clipboard,
             empty_trash,
@@ -2313,15 +2520,22 @@ pub fn run() {
             rotate_images,
             generate_thumbnail,
             generate_thumbnails_stream,
+            get_thumbnail_cache_stats,
+            get_library_index_stats,
             list_trash,
             move_to_trash,
             prepare_image_for_ocr,
+            read_app_settings,
             read_library_settings,
+            reveal_app_settings_file,
             restore_from_trash,
             reveal_in_finder,
             scan_library_folder,
             scan_library_folder_stream,
+            stop_library_watch,
+            watch_library,
             write_folder_asset_metadata,
+            write_app_settings,
             write_library_settings
         ])
         .setup(|app| {
@@ -2361,19 +2575,20 @@ mod tests {
     }
 
     fn write_rgba_png(path: &Path, width: u32, height: u32, transparent: bool) {
-        let image = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_fn(width, height, |x, y| {
-            let alpha = if transparent && (x + y) % 7 == 0 {
-                96
-            } else {
-                255
-            };
-            image::Rgba([
-                ((x * 37 + y * 17) % 251) as u8,
-                ((x * 13 + y * 53) % 241) as u8,
-                ((x * 29 + y * 31) % 239) as u8,
-                alpha,
-            ])
-        });
+        let image =
+            image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_fn(width, height, |x, y| {
+                let alpha = if transparent && (x + y) % 7 == 0 {
+                    96
+                } else {
+                    255
+                };
+                image::Rgba([
+                    ((x * 37 + y * 17) % 251) as u8,
+                    ((x * 13 + y * 53) % 241) as u8,
+                    ((x * 29 + y * 31) % 239) as u8,
+                    alpha,
+                ])
+            });
 
         image.save(path).unwrap();
     }
@@ -2385,6 +2600,29 @@ mod tests {
             relative_path: format!("{name}.png"),
             source_path: normalize_path(path),
         }
+    }
+
+    #[test]
+    #[ignore = "需要先生成 25000 素材压力库"]
+    fn stress_library_scan_from_env() {
+        let root = std::env::var("PICMAN_STRESS_LIBRARY")
+            .expect("请设置 PICMAN_STRESS_LIBRARY 指向压力素材库");
+        let started = std::time::Instant::now();
+        let response = scan_library_folder(root).expect("压力素材库扫描失败");
+        let scan_elapsed = started.elapsed();
+
+        let catalog_started = std::time::Instant::now();
+        let catalog_assets = read_catalog_assets(&PathBuf::from(&response.root_path));
+        let catalog_elapsed = catalog_started.elapsed();
+
+        assert!(response.assets.len() >= 25_000);
+        assert_eq!(catalog_assets.len(), response.assets.len());
+        eprintln!(
+            "Picman 压力扫描：{} 个素材，完整扫描 {:?}，索引恢复 {:?}",
+            response.assets.len(),
+            scan_elapsed,
+            catalog_elapsed
+        );
     }
 
     #[test]
@@ -2495,12 +2733,7 @@ mod tests {
             relative_path: initial_scan.relative_path,
             source_path: initial_scan.source_path,
         };
-        let generated = generate_thumbnail_result(
-            &root,
-            &source,
-            "standard",
-        )
-        .unwrap();
+        let generated = generate_thumbnail_result(&root, &source, "standard").unwrap();
 
         let mut metadata_cache = FolderMetadataCache::default();
         let scanned = scanned_asset_from_path(
@@ -2514,7 +2747,10 @@ mod tests {
 
         assert!(scanned.thumbnail_ready);
         assert_eq!(scanned.thumbnail_format.as_deref(), Some("jpeg"));
-        assert_eq!(scanned.thumbnail_path.as_deref(), Some(generated.path.as_str()));
+        assert_eq!(
+            scanned.thumbnail_path.as_deref(),
+            Some(generated.path.as_str())
+        );
         assert_eq!(scanned.thumbnail_quality.as_deref(), Some("standard"));
         assert_eq!(scanned.thumbnail_width, Some(240));
 
@@ -2625,8 +2861,7 @@ mod tests {
             source_url: Some("https://example.com/cat.png".to_string()),
             title: Some("cat".to_string()),
         };
-        let asset =
-            collect_image_into(&root, "Inbox", png_bytes(24, 24), &provenance).unwrap();
+        let asset = collect_image_into(&root, "Inbox", png_bytes(24, 24), &provenance).unwrap();
 
         // A normal tag edit from the UI carries only favorite/note/tags.
         write_folder_asset_metadata(
@@ -2645,7 +2880,10 @@ mod tests {
         let entry = folder_metadata.assets.get(&asset.name).unwrap();
         assert!(entry.favorite);
         assert_eq!(entry.tags, vec!["pet".to_string()]);
-        assert_eq!(entry.source_url.as_deref(), Some("https://example.com/cat.png"));
+        assert_eq!(
+            entry.source_url.as_deref(),
+            Some("https://example.com/cat.png")
+        );
         assert!(entry.captured_at.is_some());
 
         let _ = fs::remove_dir_all(root);
@@ -2708,7 +2946,8 @@ mod tests {
         assert_eq!(moved[0].asset.tags, vec!["icon".to_string()]);
 
         // Rename within the new folder, preserving metadata.
-        let renamed = rename_asset(library, "Web/home.png".to_string(), "house".to_string()).unwrap();
+        let renamed =
+            rename_asset(library, "Web/home.png".to_string(), "house".to_string()).unwrap();
         assert!(root.join("Web").join("house.png").is_file());
         assert!(!root.join("Web").join("home.png").exists());
         assert_eq!(renamed.name, "house.png");
@@ -2820,9 +3059,13 @@ mod tests {
     fn batch_process_handles_webp() {
         let root = test_root("batch-webp");
         let file = root.join("shot.webp");
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 200, image::Rgb([10, 20, 30])))
-            .save_with_format(&file, image::ImageFormat::WebP)
-            .unwrap();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            300,
+            200,
+            image::Rgb([10, 20, 30]),
+        ))
+        .save_with_format(&file, image::ImageFormat::WebP)
+        .unwrap();
 
         let result = batch_process_images(
             normalize_path(&root),
@@ -2886,7 +3129,8 @@ mod tests {
     #[test]
     fn collect_transcodes_unsupported_format_to_png() {
         let root = test_root("collect-transcode");
-        let bmp_path = std::env::temp_dir().join(format!("picman-collect-{}.bmp", std::process::id()));
+        let bmp_path =
+            std::env::temp_dir().join(format!("picman-collect-{}.bmp", std::process::id()));
         image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]))
             .save(&bmp_path)
             .unwrap();
@@ -2907,7 +3151,10 @@ mod tests {
         assert_eq!(asset.kind, "png");
         let stored = PathBuf::from(&asset.source_path);
         assert_eq!(stored.extension().unwrap(), "png");
-        assert_eq!(image::guess_format(&fs::read(&stored).unwrap()).unwrap(), image::ImageFormat::Png);
+        assert_eq!(
+            image::guess_format(&fs::read(&stored).unwrap()).unwrap(),
+            image::ImageFormat::Png
+        );
 
         let _ = fs::remove_dir_all(root);
     }

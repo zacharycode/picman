@@ -19,6 +19,7 @@ type AssetItemStyle = CSSProperties & {
 
 type AssetItemProps = {
   asset: Asset
+  deferThumbnailLoading: boolean
   layout: AssetItemLayout
   primary: boolean
   selected: boolean
@@ -61,6 +62,7 @@ function areAssetItemLayoutsEqual(a: AssetItemLayout, b: AssetItemLayout) {
 function areAssetItemPropsEqual(previous: AssetItemProps, next: AssetItemProps) {
   return (
     previous.asset === next.asset &&
+    previous.deferThumbnailLoading === next.deferThumbnailLoading &&
     areAssetItemLayoutsEqual(previous.layout, next.layout) &&
     previous.primary === next.primary &&
     previous.selected === next.selected &&
@@ -74,6 +76,7 @@ function areAssetItemPropsEqual(previous: AssetItemProps, next: AssetItemProps) 
 
 function AssetItemBase({
   asset,
+  deferThumbnailLoading,
   layout,
   primary,
   selected,
@@ -85,8 +88,10 @@ function AssetItemBase({
 }: AssetItemProps) {
   const isList = viewMode === 'list'
   const [failedThumbnailKey, setFailedThumbnailKey] = useState<string | null>(null)
+  const [loadedThumbnailKey, setLoadedThumbnailKey] = useState<string | null>(null)
   const thumbnailKey = `${asset.thumbnailUrl ?? ''}:${asset.thumbnailQuality ?? 'none'}:${asset.thumbnailReady}`
   const showThumbnail = asset.thumbnailReady && asset.thumbnailUrl && failedThumbnailKey !== thumbnailKey
+  const renderThumbnail = showThumbnail && (!deferThumbnailLoading || loadedThumbnailKey === thumbnailKey)
   const placeholderLabel =
     asset.thumbnailReady || asset.thumbnailError
       ? '加载失败'
@@ -116,7 +121,7 @@ function AssetItemBase({
       onKeyDown={handleKeyDown}
     >
       <div className="asset-thumb-wrap">
-        {showThumbnail ? (
+        {renderThumbnail ? (
           <img
             alt=""
             decoding="async"
@@ -124,11 +129,16 @@ function AssetItemBase({
             loading="lazy"
             src={asset.thumbnailUrl}
             onError={() => setFailedThumbnailKey(thumbnailKey)}
+            onLoad={() => setLoadedThumbnailKey(thumbnailKey)}
           />
         ) : (
-          <div className={`asset-thumb-swatch thumbnail-placeholder ${asset.swatch}`}>
+          <div
+            className={`asset-thumb-swatch thumbnail-placeholder ${
+              showThumbnail && deferThumbnailLoading ? 'is-deferred' : ''
+            } ${asset.swatch}`}
+          >
             <FileImage size={28} />
-            <span>{placeholderLabel}</span>
+            {!(showThumbnail && deferThumbnailLoading) && <span>{placeholderLabel}</span>}
           </div>
         )}
         <span className="type-badge">{asset.kind.toUpperCase()}</span>

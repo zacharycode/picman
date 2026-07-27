@@ -1,49 +1,59 @@
 # Picman
 
-Picman is a file-first image asset manager. Source files stay as ordinary files
-inside ordinary folders; Picman adds open JSON metadata, local indexes, and
-local thumbnail caches around them.
+Picman 是一款文件优先的图片素材管理工具。图片始终以普通文件保存在用户选择的目录中；即使不安装 Picman，也可以直接查看、复制和移动这些文件。
 
-## Current Stack
+## 核心原则
 
-- Tauri 2 shell
-- React 19
-- TypeScript
-- Vite
-- lucide-react icons
+- 图片文件是真相源，不进入私有数据库，不被应用接管。
+- 标签、收藏、备注和采集来源保存在每个素材文件夹的 `.picman.folder.json`。
+- 资源库设置保存在根目录 `.picman/settings.json`。
+- `.picman/cache/catalog.jsonl` 和缩略图都是可查看、可清理、可压缩、可重建的本地派生数据。
+- 本机界面状态保存在 macOS Application Support 中的 JSON 文件，设置页可直接定位。
 
-## Commands
+完整约定见 [架构说明](docs/ARCHITECTURE.md)、[资源库格式](docs/LIBRARY_FORMAT.md) 和 [性能契约](docs/PERFORMANCE.md)。
+
+## 技术栈
+
+- Tauri 2 / Rust
+- React 19 / TypeScript / Vite
+- `notify` 原生目录监听
+- `image` 原生缩略图与批量图像处理
+- Vitest / Testing Library / Rust tests / GitHub Actions
+
+## 本地开发
 
 ```bash
+npm install
 npm run dev
-npm run build
 npm run lint
+npm test
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-Large local-library stress tests can be generated without extra dependencies:
+构建 Apple Silicon 安装包：
+
+```bash
+npm run desktop:build
+```
+
+## 大资源库验证
 
 ```bash
 npm run stress:create -- --count=25000 --folders=120 --output=/tmp/picman-stress-25000 --clean
 npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000
+npm run stress:native
 ```
 
-Desktop commands are available after Rust is installed:
+## 发布
 
-```bash
-npm run desktop:dev
-npm run desktop:build
-```
+`v*` 标签会触发 `.github/workflows/release.yml`，在 GitHub 的 Apple Silicon macOS runner 上构建 DMG、Tauri updater 包、签名和 `latest.json`。仓库需一次性配置：
 
-## Project Records
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，无密码时可留空
 
-- `功能更新日志.md`：唯一的功能更新日志，使用中文书写，并按日期由近到远排列。
-- `docs/ARCHITECTURE.md`：记录文件优先的存储模型。
-- `docs/PERFORMANCE.md`：记录 25000 素材库性能策略与审计命令。
+本地仍可执行 `npm run release:publish` 直接发布。
 
-每一次功能更新都只记录在 `功能更新日志.md` 中。
+## 项目记录
 
-## File-First Rule
-
-Picman treats the source folder as the durable asset. Local indexes and
-thumbnails are performance artifacts only. They must be visible, removable,
-compressible, and rebuildable without changing source files.
+所有功能更新只写入 [功能更新日志](功能更新日志.md)，使用中文并按日期由近到远排列。

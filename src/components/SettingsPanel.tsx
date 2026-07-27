@@ -1,12 +1,15 @@
 import {
   Archive,
+  Database,
   DownloadCloud,
   FileImage,
+  FileJson,
   FolderOpen,
   HardDrive,
   Image,
   Monitor,
   Moon,
+  RefreshCw,
   Sparkles,
   Sun,
   Trash2,
@@ -45,11 +48,19 @@ const THUMBNAIL_QUALITY_HINTS: Record<ThumbnailQuality, string> = {
 }
 
 type SettingsPanelProps = {
+  appSettingsPath: string
   cacheLimit: number
   cacheSize: number
+  collectorEnabled: boolean
   deleteShortcut: string
   folders: FolderNode[]
   generatedCount: number
+  hasNativeLibrary: boolean
+  indexAssetCount: number
+  indexBusy: boolean
+  indexExists: boolean
+  indexSizeBytes: number
+  indexValid: boolean
   libraryName: string
   ocrApiKey: string
   ocrLanguage: string
@@ -61,12 +72,17 @@ type SettingsPanelProps = {
   thumbnailQuality: ThumbnailQuality
   updateState: AppUpdateState
   onCheckForUpdate: () => void
+  onClearLibraryIndex: () => void
   onClose: () => void
   onClearThumbnailCache: () => void
+  onCompressThumbnailCache: () => void
   onGenerateAllThumbnails: () => void
   onGenerateFolderThumbnails: (folderPaths: string[]) => void
   onOpenFolder: () => void
+  onRebuildLibraryIndex: () => void
+  onRevealAppSettings: () => void
   onSetCacheLimit: (value: number) => void
+  onSetCollectorEnabled: (value: boolean) => void
   onSetDeleteShortcut: (value: string) => void
   onSetOcrApiKey: (value: string) => void
   onSetOcrLanguage: (value: string) => void
@@ -76,11 +92,19 @@ type SettingsPanelProps = {
 }
 
 export function SettingsPanel({
+  appSettingsPath,
   cacheLimit,
   cacheSize,
+  collectorEnabled,
   deleteShortcut,
   folders,
   generatedCount,
+  hasNativeLibrary,
+  indexAssetCount,
+  indexBusy,
+  indexExists,
+  indexSizeBytes,
+  indexValid,
   libraryName,
   ocrApiKey,
   ocrLanguage,
@@ -92,12 +116,17 @@ export function SettingsPanel({
   thumbnailQuality,
   updateState,
   onCheckForUpdate,
+  onClearLibraryIndex,
   onClose,
   onClearThumbnailCache,
+  onCompressThumbnailCache,
   onGenerateAllThumbnails,
   onGenerateFolderThumbnails,
   onOpenFolder,
+  onRebuildLibraryIndex,
+  onRevealAppSettings,
   onSetCacheLimit,
+  onSetCollectorEnabled,
   onSetDeleteShortcut,
   onSetOcrApiKey,
   onSetOcrLanguage,
@@ -161,7 +190,7 @@ export function SettingsPanel({
       <div className="sp-panel">
         <div className="sp-header">
           <span>偏好设置</span>
-          <button className="sp-close" onClick={onClose}>
+          <button aria-label="关闭设置" className="sp-close" type="button" onClick={onClose}>
             <X size={14} />
           </button>
         </div>
@@ -175,6 +204,39 @@ export function SettingsPanel({
             </div>
             <button className="sp-open-btn" onClick={onOpenFolder}>
               <FolderOpen size={13} /> 打开文件夹
+            </button>
+          </div>
+        </div>
+
+        <div className="sp-section">
+          <div className="sp-section-title">本地目录索引</div>
+          <div className="sp-metrics">
+            <div className="sp-metric">
+              <Database size={14} />
+              <span>索引记录</span>
+              <strong>{indexExists ? indexAssetCount : 0}</strong>
+            </div>
+            <div className="sp-metric">
+              <HardDrive size={14} />
+              <span>索引占用</span>
+              <strong>{formatMb(Math.ceil(indexSizeBytes / 1024))}</strong>
+            </div>
+          </div>
+          <p className="sp-desc">
+            {indexBusy
+              ? '正在根据真实文件更新本地索引。'
+              : !indexExists
+                ? '当前没有索引；下次刷新或重新打开资源库时可自动重建。'
+                : indexValid
+                  ? '索引可用，仅用于快速打开；删除后不会影响图片和元数据。'
+                  : '索引不可用，将在下次刷新时从真实文件重建。'}
+          </p>
+          <div className="sp-actions sp-index-actions">
+            <button disabled={!hasNativeLibrary || indexBusy} onClick={onRebuildLibraryIndex}>
+              <RefreshCw size={13} /> 重建索引
+            </button>
+            <button className="danger" disabled={!indexExists || indexBusy} onClick={onClearLibraryIndex}>
+              <Trash2 size={13} /> 清理索引
             </button>
           </div>
         </div>
@@ -218,6 +280,7 @@ export function SettingsPanel({
           <label className="sp-field range-row">
             <span>缓存上限：{cacheLimit} GB</span>
             <input
+              disabled={isGenerating}
               max="20"
               min="1"
               onChange={(event) => onSetCacheLimit(Number(event.target.value))}
@@ -292,6 +355,9 @@ export function SettingsPanel({
             >
               <FolderOpen size={13} /> 生成所选文件夹（{THUMBNAIL_QUALITY_LABELS[thumbnailQuality]}）
             </button>
+            <button disabled={isGenerating || generatedCount === 0} onClick={onCompressThumbnailCache}>
+              <Archive size={13} /> 压缩已有缓存
+            </button>
             <button className="danger" disabled={isGenerating || generatedCount === 0} onClick={onClearThumbnailCache}>
               <Trash2 size={13} /> 清理缓存
             </button>
@@ -316,6 +382,14 @@ export function SettingsPanel({
               ))}
             </div>
           </div>
+          <label className="sp-row">
+            <span>图片收集助手</span>
+            <input
+              checked={collectorEnabled}
+              type="checkbox"
+              onChange={(event) => onSetCollectorEnabled(event.target.checked)}
+            />
+          </label>
           <label className="sp-row">
             <span>方向键切换</span>
             <select
@@ -397,12 +471,27 @@ export function SettingsPanel({
           <div className="sp-section-title">文件结构</div>
           <p className="sp-desc">配置文件跟随普通文件夹保存，图片文件保持原生可复制。</p>
           <pre className="sp-pre">{`DesignAssets/
-  .picman-library.json
+  .picman/
+    settings.json
+    cache/
+      catalog.jsonl
+      thumbnails/
+    trash/
   Icons/
     navigation-home.png
-    .picman/
-      items.json`}</pre>
+    .picman.folder.json`}</pre>
           <pre className="sp-pre">{JSON.stringify(metadataExample, null, 2)}</pre>
+          <div className="sp-lib-row sp-settings-file-row">
+            <div className="sp-lib-name">
+              <span className="sp-lib-label">本机应用设置</span>
+              <code title={appSettingsPath}>{appSettingsPath || '浏览器环境使用本地回退存储'}</code>
+            </div>
+            {appSettingsPath && (
+              <button className="sp-open-btn" onClick={onRevealAppSettings}>
+                <FileJson size={13} /> 在 Finder 中显示
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </>

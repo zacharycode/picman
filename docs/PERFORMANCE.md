@@ -1,103 +1,69 @@
-# Picman Performance Plan
+# Picman 性能契约
 
-This document records the performance contract for local libraries around
-25000 assets and nested folders. It is not a product roadmap; it is the set of
-runtime invariants that protect the file-first app from becoming page-like or
-blocking under large local folders.
+本文件定义 25000 张级本地资源库必须长期保持的运行边界。所有优化都服从文件优先原则：索引和缩略图只换取速度，永远不能成为图片或元数据的唯一来源。
 
-## Target Scenario
+## 目标场景
 
-- Around 25000 image assets.
-- Around 120 nested folders.
-- Source files stay in their original folders.
-- Thumbnails and indexes remain rebuildable performance artifacts.
+- 至少 25000 个图片素材和 100 个以上嵌套目录。
+- 默认不生成缩略图，首次打开可以只显示稳定占位图。
+- 打开、搜索、筛选、切换视图、键盘选择和快速滚动不能被全量 DOM 或图片解码阻塞。
+- 后台扫描、目录监听和缩略图任务必须有界，不能长期占满 CPU。
 
-## Required Strategies
+## 运行约束
 
-1. Opening a local library must use native background scanning.
-   - `scan_library_folder_stream` starts quickly and continues on a Rust thread.
-   - Results are emitted in small batches.
-   - Opening a new folder cancels or ignores stale scan work by `scanId`.
+1. 原生流式扫描
+   - Rust 后台线程遍历真实目录，最多每 500 个素材发送一个批次。
+   - `scanId` 隔离过期任务，切换资源库后旧批次不得写入新资源库。
+   - 有本地索引时先恢复 JSONL 快照，再后台扫描真实文件并完整归并。
 
-2. Rendering must be virtualized.
-   - The central asset surface receives ordered asset ids.
-   - Only items around the visible viewport are mounted.
-   - Adaptive, masonry, and list views all use virtual layout data.
+2. 可重建索引
+   - `.picman/cache/catalog.jsonl` 只保存上次扫描快照。
+   - 索引路径会重新绑定到当前资源库，非法相对路径和越界缩略图路径会被拒绝。
+   - 设置页显示记录数、真实占用和有效状态，并支持清理与重建。
 
-3. Filtering and sorting must avoid thumbnail-driven full recomputation.
-   - Stable catalog data drives ordinary folder, tag, type, search, and sort.
-   - Live thumbnail state is read from `assetStore` only when the user filters by
-     generated or pending thumbnails.
+3. 原生目录监听
+   - `notify` 递归监听资源库，250ms 内的突发事件合并后再通知前端。
+   - 素材和 `.picman.folder.json` 变化触发后台刷新。
+   - `.picman/settings.json` 变化只重读设置，不扫描全库。
+   - `.picman/cache/**` 变化始终忽略，避免应用自己的索引和缩略图形成刷新循环。
 
-4. Thumbnail generation must be background and bounded.
-   - Native thumbnail generation runs through `generate_thumbnails_stream`.
-   - Worker count is capped and based on available parallelism.
-   - Worker results are aggregated into batches before reaching the frontend.
-   - Frontend thumbnail writes update the incremental asset store, not the
-     source asset array.
-   - Existing thumbnail files under `.picman/cache/thumbnails` are reused when
-     the source file fingerprint, algorithm version, and quality still match.
+4. 虚拟滚动
+   - 自适应、瀑布流和列表视图只挂载可视区附近的素材项。
+   - 滚动位置按 48px 窗口步进提交，快速方向增加前向预渲染范围。
+   - 高速滚动时保留已加载图片，但延后新缩略图解码；停止 120ms 后补载，避免解码与滚动争抢主线程。
 
-5. Fast scrolling must prioritize interaction smoothness.
-   - The app keeps native platform scrolling behavior.
-   - Overscan grows in the active scroll direction when scroll velocity is high.
-   - Newly mounted thumbnails can defer image loading while the user is moving
-     quickly, then load after scrolling settles.
+5. 有界缩略图任务
+   - 原生 worker 数不超过 3，结果每 128 个合并回传。
+   - 缩略图按来源指纹、算法版本和品质复用，品质覆盖时清理同素材的旧品质变体。
+   - 容量上限使用磁盘真实字节数，超限时从最旧缓存开始清理。
+   - 设置页提供生成进度、已生成/未生成数量、真实占用、品质、压缩和清理入口。
 
-6. File-first performance artifacts must remain rebuildable.
-   - `.picman/cache` is a local performance layer, not source of truth.
-   - Future tags, metadata, and settings should remain file-readable and
-     controllable rather than being hidden in an opaque database.
-   - User-authored asset metadata is stored in per-folder `.picman.folder.json`
-     files, not in thumbnail caches or opaque local indexes.
+6. 状态与磁盘写入
+   - 高频拖拽和滚动状态先由 `requestAnimationFrame` 或定时器合并。
+   - 应用设置只保留最新待写快照，180ms 内连续变化合并为一次 JSON 写入。
+   - 隐藏窗口前强制刷新最终设置，避免最后一次布局或滚动位置丢失。
 
-7. Stress verification must be repeatable.
-   - Generate the large test folder:
+## 自动验证
 
-     ```bash
-     npm run stress:create -- --count=25000 --folders=120 --output=/tmp/picman-stress-25000 --clean
-     ```
+```bash
+npm run lint
+npm test
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+npm run stress:create -- --count=25000 --folders=120 --output=/tmp/picman-stress-25000 --clean
+npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000
+npm run stress:native
+```
 
-   - Run the performance invariant audit:
+CI 对每次推送执行前端测试、Rust 测试、25000 素材静态不变量审计和原生扫描压力测试。
 
-     ```bash
-     npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000
-     ```
+## 2026-07-26 基线
 
-## Completion Evidence
+- 测试库：25000 个素材、150 个实际嵌套目录，约 779MB。
+- Rust 调试构建完整扫描：约 727ms。
+- 25000 条 JSONL 索引恢复：约 219ms。
+- 索引体积：约 14MB，并带 Dropbox 忽略属性。
+- 性能审计：80/80 通过。
+- 前端测试：12/12 通过；Rust 常规测试：20/20 通过。
 
-The active performance goal is not considered complete from code structure
-alone. It needs both:
-
-- Passing invariant checks from `npm run stress:audit`.
-- Manual or automated runtime evidence that the packaged app can open the
-  25000 asset library, switch views, search, select, and generate thumbnails
-  without making the interface unusable.
-
-### 2026-05-31 Runtime Evidence
-
-- `v0.1.17` added folder-level metadata persistence. `npm run stress:audit
-  -- --library=/tmp/picman-stress-25000 --min-count=25000` passed 23/23
-  invariants, including checks for `.picman.folder.json` and metadata writeback.
-- `cargo test` passed 6 tests, including folder metadata write-and-restore.
-- `npm run lint`, `npm run build`, `npm run desktop:build`, `npm run release:prepare`,
-  and codesign verification passed for v0.1.17.
-- `npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000`
-  passed 21/21 invariants after adding cache restore and fast-scroll checks.
-- `cargo test` passed 5 thumbnail/cache tests, including existing-cache reuse
-  before source decode and scan-time thumbnail cache restoration.
-- `npm run lint`, `npm run build`, `npm run desktop:build`, `npm run release:prepare`,
-  and codesign verification passed for v0.1.16.
-- GitHub Release `v0.1.16` was published with DMG, updater archive, signature,
-  and `latest.json`.
-
-### 2026-05-29 Runtime Evidence
-
-- `npm run stress:audit -- --library=/tmp/picman-stress-25000 --min-count=25000`
-  passed 17/17 invariants.
-- The packaged macOS app opened `/tmp/picman-stress-25000` and scanned 25000
-  assets without blocking the interface.
-- Standard thumbnail generation completed for all 25000 assets while the UI
-  stayed responsive enough to switch to list view during generation.
-- Final standard thumbnail cache: 25000 files, about 159M total, with 21250 JPG,
-  2500 PNG, and 1250 SVG files.
+以上时间是当前机器上的合成素材基线，不作为所有硬件的固定承诺；回归时更重要的是数量级不恶化、界面不失去响应、文件真相源不被派生层替代。

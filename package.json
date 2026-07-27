@@ -1,20 +1,23 @@
 {
   "name": "picman",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.96",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "desktop:dev": "tauri dev",
-    "desktop:build": "TAURI_SIGNING_PRIVATE_KEY=$HOME/.tauri/picman-updater.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD= tauri build",
+    "desktop:build": "TAURI_SIGNING_PRIVATE_KEY=\"${TAURI_SIGNING_PRIVATE_KEY:-$HOME/.tauri/picman-updater.key}\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" tauri build",
     "release:github": "npm run desktop:build && npm run release:prepare",
     "release:prepare": "node scripts/prepare-github-release.mjs",
     "release:publish": "npm run release:github && node scripts/publish-github-release.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "vite preview",
     "stress:audit": "node scripts/performance-audit.mjs",
-    "stress:create": "node scripts/create-stress-library.mjs"
+    "stress:create": "node scripts/create-stress-library.mjs",
+    "stress:native": "PICMAN_STRESS_LIBRARY=/tmp/picman-stress-25000 cargo test --manifest-path src-tauri/Cargo.toml stress_library_scan_from_env -- --ignored --nocapture"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
@@ -28,6 +31,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@tauri-apps/cli": "^2.11.2",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^24.12.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
@@ -36,8 +40,10 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
+    "jsdom": "^29.1.1",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
-    "vite": "^8.0.12"
+    "vite": "^8.0.12",
+    "vitest": "^4.1.10"
   }
 }
