@@ -1,4 +1,4 @@
-import { FileImage, Heart, Plus, RotateCcw, RotateCw, ScanText, Smile, Tag, X } from 'lucide-react'
+import { FileImage, Heart, Plus, RotateCcw, RotateCw, ScanText, Share2, Smile, Tag, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
 import type { Asset } from '../types/library'
@@ -35,6 +35,7 @@ type InspectorProps = {
   onAddTag: (assetId: string, tag: string) => void
   onOcr: (asset: Asset) => void
   onRotate: (asset: Asset, quarterTurns: number) => void
+  onShare: (asset: Asset) => void
   onRemoveTag: (assetId: string, tag: string) => void
   onSetFavorite: (assetId: string, favorite: boolean) => void
   onSelectTag: (tag: string) => void
@@ -48,6 +49,7 @@ export function Inspector({
   onAddTag,
   onOcr,
   onRotate,
+  onShare,
   onRemoveTag,
   onSetFavorite,
   onSelectTag,
@@ -117,6 +119,9 @@ export function Inspector({
         </div>
         <div className="insp-path">{asset.relativePath}</div>
         <div className="insp-actions-row">
+          <button className="insp-share-btn" title="使用 macOS 系统菜单分享" type="button" onClick={() => onShare(asset)}>
+            <Share2 size={13} /> 分享
+          </button>
           <button
             className="insp-ocr-btn"
             disabled={asset.kind === 'svg'}
@@ -291,11 +296,14 @@ export function Inspector({
   )
 }
 
-export function MultiSelectInspector({ count }: { count: number }) {
+export function MultiSelectInspector({ count, onShare }: { count: number; onShare: () => void }) {
   return (
     <div className="multi-select-info">
       <div className="ms-count">{count}</div>
       <div className="ms-label">个素材已选择</div>
+      <button className="ms-share-btn" type="button" onClick={onShare}>
+        <Share2 size={14} /> 分享所选
+      </button>
       <div className="ms-hint">
         <p>⌘A - 全选</p>
         <p>Shift+点击 - 连续选择</p>

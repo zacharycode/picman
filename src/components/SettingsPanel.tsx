@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Archive,
   Database,
   DownloadCloud,
@@ -7,6 +8,7 @@ import {
   FolderOpen,
   HardDrive,
   Image,
+  LocateFixed,
   Monitor,
   Moon,
   RefreshCw,
@@ -21,12 +23,12 @@ import { metadataExample } from '../data/mockLibrary'
 import { formatMb } from '../lib/format'
 import { eventToShortcut, formatShortcut } from '../lib/shortcut'
 import type {
+  Asset,
   AppUpdateState,
   FolderNode,
   SelectionKeyAxis,
   ThemePref,
   ThumbnailGenerationState,
-  ThumbnailQuality,
 } from '../types/library'
 
 const THEME_OPTIONS: [ThemePref, string, ComponentType<{ size?: number }>][] = [
@@ -35,21 +37,8 @@ const THEME_OPTIONS: [ThemePref, string, ComponentType<{ size?: number }>][] = [
   ['dark', '深色', Moon],
 ]
 
-const THUMBNAIL_QUALITY_LABELS: Record<ThumbnailQuality, string> = {
-  compact: '紧凑',
-  standard: '标准',
-  high: '高清',
-}
-
-const THUMBNAIL_QUALITY_HINTS: Record<ThumbnailQuality, string> = {
-  compact: '小体积',
-  standard: '均衡',
-  high: '高细节',
-}
-
 type SettingsPanelProps = {
   appSettingsPath: string
-  cacheLimit: number
   cacheSize: number
   collectorEnabled: boolean
   deleteShortcut: string
@@ -69,31 +58,29 @@ type SettingsPanelProps = {
   selectionKeyAxis: SelectionKeyAxis
   themePref: ThemePref
   thumbnailGeneration: ThumbnailGenerationState
-  thumbnailQuality: ThumbnailQuality
+  thumbnailFailures: Asset[]
   updateState: AppUpdateState
   onCheckForUpdate: () => void
   onClearLibraryIndex: () => void
   onClose: () => void
   onClearThumbnailCache: () => void
-  onCompressThumbnailCache: () => void
   onGenerateAllThumbnails: () => void
   onGenerateFolderThumbnails: (folderPaths: string[]) => void
   onOpenFolder: () => void
   onRebuildLibraryIndex: () => void
   onRevealAppSettings: () => void
-  onSetCacheLimit: (value: number) => void
+  onRetryFailedThumbnails: () => void
+  onRevealThumbnailFailure: (assetId: string) => void
   onSetCollectorEnabled: (value: boolean) => void
   onSetDeleteShortcut: (value: string) => void
   onSetOcrApiKey: (value: string) => void
   onSetOcrLanguage: (value: string) => void
   onSetSelectionKeyAxis: (value: SelectionKeyAxis) => void
   onSetThemePref: (value: ThemePref) => void
-  onSetThumbnailQuality: (value: ThumbnailQuality) => void
 }
 
 export function SettingsPanel({
   appSettingsPath,
-  cacheLimit,
   cacheSize,
   collectorEnabled,
   deleteShortcut,
@@ -113,26 +100,25 @@ export function SettingsPanel({
   selectionKeyAxis,
   themePref,
   thumbnailGeneration,
-  thumbnailQuality,
+  thumbnailFailures,
   updateState,
   onCheckForUpdate,
   onClearLibraryIndex,
   onClose,
   onClearThumbnailCache,
-  onCompressThumbnailCache,
   onGenerateAllThumbnails,
   onGenerateFolderThumbnails,
   onOpenFolder,
   onRebuildLibraryIndex,
   onRevealAppSettings,
-  onSetCacheLimit,
+  onRetryFailedThumbnails,
+  onRevealThumbnailFailure,
   onSetCollectorEnabled,
   onSetDeleteShortcut,
   onSetOcrApiKey,
   onSetOcrLanguage,
   onSetSelectionKeyAxis,
   onSetThemePref,
-  onSetThumbnailQuality,
 }: SettingsPanelProps) {
   const [selectedFolders, setSelectedFolders] = useState<Set<string>>(() => new Set())
   const [capturingShortcut, setCapturingShortcut] = useState(false)
@@ -169,7 +155,7 @@ export function SettingsPanel({
       }${failedSuffix}`
     : thumbnailGeneration.status === 'completed'
       ? `上次已完成：${thumbnailGeneration.scopeLabel} · ${thumbnailGeneration.total} 个素材${failedSuffix}`
-      : '打开资源目录后默认不生成缩略图，需要在这里手动生成。重复生成会覆盖已有缩略图。'
+      : '新增素材会自动以标准均衡品质生成缩略图；也可以在这里批量重新生成。'
 
   function toggleFolder(path: string) {
     setSelectedFolders((current) => {
@@ -272,43 +258,21 @@ export function SettingsPanel({
             </div>
             <div className="sp-metric">
               <Archive size={14} />
-              <span>未生成</span>
+              <span>待生成</span>
               <strong>{pendingCount}</strong>
             </div>
+            <div className={`sp-metric ${thumbnailFailures.length > 0 ? 'has-failures' : ''}`}>
+              <AlertTriangle size={14} />
+              <span>生成失败</span>
+              <strong>{thumbnailFailures.length}</strong>
+            </div>
           </div>
-
-          <label className="sp-field range-row">
-            <span>缓存上限：{cacheLimit} GB</span>
-            <input
-              disabled={isGenerating}
-              max="20"
-              min="1"
-              onChange={(event) => onSetCacheLimit(Number(event.target.value))}
-              type="range"
-              value={cacheLimit}
-            />
-          </label>
+          <p className="sp-desc">“待生成”表示尚未尝试，并不计入“生成失败”；浏览到这些素材时会自动生成。</p>
 
           <div className="sp-generation-box">
             <div className="sp-generation-head">
               <span>{isGenerating ? `正在生成：${thumbnailGeneration.scopeLabel}` : '手动生成缩略图'}</span>
               {thumbnailGeneration.status === 'completed' && <strong>上次完成 {thumbnailGeneration.total} 个</strong>}
-            </div>
-            <div className="sp-generation-quality">
-              <span>生成品质</span>
-              <div className="segmented quality-segmented">
-                {(['compact', 'standard', 'high'] as ThumbnailQuality[]).map((quality) => (
-                  <button
-                    key={quality}
-                    className={thumbnailQuality === quality ? 'active' : ''}
-                    disabled={isGenerating}
-                    onClick={() => onSetThumbnailQuality(quality)}
-                  >
-                    <strong>{THUMBNAIL_QUALITY_LABELS[quality]}</strong>
-                    <small>{THUMBNAIL_QUALITY_HINTS[quality]}</small>
-                  </button>
-                ))}
-              </div>
             </div>
             <div className="sp-generation-progress" aria-label="缩略图生成进度">
               <div style={{ width: `${generationProgress}%` }} />
@@ -317,6 +281,36 @@ export function SettingsPanel({
               {generationDescription}
             </div>
           </div>
+
+          {thumbnailFailures.length > 0 && (
+            <div className="sp-failure-box">
+              <div className="sp-failure-head">
+                <span>
+                  <AlertTriangle size={13} /> {thumbnailFailures.length} 个缩略图生成失败
+                </span>
+                <button disabled={isGenerating} type="button" onClick={onRetryFailedThumbnails}>
+                  <RefreshCw size={12} /> 重新生成
+                </button>
+              </div>
+              <div className="sp-failure-list">
+                {thumbnailFailures.map((asset) => (
+                  <button
+                    key={asset.id}
+                    className="sp-failure-item"
+                    title={`在 Finder 中显示：${asset.sourcePath ?? asset.relativePath}`}
+                    type="button"
+                    onClick={() => onRevealThumbnailFailure(asset.id)}
+                  >
+                    <LocateFixed size={13} />
+                    <span>
+                      <strong>{asset.name}</strong>
+                      <small>{asset.thumbnailError}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="sp-folder-picker">
             <div className="sp-folder-picker-head">
@@ -347,16 +341,13 @@ export function SettingsPanel({
 
           <div className="sp-actions">
             <button disabled={isGenerating} onClick={onGenerateAllThumbnails}>
-              <Sparkles size={13} /> 生成全部（{THUMBNAIL_QUALITY_LABELS[thumbnailQuality]}）
+              <Sparkles size={13} /> 生成全部缩略图
             </button>
             <button
               disabled={isGenerating || activeSelectedFolders.length === 0}
               onClick={() => onGenerateFolderThumbnails(activeSelectedFolders)}
             >
-              <FolderOpen size={13} /> 生成所选文件夹（{THUMBNAIL_QUALITY_LABELS[thumbnailQuality]}）
-            </button>
-            <button disabled={isGenerating || generatedCount === 0} onClick={onCompressThumbnailCache}>
-              <Archive size={13} /> 压缩已有缓存
+              <FolderOpen size={13} /> 生成所选文件夹
             </button>
             <button className="danger" disabled={isGenerating || generatedCount === 0} onClick={onClearThumbnailCache}>
               <Trash2 size={13} /> 清理缓存

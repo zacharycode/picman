@@ -19,7 +19,10 @@
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior-x: none;
 }
 
 .sp-header {
@@ -52,6 +55,7 @@
 }
 
 .sp-section {
+  min-width: 0;
   padding: 16px;
   border-bottom: 1px solid var(--border);
   display: grid;
@@ -252,7 +256,11 @@
 }
 
 .sp-pre {
-  overflow: auto;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
   border-radius: 6px;
   background: rgba(0,0,0,0.35);
   color: #a8bfd0;
@@ -377,49 +385,6 @@
   background: var(--surface-2);
 }
 
-.sp-generation-quality {
-  display: grid;
-  gap: 6px;
-}
-
-.sp-generation-quality > span {
-  color: var(--text2);
-  font-size: 11px;
-}
-
-.quality-segmented {
-  display: grid !important;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.sp-panel .quality-segmented button {
-  display: grid;
-  align-content: center;
-  gap: 2px;
-  height: 40px;
-  padding: 0 6px;
-  text-align: center;
-  text-transform: none;
-}
-
-.quality-segmented strong,
-.quality-segmented small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.quality-segmented strong {
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.quality-segmented small {
-  font-size: 10px;
-  font-weight: 400;
-  opacity: 0.72;
-}
-
 .sp-generation-head,
 .sp-folder-picker-head {
   display: flex;
@@ -449,6 +414,119 @@
   color: var(--text2);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.sp-metric.has-failures,
+.sp-failure-box {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border-hi));
+}
+
+.sp-metric.has-failures svg,
+.sp-metric.has-failures strong {
+  color: var(--danger);
+}
+
+.sp-failure-box {
+  display: grid;
+  overflow: hidden;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 7px;
+  background: var(--surface-sunken);
+}
+
+.sp-failure-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 8px 0 10px;
+}
+
+.sp-failure-head > span,
+.sp-failure-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sp-failure-head > span {
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sp-failure-head button {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border-hi);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text-hi);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.sp-failure-head button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.sp-failure-list {
+  display: grid;
+  max-height: 150px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.sp-failure-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-height: 42px;
+  padding: 5px 9px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text2);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sp-failure-item:last-child {
+  border-bottom: 0;
+}
+
+.sp-failure-item:hover {
+  background: var(--surface-2);
+  color: var(--text-hi);
+}
+
+.sp-failure-item > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.sp-failure-item strong,
+.sp-failure-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sp-failure-item strong {
+  color: var(--text-hi);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sp-failure-item small {
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .sp-folder-picker {

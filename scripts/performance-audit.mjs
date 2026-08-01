@@ -42,7 +42,7 @@ function assertCheck(checks, condition, label, detail) {
 }
 
 function constantNumber(source, name) {
-  const match = source.match(new RegExp(`const\\s+${name}\\s*:\\s*usize\\s*=\\s*(\\d+)`))
+  const match = source.match(new RegExp(`const\\s+${name}\\s*:\\s*(?:usize|u64)\\s*=\\s*(\\d+)`))
   return match ? Number(match[1]) : null
 }
 
@@ -119,6 +119,7 @@ async function main() {
   const checks = []
   const scanBatchSize = constantNumber(tauriSource, 'SCAN_BATCH_SIZE')
   const thumbnailBatchSize = constantNumber(tauriSource, 'THUMBNAIL_BATCH_SIZE')
+  const thumbnailBatchFlushMs = constantNumber(tauriSource, 'THUMBNAIL_BATCH_FLUSH_MS')
   const thumbnailWorkerLimit = constantNumber(tauriSource, 'THUMBNAIL_MAX_WORKERS')
   const thumbnailFlush = extractBetween(logicSource, 'const flushNativeThumbnailUpdates', 'const queueNativeThumbnailBatch')
   const visibleFilterSource = extractBetween(
@@ -341,12 +342,22 @@ async function main() {
   )
   assertCheck(
     checks,
-    thumbnailCacheSource.includes('size_bytes <= max_bytes') &&
-      thumbnailCacheSource.includes('sort_unstable_by') &&
-      thumbnailCacheSource.includes('fs::remove_file') &&
-      tauriSource.includes('apply_thumbnail_cache_limit'),
-    '缩略图容量上限按真实字节统计并从最旧缓存开始清理',
-    'real cache byte limit',
+      logicSource.includes('thumbnailGenerationAssets') &&
+      logicSource.includes('pendingAutoThumbnailAssetsRef') &&
+      logicSource.includes('generatePendingAutoThumbnailsRef') &&
+      logicSource.includes('generateThumbnailAssets(targetAssets, label, false)'),
+    '目录刷新发现新增或更新图片后自动进入缩略图生成队列',
+    'watched asset auto-thumbnail queue',
+  )
+  assertCheck(
+    checks,
+    thumbnailCacheSource.includes('thumbnail_cache_result') &&
+      thumbnailCacheSource.includes('size_bytes: files.iter()') &&
+      !thumbnailCacheSource.includes('prune_thumbnail_cache') &&
+      !tauriSource.includes('apply_thumbnail_cache_limit') &&
+      !tauriSource.includes('cache_limit_bytes'),
+    '缩略图缓存不设容量上限，仅统计真实占用并保留手动清理',
+    'unlimited cache + real byte stats',
   )
   assertCheck(checks, tauriSource.includes('fn scan_library_folder_stream'), '本地资源目录扫描为后台流式命令', 'scan_library_folder_stream')
   assertCheck(checks, scanBatchSize !== null && scanBatchSize <= 500, '扫描结果按小批次发送', `SCAN_BATCH_SIZE=${scanBatchSize}`)
@@ -356,9 +367,26 @@ async function main() {
   assertCheck(checks, !libraryViewSource.includes('visibleAssets:'), '视图层不再接收 visibleAssets 全量数组', 'no visibleAssets prop')
   assertCheck(checks, logicSource.includes('assetStore') && logicSource.includes('thumbnailFilterVersion'), '缩略图状态与源素材数组解耦', 'assetStore + thumbnailFilterVersion')
   assertCheck(checks, !thumbnailFlush.includes('setLibraryAssets'), '缩略图批次写回不更新主素材数组', 'flushNativeThumbnailUpdates')
-  assertCheck(checks, thumbnailBatchSize !== null && thumbnailBatchSize >= 128, '缩略图事件按批次聚合', `THUMBNAIL_BATCH_SIZE=${thumbnailBatchSize}`)
+  assertCheck(checks, thumbnailBatchSize !== null && thumbnailBatchSize <= 32, '缩略图事件使用低延迟有界小批次聚合', `THUMBNAIL_BATCH_SIZE=${thumbnailBatchSize}`)
+  assertCheck(
+    checks,
+    thumbnailBatchFlushMs !== null &&
+      thumbnailBatchFlushMs <= 100 &&
+      tauriSource.includes('recv_timeout(receive_timeout)'),
+    '缩略图首批结果按时间上限及时发送',
+    `THUMBNAIL_BATCH_FLUSH_MS=${thumbnailBatchFlushMs}`,
+  )
   assertCheck(checks, thumbnailWorkerLimit !== null && thumbnailWorkerLimit <= 3, '缩略图后台并发受控', `THUMBNAIL_MAX_WORKERS=${thumbnailWorkerLimit}`)
   assertCheck(checks, tauriSource.includes('available_parallelism') && tauriSource.includes('mpsc::channel'), '缩略图 worker 池按机器能力保守调度并聚合结果', 'available_parallelism + mpsc')
+  assertCheck(
+    checks,
+    tauriSource.includes('struct ThumbnailWorkQueue') &&
+      tauriSource.includes('fn prioritize_thumbnail_generation') &&
+      logicSource.includes('onViewportAssetIdsChange={handleViewportAssetIdsChange}') &&
+      logicSource.includes('scheduleVisibleThumbnailPriority(true)'),
+    '缩略图后台队列支持运行中按真实可视区动态提权',
+    'viewport-prioritized pending queue',
+  )
   assertCheck(checks, tauriSource.includes('completed: usize') && logicSource.includes('completed: number'), '缩略图取消/完成事件携带真实完成数量', 'completed payload')
   assertCheck(
     checks,
@@ -386,6 +414,14 @@ async function main() {
   )
   assertCheck(
     checks,
+    tauriSource.includes('fn patch_catalog_thumbnail_results') &&
+      tauriSource.includes('read_catalog_assets(root)') &&
+      tauriSource.includes('write_catalog_assets(root, &catalog_assets)'),
+    '完整缩略图任务把有效结果回写目录索引供下次启动直接恢复',
+    'thumbnail catalog write-back',
+  )
+  assertCheck(
+    checks,
     libraryViewSource.includes('VIRTUAL_FAST_OVERSCAN_PX') &&
       libraryViewSource.includes('FAST_SCROLL_VELOCITY_PX_PER_MS'),
     '快速滚动使用动态预渲染（滚动方向上扩大预渲染范围）',
@@ -393,13 +429,13 @@ async function main() {
   )
   assertCheck(
     checks,
-    libraryViewSource.includes('FAST_SCROLL_IMAGE_DEFER_THRESHOLD') &&
-      libraryViewSource.includes('SCROLL_SETTLE_MS') &&
-      libraryViewSource.includes('deferThumbnailLoading={deferThumbnailLoading}') &&
-      assetItemSource.includes('loadedThumbnailKey === thumbnailKey') &&
-      assetItemSource.includes('!deferThumbnailLoading'),
-    '快速滚动时保留已加载图片、延后新缩略图解码，并在滚动停止后补载',
-    'deferred thumbnail decode while fast scrolling',
+    libraryViewSource.includes("thumbnailPriority={viewportAssetIdSet.has(asset.id) ? 'high' : 'low'}") &&
+      assetItemSource.includes('{showThumbnail ? (') &&
+      assetItemSource.includes('fetchPriority={thumbnailPriority}') &&
+      assetItemSource.includes("loading={thumbnailPriority === 'high' ? 'eager' : 'lazy'}") &&
+      !assetItemSource.includes('deferThumbnailLoading'),
+    '已生成缩略图在预渲染区保持真实图片节点，并按可视区分配 eager/lazy 与 high/low，避免快速滚动占位闪烁',
+    'stable thumbnail nodes + viewport fetch priority',
   )
   assertCheck(
     checks,
@@ -489,7 +525,8 @@ async function main() {
       !adaptiveVirtualLayoutSource.includes('style: virtualItemStyle') &&
       !listVirtualLayoutSource.includes('style: virtualItemStyle') &&
       assetItemSource.includes('function assetItemLayoutStyle(layout: AssetItemLayout): AssetItemStyle') &&
-      assetItemSource.includes('transform: `translate3d(${layout.left}px, ${layout.top}px, 0)`') &&
+      assetItemSource.includes('transform: `translate(${layout.left}px, ${layout.top}px)`') &&
+      !assetItemSource.includes('translate3d') &&
       virtualRenderSource.includes('layout={item}') &&
       !virtualRenderSource.includes('style={virtualItemStyle(item)}'),
     '自适应和列表虚拟布局只保存数值位置，并把布局数字直接传给素材项',
@@ -573,7 +610,10 @@ async function main() {
       refreshMergeSource.includes('for (let index = 0; index < scannedAssets.length; index += 1)') &&
       refreshMergeSource.includes('const asset = scannedAssets[index]') &&
       refreshMergeSource.includes('for (const asset of previousAssets)') &&
-      refreshMergeSource.includes('if (!previousSourcePaths.has(asset.sourcePath)) added += 1') &&
+      refreshMergeSource.includes('if (!previousSourcePaths.has(asset.sourcePath))') &&
+      refreshMergeSource.includes('added += 1') &&
+      refreshMergeSource.includes('const thumbnailGenerationAssets = new Array<Asset>(scannedAssets.length)') &&
+      refreshMergeSource.includes('thumbnailGenerationAssets[thumbnailGenerationAssetCount] = assets[index]') &&
       refreshMergeSource.includes('assets[index] = {') &&
       refreshMergeSource.includes('assets[index] = asset') &&
       !refreshMergeSource.includes('assets.push') &&
@@ -682,7 +722,9 @@ async function main() {
   assertCheck(
     checks,
     logicSource.includes('const totalAssetCount = libraryAssetIds.length') &&
-      logicSource.includes('const pendingCount = Math.max(0, totalAssetCount - generatedCount)') &&
+      logicSource.includes(
+        'const pendingCount = Math.max(0, totalAssetCount - generatedCount - unresolvedThumbnailFailureCount)',
+      ) &&
       logicSource.includes('totalCount={totalAssetCount}') &&
       !logicSource.includes('libraryAssets.length - generatedCount') &&
       !logicSource.includes('totalCount={libraryAssets.length}'),
@@ -914,19 +956,21 @@ async function main() {
   )
   assertCheck(
     checks,
-    generateThumbnailAssetsSource.includes('const thumbnailClear = prepareThumbnailClearPatch(targetAssets)') &&
+    generateThumbnailAssetsSource.includes('const thumbnailStateById = createAssetMap(targetAssets)') &&
+      generateThumbnailAssetsSource.includes('prepareThumbnailGenerationUpdate(previous, {') &&
       generateThumbnailAssetsSource.includes('const nativeSources = libraryRootPath ? createNativeThumbnailSources(targetAssets) : null') &&
       generateThumbnailAssetsSource.includes('if (libraryRootPath && nativeSources)') &&
       generateThumbnailAssetsSource.includes('sources: nativeSources') &&
-      generateThumbnailAssetsSource.includes('subtractThumbnailMetrics(current, thumbnailClear.metrics)') &&
-      generateThumbnailAssetsSource.includes('applyAssetUpdatesToMap(assetMap, thumbnailClear.updates)') &&
+      generateThumbnailAssetsSource.includes('scheduleVisibleThumbnailPriority(true)') &&
+      !generateThumbnailAssetsSource.includes('prepareThumbnailClearPatch(targetAssets)') &&
+      !generateThumbnailAssetsSource.includes('subtractThumbnailMetrics(current') &&
       !generateThumbnailAssetsSource.includes('targetIds') &&
       !generateThumbnailAssetsSource.includes('targetAssets.every((asset) => asset.sourcePath)') &&
       !generateThumbnailAssetsSource.includes('targetAssets.map((asset) => ({') &&
       !generateThumbnailAssetsSource.includes('revokeThumbnailUrls(liveAssets.filter') &&
       !generateThumbnailAssetsSource.includes('buildThumbnailClearUpdates'),
-    '重新生成缩略图时复用单次清理补丁，并单次构造原生 sources，避免全库 live 数组过滤和重复遍历',
-    'thumbnail regenerate clear patch',
+    '重新生成缩略图时保留旧图并增量替换，同时单次构造原生 sources 和优先可视区',
+    'stale-while-revalidate thumbnail generation',
   )
   assertCheck(
     checks,
@@ -1044,10 +1088,12 @@ async function main() {
   )
   assertCheck(
     checks,
-    assetItemSource.includes('translate3d') &&
-      assetItemSource.includes('decoding="async"'),
-    '虚拟项使用合成层位移并异步解码图片',
-    'translate3d + async decoding',
+    assetItemSource.includes('transform: `translate(') &&
+      assetItemSource.includes('decoding="async"') &&
+      !assetItemSource.includes('translate3d') &&
+      !appCssSource.includes('will-change: transform'),
+    '虚拟项使用轻量二维位移并异步解码，避免为全部 overscan 项常驻合成层',
+    '2d translate + async decoding',
   )
   assertCheck(
     checks,
@@ -1145,7 +1191,8 @@ async function main() {
 
   if (failed.length > 0) {
     console.error(`性能审计失败：${failed.length}/${checks.length}`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
 
   console.log(`性能审计通过：${checks.length}/${checks.length}`)
@@ -1153,5 +1200,5 @@ async function main() {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : error)
-  process.exit(1)
+  process.exitCode = 1
 })

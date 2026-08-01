@@ -8,7 +8,6 @@ export type PicmanAppPrefs = {
   version?: number
   activeFolder?: string
   activeTag?: string
-  cacheLimitGb?: number
   collectorEnabled?: boolean
   deleteShortcut?: string
   folderPaneHeight?: number
@@ -24,7 +23,6 @@ export type PicmanAppPrefs = {
   sortField?: string
   themePref?: string
   thumbSize?: number
-  thumbnailQuality?: string
   viewMode?: string
 }
 
@@ -74,11 +72,14 @@ function removeLegacyAppPrefs() {
 }
 
 function normalizePrefs(prefs: PicmanAppPrefs): PicmanAppPrefs {
-  return {
+  const normalized: PicmanAppPrefs & Record<string, unknown> = {
     ...prefs,
     scrollPositions: prefs.scrollPositions ? { ...prefs.scrollPositions } : undefined,
     version: APP_PREFS_VERSION,
   }
+  delete normalized.cacheLimitGb
+  delete normalized.thumbnailQuality
+  return normalized
 }
 
 function enqueueNativeWrite(snapshot: PicmanAppPrefs) {

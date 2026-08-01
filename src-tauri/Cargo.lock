@@ -3025,12 +3025,15 @@ dependencies = [
 
 [[package]]
 name = "picman"
-version = "0.1.96"
+version = "0.1.97"
 dependencies = [
  "chrono",
  "image",
  "log",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "sha2",

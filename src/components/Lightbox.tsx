@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, FileImage, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { ChevronLeft, ChevronRight, FileImage, Share2, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useEffect, useRef, useState } from 'react'
 import { formatMb } from '../lib/format'
@@ -13,9 +13,10 @@ type LightboxProps = {
   onClose: () => void
   onNext: () => void
   onPrev: () => void
+  onShare: (asset: Asset) => void
 }
 
-export function Lightbox({ asset, hasNext, hasPrev, index, total, onClose, onNext, onPrev }: LightboxProps) {
+export function Lightbox({ asset, hasNext, hasPrev, index, total, onClose, onNext, onPrev, onShare }: LightboxProps) {
   return (
     <div className="lightbox" onClick={onClose}>
       <div className="lb-counter" onClick={(event) => event.stopPropagation()}>
@@ -24,6 +25,16 @@ export function Lightbox({ asset, hasNext, hasPrev, index, total, onClose, onNex
 
       <button className="lb-close" onClick={onClose}>
         <X size={16} />
+      </button>
+      <button
+        className="lb-share"
+        title="使用 macOS 系统菜单分享"
+        onClick={(event) => {
+          event.stopPropagation()
+          onShare(asset)
+        }}
+      >
+        <Share2 size={15} />
       </button>
 
       {hasPrev && (

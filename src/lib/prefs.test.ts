@@ -20,7 +20,10 @@ describe('应用设置文件', () => {
 
   it('首次启动把旧 WebView 偏好迁移到原生 JSON', async () => {
     setTauriRuntime(true)
-    localStorage.setItem('picman-app-prefs', JSON.stringify({ cacheLimitGb: 7, themePref: 'dark' }))
+    localStorage.setItem(
+      'picman-app-prefs',
+      JSON.stringify({ cacheLimitGb: 7, themePref: 'dark', thumbnailQuality: 'high' }),
+    )
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'read_app_settings') {
         return { path: '/Application Support/Picman/settings.json', settings: { sidebarWidth: 248 } }
@@ -31,7 +34,9 @@ describe('应用设置文件', () => {
 
     const loaded = await prefs.loadAppPrefs()
 
-    expect(loaded).toMatchObject({ cacheLimitGb: 7, sidebarWidth: 248, themePref: 'dark', version: 1 })
+    expect(loaded).toMatchObject({ sidebarWidth: 248, themePref: 'dark', version: 1 })
+    expect(loaded).not.toHaveProperty('cacheLimitGb')
+    expect(loaded).not.toHaveProperty('thumbnailQuality')
     expect(prefs.getAppSettingsPath()).toBe('/Application Support/Picman/settings.json')
     expect(invokeMock).toHaveBeenCalledWith('write_app_settings', { settings: loaded })
     expect(localStorage.getItem('picman-app-prefs')).toBeNull()
@@ -46,11 +51,11 @@ describe('应用设置文件', () => {
     setTauriRuntime(true)
     invokeMock.mockResolvedValue(undefined)
     const nativePrefs = await import('./prefs')
-    nativePrefs.writeAppPrefs({ cacheLimitGb: 3 })
+    nativePrefs.writeAppPrefs({ collectorEnabled: false })
 
     await vi.waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('write_app_settings', {
-        settings: { cacheLimitGb: 3, version: 1 },
+        settings: { collectorEnabled: false, version: 1 },
       })
     })
   })

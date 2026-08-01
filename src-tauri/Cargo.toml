@@ -1,6 +1,6 @@
 [package]
 name = "picman"
-version = "0.1.96"
+version = "0.1.97"
 description = "File-first image asset manager"
 authors = ["Picman"]
 license = ""
@@ -33,3 +33,8 @@ tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-drag = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSResponder", "NSSharingService", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL"] }

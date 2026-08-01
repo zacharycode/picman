@@ -19,10 +19,10 @@ type AssetItemStyle = CSSProperties & {
 
 type AssetItemProps = {
   asset: Asset
-  deferThumbnailLoading: boolean
   layout: AssetItemLayout
   primary: boolean
   selected: boolean
+  thumbnailPriority: 'high' | 'low'
   viewMode: AssetViewMode
   onClick: (asset: Asset, event: MouseEvent<HTMLDivElement>) => void
   onContextMenu: (asset: Asset, event: MouseEvent<HTMLDivElement>) => void
@@ -36,7 +36,7 @@ function assetItemLayoutStyle(layout: AssetItemLayout): AssetItemStyle {
     left: 0,
     position: 'absolute',
     top: 0,
-    transform: `translate3d(${layout.left}px, ${layout.top}px, 0)`,
+    transform: `translate(${layout.left}px, ${layout.top}px)`,
   }
 
   if (layout.width !== undefined) style.width = layout.width
@@ -62,10 +62,10 @@ function areAssetItemLayoutsEqual(a: AssetItemLayout, b: AssetItemLayout) {
 function areAssetItemPropsEqual(previous: AssetItemProps, next: AssetItemProps) {
   return (
     previous.asset === next.asset &&
-    previous.deferThumbnailLoading === next.deferThumbnailLoading &&
     areAssetItemLayoutsEqual(previous.layout, next.layout) &&
     previous.primary === next.primary &&
     previous.selected === next.selected &&
+    previous.thumbnailPriority === next.thumbnailPriority &&
     previous.viewMode === next.viewMode &&
     previous.onClick === next.onClick &&
     previous.onContextMenu === next.onContextMenu &&
@@ -76,10 +76,10 @@ function areAssetItemPropsEqual(previous: AssetItemProps, next: AssetItemProps) 
 
 function AssetItemBase({
   asset,
-  deferThumbnailLoading,
   layout,
   primary,
   selected,
+  thumbnailPriority,
   viewMode,
   onClick,
   onContextMenu,
@@ -88,10 +88,8 @@ function AssetItemBase({
 }: AssetItemProps) {
   const isList = viewMode === 'list'
   const [failedThumbnailKey, setFailedThumbnailKey] = useState<string | null>(null)
-  const [loadedThumbnailKey, setLoadedThumbnailKey] = useState<string | null>(null)
   const thumbnailKey = `${asset.thumbnailUrl ?? ''}:${asset.thumbnailQuality ?? 'none'}:${asset.thumbnailReady}`
   const showThumbnail = asset.thumbnailReady && asset.thumbnailUrl && failedThumbnailKey !== thumbnailKey
-  const renderThumbnail = showThumbnail && (!deferThumbnailLoading || loadedThumbnailKey === thumbnailKey)
   const placeholderLabel =
     asset.thumbnailReady || asset.thumbnailError
       ? '加载失败'
@@ -121,24 +119,20 @@ function AssetItemBase({
       onKeyDown={handleKeyDown}
     >
       <div className="asset-thumb-wrap">
-        {renderThumbnail ? (
+        {showThumbnail ? (
           <img
             alt=""
             decoding="async"
             draggable={false}
-            loading="lazy"
+            fetchPriority={thumbnailPriority}
+            loading={thumbnailPriority === 'high' ? 'eager' : 'lazy'}
             src={asset.thumbnailUrl}
             onError={() => setFailedThumbnailKey(thumbnailKey)}
-            onLoad={() => setLoadedThumbnailKey(thumbnailKey)}
           />
         ) : (
-          <div
-            className={`asset-thumb-swatch thumbnail-placeholder ${
-              showThumbnail && deferThumbnailLoading ? 'is-deferred' : ''
-            } ${asset.swatch}`}
-          >
+          <div className={`asset-thumb-swatch thumbnail-placeholder ${asset.swatch}`}>
             <FileImage size={28} />
-            {!(showThumbnail && deferThumbnailLoading) && <span>{placeholderLabel}</span>}
+            <span>{placeholderLabel}</span>
           </div>
         )}
         <span className="type-badge">{asset.kind.toUpperCase()}</span>

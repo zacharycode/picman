@@ -8,6 +8,7 @@ import {
   RotateCw,
   Rows3,
   Search,
+  Share2,
   SlidersHorizontal,
   Trash2,
   Wand2,
@@ -54,7 +55,6 @@ const VIRTUAL_OVERSCAN_PX = 900
 const VIRTUAL_FAST_OVERSCAN_PX = 2400
 const VIRTUAL_SCROLL_STEP_PX = 48
 const FAST_SCROLL_VELOCITY_PX_PER_MS = 1.2
-const FAST_SCROLL_IMAGE_DEFER_THRESHOLD = 0.75
 const SCROLL_SETTLE_MS = 120
 const VIEW_MODE_LABELS: Record<AssetViewMode, string> = {
   adaptive: '自适应',
@@ -403,6 +403,33 @@ function createMasonryLayout(layoutData: MasonryLayoutData, viewport: ViewportSt
   }
 }
 
+function virtualAssetIdsInViewport(items: VirtualAssetItem[], scrollTop: number, viewportHeight: number) {
+  const viewportBottom = scrollTop + Math.max(1, viewportHeight)
+  const assetIds = new Array<string>(items.length)
+  let assetCount = 0
+
+  for (const item of items) {
+    if (item.top >= viewportBottom || item.top + item.height <= scrollTop) continue
+
+    assetIds[assetCount] = item.assetId
+    assetCount += 1
+  }
+
+  assetIds.length = assetCount
+  return assetIds
+}
+
+function sameAssetIds(a: string[], b: string[]) {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false
+  }
+
+  return true
+}
+
 type LibraryViewProps = {
   activeTag: string
   activeFilterCount: number
@@ -440,6 +467,8 @@ type LibraryViewProps = {
   onOcr: (asset: Asset) => void
   onRotate: (asset: Asset, quarterTurns: number) => void
   onRotateSelected: (quarterTurns: number) => void
+  onShare: (asset: Asset) => void
+  onShareSelected: () => void
   onOpenFolder: () => void
   onRefresh: () => void
   onRemoveAssetTag: (assetId: string, tag: string) => void
@@ -456,6 +485,7 @@ type LibraryViewProps = {
   onSetTypeFilter: (type: 'all' | AssetKind) => void
   onSetViewMode: (mode: AssetViewMode) => void
   onScrollPositionChange: (key: string, scrollTop: number) => void
+  onViewportAssetIdsChange?: (assetIds: string[]) => void
 }
 
 export function LibraryView({
@@ -495,6 +525,8 @@ export function LibraryView({
   onOcr,
   onRotate,
   onRotateSelected,
+  onShare,
+  onShareSelected,
   onOpenFolder,
   onRefresh,
   onRemoveAssetTag,
@@ -511,6 +543,7 @@ export function LibraryView({
   onSetTypeFilter,
   onSetViewMode,
   onScrollPositionChange,
+  onViewportAssetIdsChange,
 }: LibraryViewProps) {
   const [inspectorWidth, setInspectorWidth] = useState(202)
   const [searchText, setSearchText] = useState(query)
@@ -525,8 +558,14 @@ export function LibraryView({
   const scrollSettleTimerRef = useRef<number | undefined>(undefined)
   const scrollRestoreRef = useRef({ attempts: 0, done: false, key: '' })
   const lastNotifiedScrollRef = useRef({ key: '', top: -1 })
+  const lastReportedViewportAssetIdsRef = useRef<string[]>([])
+  const onViewportAssetIdsChangeRef = useRef(onViewportAssetIdsChange)
+  const pendingViewportAssetIdsReportRef = useRef<string[] | null>(null)
+  const virtualItemsRef = useRef<VirtualAssetItem[]>([])
+  const viewportAssetIdsReportFrameRef = useRef<number | undefined>(undefined)
   const searchComposingRef = useRef(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [viewportAssetIds, setViewportAssetIds] = useState<string[]>([])
   const libraryGridColumns = inspectorVisible ? `minmax(0, 1fr) 5px ${inspectorWidth}px` : 'minmax(0, 1fr)'
   const fixedThumbSize = `${thumbSize}px`
   const adaptiveMinSize = `${Math.max(178, thumbSize + 34)}px`
@@ -566,6 +605,9 @@ export function LibraryView({
       onAssetDragStart,
     }
   }, [onAssetClick, onAssetContextMenu, onAssetDoubleClick, onAssetDragStart])
+  useLayoutEffect(() => {
+    onViewportAssetIdsChangeRef.current = onViewportAssetIdsChange
+  }, [onViewportAssetIdsChange])
   const handleItemClick = useCallback((asset: Asset, event: MouseEvent<HTMLDivElement>) => {
     assetHandlersRef.current.onAssetClick(asset, event)
   }, [])
@@ -590,7 +632,12 @@ export function LibraryView({
     }
     return createAdaptiveLayout(visibleAssetIds, viewport, adaptiveMetrics)
   }, [adaptiveMetrics, masonryLayoutData, viewMode, viewport, visibleAssetIds])
-  const deferThumbnailLoading = viewport.scrollSpeed >= FAST_SCROLL_IMAGE_DEFER_THRESHOLD
+  const fallbackViewportAssetIds = useMemo(
+    () => virtualAssetIdsInViewport(virtualLayout.items, viewport.scrollTop, viewport.height),
+    [viewport.height, viewport.scrollTop, virtualLayout.items],
+  )
+  const effectiveViewportAssetIds = viewportAssetIds.length > 0 ? viewportAssetIds : fallbackViewportAssetIds
+  const viewportAssetIdSet = useMemo(() => new Set(effectiveViewportAssetIds), [effectiveViewportAssetIds])
   const getVirtualPosition = useCallback(
     (assetId: string): VirtualPosition | undefined => {
       const index = getAssetIndex(assetId)
@@ -607,6 +654,66 @@ export function LibraryView({
     if (!searchComposingRef.current) setSearchText(query)
   }, [query])
 
+  const commitViewportAssetIds = useCallback((nextScrollTop: number, nextViewportHeight: number) => {
+    const nextIds = virtualAssetIdsInViewport(virtualItemsRef.current, nextScrollTop, nextViewportHeight)
+    setViewportAssetIds((current) => (sameAssetIds(current, nextIds) ? current : nextIds))
+  }, [])
+
+  const syncViewportSize = useCallback(() => {
+    const container = scrollRef.current
+    if (!container) return
+
+    const height = container.clientHeight
+    const width = container.clientWidth
+    setViewport((current) =>
+      current.height === height && current.width === width ? current : { ...current, height, width },
+    )
+  }, [])
+
+  useLayoutEffect(() => {
+    syncViewportSize()
+  }, [inspectorVisible, inspectorWidth, syncViewportSize])
+
+  useLayoutEffect(() => {
+    virtualItemsRef.current = virtualLayout.items
+    const container = scrollRef.current
+    if (!container) {
+      setViewportAssetIds((current) => (current.length === 0 ? current : []))
+      return
+    }
+
+    commitViewportAssetIds(container.scrollTop, container.clientHeight)
+  }, [commitViewportAssetIds, virtualLayout.items])
+
+  useEffect(() => {
+    if (!onViewportAssetIdsChange) return
+    if (sameAssetIds(lastReportedViewportAssetIdsRef.current, effectiveViewportAssetIds)) return
+
+    pendingViewportAssetIdsReportRef.current = effectiveViewportAssetIds
+    if (viewportAssetIdsReportFrameRef.current !== undefined) return
+
+    viewportAssetIdsReportFrameRef.current = window.requestAnimationFrame(() => {
+      viewportAssetIdsReportFrameRef.current = undefined
+      const nextAssetIds = pendingViewportAssetIdsReportRef.current
+      pendingViewportAssetIdsReportRef.current = null
+      if (!nextAssetIds || sameAssetIds(lastReportedViewportAssetIdsRef.current, nextAssetIds)) return
+
+      const handleViewportAssetIdsChange = onViewportAssetIdsChangeRef.current
+      if (!handleViewportAssetIdsChange) return
+
+      lastReportedViewportAssetIdsRef.current = nextAssetIds
+      handleViewportAssetIdsChange(nextAssetIds)
+    })
+  }, [effectiveViewportAssetIds, onViewportAssetIdsChange])
+
+  useEffect(() => {
+    return () => {
+      if (viewportAssetIdsReportFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(viewportAssetIdsReportFrameRef.current)
+      }
+    }
+  }, [])
+
   useLayoutEffect(() => {
     const container = scrollRef.current
     if (!container) return
@@ -621,6 +728,7 @@ export function LibraryView({
       const scrollDirection: ViewportState['scrollDirection'] = deltaY < 0 ? 'up' : 'down'
       const scrollSpeed = quantizeScrollSpeed(Math.abs(deltaY) / elapsed)
       const scrollTop = quantizeScrollTop(container.scrollTop, scrollDirection)
+      commitViewportAssetIds(container.scrollTop, container.clientHeight)
       scrollSampleRef.current = {
         scrollTop: container.scrollTop,
         time: now,
@@ -664,7 +772,10 @@ export function LibraryView({
       if (frameId) return
       frameId = window.requestAnimationFrame(measure)
     }
-    const resizeObserver = new ResizeObserver(scheduleMeasure)
+    const resizeObserver = new ResizeObserver(() => {
+      syncViewportSize()
+      scheduleMeasure()
+    })
 
     resizeObserver.observe(container)
     container.addEventListener('scroll', scheduleMeasure, { passive: true })
@@ -677,7 +788,7 @@ export function LibraryView({
       resizeObserver.disconnect()
       container.removeEventListener('scroll', scheduleMeasure)
     }
-  }, [onScrollPositionChange, scrollRestoreKey])
+  }, [commitViewportAssetIds, onScrollPositionChange, scrollRestoreKey, syncViewportSize])
 
   useLayoutEffect(() => {
     const container = scrollRef.current
@@ -693,12 +804,29 @@ export function LibraryView({
     if (Math.abs(container.scrollTop - targetTop) > 1) {
       container.scrollTo({ top: targetTop, behavior: 'auto' })
     }
+    const restoredScrollTop = quantizeScrollTop(targetTop, targetTop < viewport.scrollTop ? 'up' : 'down')
+    setViewport((current) => {
+      const next = {
+        height: container.clientHeight,
+        scrollDirection: targetTop < current.scrollTop ? ('up' as const) : ('down' as const),
+        scrollSpeed: 0,
+        scrollTop: restoredScrollTop,
+        width: container.clientWidth,
+      }
+      return current.height === next.height &&
+        current.scrollDirection === next.scrollDirection &&
+        current.scrollSpeed === next.scrollSpeed &&
+        current.scrollTop === next.scrollTop &&
+        current.width === next.width
+        ? current
+        : next
+    })
 
     scrollRestoreRef.current.attempts += 1
     if (scrollTop <= 0 || maxScroll >= scrollTop || scrollRestoreRef.current.attempts > 24) {
       scrollRestoreRef.current.done = true
     }
-  }, [scrollRestoreKey, scrollTop, virtualLayout.totalHeight])
+  }, [scrollRestoreKey, scrollTop, viewport.scrollTop, virtualLayout.totalHeight])
 
   const scrollJumpEdge = scrollJump?.edge
   const scrollJumpId = scrollJump?.id
@@ -992,6 +1120,9 @@ export function LibraryView({
               <button className="multiselect-action" title={`批量调整与压缩（${selectedIds.size}）`} onClick={onOpenBatch}>
                 <Wand2 size={13} /> 调整/压缩
               </button>
+              <button className="multiselect-action" title={`分享所选（${selectedIds.size}）`} onClick={onShareSelected}>
+                <Share2 size={13} /> 分享
+              </button>
               <button className="multiselect-action danger" title={`删除所选到回收站（${selectedIds.size}）`} onClick={onDeleteSelected}>
                 <Trash2 size={13} /> 删除
               </button>
@@ -1023,10 +1154,10 @@ export function LibraryView({
                   <AssetItem
                     key={asset.id}
                     asset={asset}
-                    deferThumbnailLoading={deferThumbnailLoading}
                     layout={item}
                     primary={primaryAsset?.id === asset.id}
                     selected={selectedIds.has(asset.id)}
+                    thumbnailPriority={viewportAssetIdSet.has(asset.id) ? 'high' : 'low'}
                     viewMode={viewMode}
                     onClick={handleItemClick}
                     onContextMenu={handleItemContextMenu}
@@ -1061,7 +1192,7 @@ export function LibraryView({
 
           <aside className="inspector">
             {selectedIds.size > 1 ? (
-              <MultiSelectInspector count={selectedIds.size} />
+              <MultiSelectInspector count={selectedIds.size} onShare={onShareSelected} />
             ) : primaryAsset ? (
               <Inspector
                 key={primaryAsset.id}
@@ -1071,6 +1202,7 @@ export function LibraryView({
                 onAddTag={onAddAssetTag}
                 onOcr={onOcr}
                 onRotate={onRotate}
+                onShare={onShare}
                 onRemoveTag={onRemoveAssetTag}
                 onSetFavorite={onSetAssetFavorite}
                 onSelectTag={onSetActiveTag}

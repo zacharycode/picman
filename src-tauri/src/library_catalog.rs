@@ -6,6 +6,10 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static CATALOG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize, Serialize)]
 struct CatalogHeader {
@@ -27,6 +31,20 @@ pub(crate) struct LibraryIndexStats {
 
 fn catalog_path(root: &Path) -> PathBuf {
     root.join(".picman").join("cache").join("catalog.jsonl")
+}
+
+fn catalog_temp_path(cache_dir: &Path) -> PathBuf {
+    let sequence = CATALOG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    cache_dir.join(format!(
+        "catalog.jsonl.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        sequence
+    ))
 }
 
 fn valid_catalog_header(line: &str) -> bool {
@@ -116,7 +134,9 @@ pub(crate) fn write_catalog_assets(root: &Path, assets: &[ScannedAsset]) -> Resu
     fs::create_dir_all(cache_dir).map_err(|error| format!("无法创建目录索引目录：{error}"))?;
     mark_cache_local(cache_dir);
 
-    let temp = cache_dir.join("catalog.jsonl.tmp");
+    // A scan and a thumbnail completion can update the catalog concurrently.
+    // Unique staging paths keep their writes isolated until the final rename.
+    let temp = catalog_temp_path(cache_dir);
     let file = fs::File::create(&temp).map_err(|error| format!("无法创建目录索引：{error}"))?;
     let mut writer = BufWriter::new(file);
     let header = CatalogHeader {
@@ -140,7 +160,12 @@ pub(crate) fn write_catalog_assets(root: &Path, assets: &[ScannedAsset]) -> Resu
     writer
         .flush()
         .map_err(|error| format!("目录索引刷新失败：{error}"))?;
-    fs::rename(&temp, &path).map_err(|error| format!("目录索引保存失败：{error}"))
+    drop(writer);
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("目录索引保存失败：{error}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -200,6 +225,16 @@ pub(crate) fn clear_library_index(library_root: String) -> Result<LibraryIndexSt
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("无法清理目录索引：{error}")),
+        }
+    }
+    let cache_dir = root.join(".picman/cache");
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with("catalog.jsonl.") && file_name.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
     Ok(LibraryIndexStats {

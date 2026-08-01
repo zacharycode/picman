@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Picman",
-  "version": "0.1.96",
+  "version": "0.1.97",
   "identifier": "app.picman.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -19,13 +19,15 @@
         "minHeight": 640,
         "dragDropEnabled": false,
         "resizable": true,
+        "visible": false,
         "fullscreen": false,
         "decorations": true,
+        "backgroundColor": "#1a1a1a",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "trafficLightPosition": {
           "x": 20,
-          "y": 18
+          "y": 20
         }
       }
     ],

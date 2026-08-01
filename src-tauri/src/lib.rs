@@ -7,7 +7,7 @@ use chrono::{DateTime, Local};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::imageops::FilterType;
-use image::{ColorType, GenericImageView, ImageEncoder};
+use image::{ColorType, GenericImageView, ImageEncoder, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,10 +16,10 @@ use std::io::{Cursor, ErrorKind};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use walkdir::WalkDir;
@@ -30,26 +30,40 @@ use library_catalog::{
     write_catalog_assets,
 };
 use library_watch::{stop_library_watch, watch_library, LibraryWatchState};
-use thumbnail_cache::{
-    prune_thumbnail_cache, thumbnail_cache_dir, thumbnail_cache_result, ThumbnailCacheResult,
-};
+use thumbnail_cache::{thumbnail_cache_dir, thumbnail_cache_result, ThumbnailCacheResult};
 
 const THUMBNAIL_ALGORITHM_VERSION: &str = "rust-image-lanczos-v2-alpha-aware";
 const SCAN_BATCH_SIZE: usize = 500;
 const SCAN_BATCH_EVENT: &str = "picman-library-scan-batch";
 const SCAN_ERROR_EVENT: &str = "picman-library-scan-error";
 const SCAN_FINISHED_EVENT: &str = "picman-library-scan-finished";
-const THUMBNAIL_BATCH_SIZE: usize = 128;
+const THUMBNAIL_BATCH_FLUSH_MS: u64 = 80;
+const THUMBNAIL_BATCH_SIZE: usize = 16;
+const THUMBNAIL_CLEANUP_GRACE_MS: u64 = 750;
 const THUMBNAIL_MAX_WORKERS: usize = 3;
 const THUMBNAIL_BATCH_EVENT: &str = "picman-thumbnail-batch";
 const THUMBNAIL_FINISHED_EVENT: &str = "picman-thumbnail-finished";
 const THUMBNAIL_QUALITY_RESTORE_ORDER: [&str; 3] = ["standard", "high", "compact"];
 const FOLDER_METADATA_FILE_NAME: &str = ".picman.folder.json";
 const CATALOG_SCHEMA_VERSION: u32 = 1;
+static THUMBNAIL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static SHARING_SERVICE_PICKER: std::cell::RefCell<
+        Option<objc2::rc::Retained<objc2_app_kit::NSSharingServicePicker>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Clone, Default)]
 struct ThumbnailJobState {
-    active_job_id: Arc<Mutex<Option<String>>>,
+    active_job: Arc<Mutex<Option<ActiveThumbnailJob>>>,
+}
+
+#[derive(Clone)]
+struct ActiveThumbnailJob {
+    id: String,
+    queue: Arc<ThumbnailWorkQueue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +146,152 @@ struct ThumbnailSource {
     source_path: String,
 }
 
+#[derive(Debug)]
+struct ThumbnailQueueLink {
+    next: Option<usize>,
+    pending: bool,
+    previous: Option<usize>,
+}
+
+#[derive(Debug)]
+struct ThumbnailWorkQueueInner {
+    head: Option<usize>,
+    links: Vec<ThumbnailQueueLink>,
+    remaining: usize,
+    tail: Option<usize>,
+}
+
+impl ThumbnailWorkQueueInner {
+    fn pop_front(&mut self) -> Option<usize> {
+        let index = self.head?;
+        let next = self.links[index].next;
+        self.head = next;
+
+        if let Some(next) = next {
+            self.links[next].previous = None;
+        } else {
+            self.tail = None;
+        }
+
+        self.links[index].next = None;
+        self.links[index].pending = false;
+        self.links[index].previous = None;
+        self.remaining = self.remaining.saturating_sub(1);
+        Some(index)
+    }
+
+    fn move_to_front(&mut self, index: usize) -> bool {
+        if !self
+            .links
+            .get(index)
+            .map(|link| link.pending)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self.head == Some(index) {
+            return true;
+        }
+
+        let previous = self.links[index].previous;
+        let next = self.links[index].next;
+
+        if let Some(previous) = previous {
+            self.links[previous].next = next;
+        }
+        if let Some(next) = next {
+            self.links[next].previous = previous;
+        } else {
+            self.tail = previous;
+        }
+
+        let previous_head = self.head;
+        self.links[index].next = previous_head;
+        self.links[index].previous = None;
+        if let Some(previous_head) = previous_head {
+            self.links[previous_head].previous = Some(index);
+        } else {
+            self.tail = Some(index);
+        }
+        self.head = Some(index);
+        true
+    }
+}
+
+#[derive(Debug)]
+struct ThumbnailWorkQueue {
+    indices_by_asset_id: HashMap<String, Vec<usize>>,
+    inner: Mutex<ThumbnailWorkQueueInner>,
+}
+
+impl ThumbnailWorkQueue {
+    fn new(sources: &[ThumbnailSource]) -> Self {
+        let mut indices_by_asset_id = HashMap::<String, Vec<usize>>::new();
+        let mut links = Vec::with_capacity(sources.len());
+
+        for (index, source) in sources.iter().enumerate() {
+            indices_by_asset_id
+                .entry(source.id.clone())
+                .or_default()
+                .push(index);
+            links.push(ThumbnailQueueLink {
+                next: (index + 1 < sources.len()).then_some(index + 1),
+                pending: true,
+                previous: index.checked_sub(1),
+            });
+        }
+
+        Self {
+            indices_by_asset_id,
+            inner: Mutex::new(ThumbnailWorkQueueInner {
+                head: (!sources.is_empty()).then_some(0),
+                links,
+                remaining: sources.len(),
+                tail: sources.len().checked_sub(1),
+            }),
+        }
+    }
+
+    fn pop_front(&self) -> Option<usize> {
+        self.inner.lock().ok()?.pop_front()
+    }
+
+    fn prioritize(&self, asset_ids: &[String]) -> Result<usize, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "缩略图待处理队列不可用".to_string())?;
+        let mut prioritized = 0usize;
+        let mut seen = HashSet::with_capacity(asset_ids.len());
+        let mut requested_indices = Vec::with_capacity(asset_ids.len());
+
+        for asset_id in asset_ids {
+            if !seen.insert(asset_id.as_str()) {
+                continue;
+            }
+            let Some(indices) = self.indices_by_asset_id.get(asset_id) else {
+                continue;
+            };
+            requested_indices.extend(indices.iter().copied());
+        }
+
+        // Moving in reverse preserves the caller's order at the front while
+        // keeping the queue fixed-size and leaving claimed work untouched.
+        for index in requested_indices.into_iter().rev() {
+            if inner.move_to_front(index) {
+                prioritized += 1;
+            }
+        }
+
+        Ok(prioritized)
+    }
+
+    #[cfg(test)]
+    fn remaining(&self) -> usize {
+        self.inner.lock().map(|inner| inner.remaining).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailResult {
@@ -188,6 +348,12 @@ struct ThumbnailFinishedPayload {
 struct ThumbnailWorkerResult {
     current_name: Option<String>,
     is_failed: bool,
+    source_index: usize,
+    update: ThumbnailUpdatePayload,
+}
+
+struct SuccessfulThumbnailResult {
+    source_index: usize,
     update: ThumbnailUpdatePayload,
 }
 
@@ -243,6 +409,13 @@ struct ThumbnailCacheHit {
     result: ThumbnailResult,
 }
 
+struct ExistingThumbnail {
+    format: &'static str,
+    modified_nanos: u128,
+    path: PathBuf,
+    size_kb: u64,
+}
+
 /// Quality cache directories that actually exist for a library, probed once per
 /// scan. On a fresh library no thumbnail cache exists, so scanning can skip the
 /// per-file hash and stat work that would otherwise always miss.
@@ -254,10 +427,35 @@ impl ThumbnailCacheProbe {
     fn new(root: &Path) -> Self {
         let qualities = THUMBNAIL_QUALITY_RESTORE_ORDER
             .into_iter()
-            .filter(|quality| thumbnail_cache_dir(root, quality).is_dir())
+            .filter(|quality| thumbnail_quality_has_cache_files(root, quality))
             .collect();
         Self { qualities }
     }
+}
+
+fn thumbnail_quality_has_cache_files(root: &Path, quality: &str) -> bool {
+    let Ok(entries) = fs::read_dir(thumbnail_cache_dir(root, quality)) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        matches!(
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
+                .as_deref(),
+            Some("jpg" | "jpeg" | "png" | "webp" | "svg")
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -431,6 +629,10 @@ impl FolderMetadataCache {
     }
 }
 
+fn decode_image_by_content(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    Ok(ImageReader::open(path)?.with_guessed_format()?.decode()?)
+}
+
 fn image_dimensions(path: &Path) -> (String, Option<u32>, Option<u32>) {
     if path
         .extension()
@@ -440,9 +642,13 @@ fn image_dimensions(path: &Path) -> (String, Option<u32>, Option<u32>) {
         return svg_dimensions(path).unwrap_or_else(|| ("vector".to_string(), None, None));
     }
 
-    match image::image_dimensions(path) {
-        Ok((width, height)) => (format!("{width} x {height}"), Some(width), Some(height)),
-        Err(_) => ("unknown".to_string(), None, None),
+    let dimensions = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    match dimensions {
+        Some((width, height)) => (format!("{width} x {height}"), Some(width), Some(height)),
+        None => ("unknown".to_string(), None, None),
     }
 }
 
@@ -567,11 +773,10 @@ fn existing_thumbnail_for_quality(
     source: &ThumbnailSource,
     quality: &str,
     metadata: &fs::Metadata,
-) -> Option<ThumbnailResult> {
+) -> Option<ExistingThumbnail> {
     let hash = cache_hash(root, source, quality, metadata);
     let cache_dir = thumbnail_cache_dir(root, quality);
-    let source_path = Path::new(&source.source_path);
-    let preset = thumbnail_preset(quality);
+    let mut newest = None::<ExistingThumbnail>;
 
     for (extension, format) in cached_thumbnail_candidates(source) {
         let output_path = cache_dir.join(format!("{hash}.{extension}"));
@@ -579,20 +784,52 @@ fn existing_thumbnail_for_quality(
             continue;
         }
 
-        let output_metadata = fs::metadata(&output_path).ok()?;
-        let (width, height) =
-            cached_thumbnail_dimensions(source_path, &output_path, format, &preset);
-
-        return Some(ThumbnailResult {
-            format: (*format).to_string(),
-            height,
-            path: normalize_path(&output_path),
+        let Ok(output_metadata) = fs::metadata(&output_path) else {
+            continue;
+        };
+        let candidate = ExistingThumbnail {
+            format: *format,
+            modified_nanos: output_metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+            path: output_path,
             size_kb: std::cmp::max(1, output_metadata.len().div_ceil(1024)),
-            width,
-        });
+        };
+        let should_replace = newest
+            .as_ref()
+            .map(|current| candidate.modified_nanos >= current.modified_nanos)
+            .unwrap_or(true);
+        if should_replace {
+            newest = Some(candidate);
+        }
     }
 
-    None
+    newest
+}
+
+fn thumbnail_result_from_existing(
+    source: &ThumbnailSource,
+    quality: &str,
+    existing: ExistingThumbnail,
+) -> ThumbnailResult {
+    let preset = thumbnail_preset(quality);
+    let (width, height) = cached_thumbnail_dimensions(
+        Path::new(&source.source_path),
+        &existing.path,
+        existing.format,
+        &preset,
+    );
+
+    ThumbnailResult {
+        format: existing.format.to_string(),
+        height,
+        path: normalize_path(&existing.path),
+        size_kb: existing.size_kb,
+        width,
+    }
 }
 
 fn existing_thumbnail_cache_hit(
@@ -601,13 +838,24 @@ fn existing_thumbnail_cache_hit(
     metadata: &fs::Metadata,
     probe: &ThumbnailCacheProbe,
 ) -> Option<ThumbnailCacheHit> {
+    let mut newest = None::<(&'static str, ExistingThumbnail)>;
+
     for &quality in &probe.qualities {
-        if let Some(result) = existing_thumbnail_for_quality(root, source, quality, metadata) {
-            return Some(ThumbnailCacheHit { quality, result });
+        if let Some(existing) = existing_thumbnail_for_quality(root, source, quality, metadata) {
+            let should_replace = newest
+                .as_ref()
+                .map(|(_, current)| existing.modified_nanos >= current.modified_nanos)
+                .unwrap_or(true);
+            if should_replace {
+                newest = Some((quality, existing));
+            }
         }
     }
 
-    None
+    newest.map(|(quality, existing)| ThumbnailCacheHit {
+        quality,
+        result: thumbnail_result_from_existing(source, quality, existing),
+    })
 }
 
 fn has_alpha(color: ColorType) -> bool {
@@ -652,13 +900,16 @@ fn write_png(path: &Path, image: &image::DynamicImage) -> Result<(), String> {
         .map_err(|error| format!("PNG 编码失败：{error}"))
 }
 
-fn source_passthrough_format(path: &Path) -> Option<(&'static str, &'static str)> {
+fn source_passthrough_format(
+    path: &Path,
+    detected_format: Option<ImageFormat>,
+) -> Option<(&'static str, &'static str)> {
     let ext = path.extension()?.to_string_lossy().to_lowercase();
 
-    match ext.as_str() {
-        "png" => Some(("png", "png")),
-        "jpg" | "jpeg" => Some(("jpg", "jpeg")),
-        "webp" => Some(("webp", "webp")),
+    match (ext.as_str(), detected_format) {
+        ("png", Some(ImageFormat::Png)) => Some(("png", "png")),
+        ("jpg" | "jpeg", Some(ImageFormat::Jpeg)) => Some(("jpg", "jpeg")),
+        ("webp", Some(ImageFormat::WebP)) => Some(("webp", "webp")),
         _ => None,
     }
 }
@@ -966,8 +1217,18 @@ fn scan_library_folder_stream(
     })
 }
 
+async fn run_blocking<T, F>(task_name: &'static str, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| format!("{task_name}后台任务失败：{error}"))?
+}
+
 #[tauri::command]
-fn generate_thumbnail(
+async fn generate_thumbnail(
     app: AppHandle,
     library_root: String,
     source: ThumbnailSource,
@@ -975,7 +1236,10 @@ fn generate_thumbnail(
 ) -> Result<ThumbnailResult, String> {
     let root = PathBuf::from(&library_root);
     allow_library_asset_scope(&app, &root)?;
-    generate_thumbnail_result(&root, &source, &quality)
+    run_blocking("缩略图生成", move || {
+        generate_thumbnail_result(&root, &source, &quality)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1319,7 +1583,8 @@ fn prepare_image_for_ocr(source_path: String) -> Result<String, String> {
         return Err("图片文件不存在".to_string());
     }
 
-    let decoded = image::open(&path).map_err(|error| format!("图片解码失败：{error}"))?;
+    let decoded =
+        decode_image_by_content(&path).map_err(|error| format!("图片解码失败：{error}"))?;
     let (width, height) = decoded.dimensions();
     const MAX_EDGE: u32 = 2048;
     let prepared = if width.max(height) > MAX_EDGE {
@@ -1343,7 +1608,11 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
         return Err("路径不存在".to_string());
     }
 
-    let status = Command::new("open")
+    let mut command = Command::new("open");
+    if target.is_file() {
+        command.arg("-R");
+    }
+    let status = command
         .arg(&target)
         .status()
         .map_err(|error| format!("无法在 Finder 中打开：{error}"))?;
@@ -1352,6 +1621,71 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
         Ok(())
     } else {
         Err("Finder 打开失败".to_string())
+    }
+}
+
+#[tauri::command]
+fn share_files(window: tauri::WebviewWindow, paths: Vec<String>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::AnyThread;
+        use objc2_app_kit::{NSSharingServicePicker, NSWindow};
+        use objc2_foundation::{NSArray, NSRectEdge, NSString, NSURL};
+
+        let mut urls = Vec::new();
+        for path in paths {
+            let canonical = PathBuf::from(path)
+                .canonicalize()
+                .map_err(|error| format!("无法读取待分享文件：{error}"))?;
+            if !canonical.is_file() {
+                return Err("只能分享真实图片文件".to_string());
+            }
+            let path = NSString::from_str(&canonical.to_string_lossy());
+            urls.push(NSURL::fileURLWithPath(&path));
+        }
+        if urls.is_empty() {
+            return Err("没有可分享的图片文件".to_string());
+        }
+
+        let ns_window = window
+            .ns_window()
+            .map_err(|error| format!("无法获取应用窗口：{error}"))?
+            as usize;
+        window
+            .run_on_main_thread(move || unsafe {
+                let window = &*(ns_window as *mut NSWindow);
+                let Some(content_view) = window.contentView() else {
+                    return;
+                };
+                let items = NSArray::from_retained_slice(&urls);
+                let items: &NSArray = &*((&*items as *const NSArray<NSURL>).cast::<NSArray>());
+                let picker =
+                    NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), items);
+                let mut anchor = content_view.bounds();
+                anchor.origin.x += anchor.size.width * 0.82;
+                anchor.origin.y += anchor.size.height * 0.54;
+                anchor.size.width = 1.0;
+                anchor.size.height = 1.0;
+                SHARING_SERVICE_PICKER.with(|active_picker| {
+                    let mut active_picker = active_picker.borrow_mut();
+                    *active_picker = Some(picker);
+                    if let Some(picker) = active_picker.as_ref() {
+                        picker.showRelativeToRect_ofView_preferredEdge(
+                            anchor,
+                            &content_view,
+                            NSRectEdge::MinY,
+                        );
+                    }
+                });
+            })
+            .map_err(|error| format!("无法打开系统分享菜单：{error}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, paths);
+        Err("系统分享菜单仅支持 macOS".to_string())
     }
 }
 
@@ -1716,7 +2050,8 @@ fn process_single_image(
             .len()
             .div_ceil(1024),
     );
-    let decoded = image::open(&source).map_err(|error| format!("图片解码失败：{error}"))?;
+    let decoded =
+        decode_image_by_content(&source).map_err(|error| format!("图片解码失败：{error}"))?;
     let (width, height) = decoded.dimensions();
     let resized = match batch_target_dims(width, height, options) {
         Some((target_width, target_height)) => {
@@ -1770,7 +2105,7 @@ fn copy_image_to_clipboard(app: AppHandle, source_path: String) -> Result<(), St
         return Err("图片文件不存在".to_string());
     }
 
-    let rgba = image::open(&path)
+    let rgba = decode_image_by_content(&path)
         .map_err(|error| format!("图片解码失败：{error}"))?
         .to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -2032,7 +2367,8 @@ fn rotate_single_image(
         return Err("不支持的格式".to_string());
     }
 
-    let decoded = image::open(&source).map_err(|error| format!("图片解码失败：{error}"))?;
+    let decoded =
+        decode_image_by_content(&source).map_err(|error| format!("图片解码失败：{error}"))?;
     let rotated = match quarter_turns % 4 {
         1 => decoded.rotate90(),
         2 => decoded.rotate180(),
@@ -2076,6 +2412,51 @@ fn rotate_images(
     Ok(rotated)
 }
 
+fn thumbnail_temp_path(cache_dir: &Path, hash: &str) -> PathBuf {
+    let sequence = THUMBNAIL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    cache_dir.join(format!(
+        "{hash}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        sequence
+    ))
+}
+
+fn commit_thumbnail_temp(temp_path: &Path, output_path: &Path) -> Result<(), String> {
+    match fs::rename(temp_path, output_path) {
+        Ok(()) => Ok(()),
+        // Another worker may have completed the same cache key first. Its
+        // atomically committed file is equivalent, so keep it and discard ours.
+        Err(_) if output_path.is_file() => {
+            let _ = fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp_path);
+            Err(format!("无法写入缩略图缓存：{error}"))
+        }
+    }
+}
+
+fn copy_thumbnail_file(
+    source_path: &Path,
+    cache_dir: &Path,
+    hash: &str,
+    output_path: &Path,
+    error_label: &str,
+) -> Result<(), String> {
+    let temp_path = thumbnail_temp_path(cache_dir, hash);
+    if let Err(error) = fs::copy(source_path, &temp_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("{error_label}：{error}"));
+    }
+    commit_thumbnail_temp(&temp_path, output_path)
+}
+
 fn generate_thumbnail_file(
     root: &Path,
     source: &ThumbnailSource,
@@ -2094,7 +2475,7 @@ fn generate_thumbnail_file(
 
     if !force {
         if let Some(existing) = existing_thumbnail_for_quality(root, source, quality, &metadata) {
-            return Ok(existing);
+            return Ok(thumbnail_result_from_existing(source, quality, existing));
         }
     }
 
@@ -2105,8 +2486,13 @@ fn generate_thumbnail_file(
             .unwrap_or(false)
     {
         let output_path = cache_dir.join(format!("{hash}.svg"));
-        fs::copy(&source_path, &output_path)
-            .map_err(|error| format!("无法写入 SVG 缩略图缓存：{error}"))?;
+        copy_thumbnail_file(
+            &source_path,
+            &cache_dir,
+            &hash,
+            &output_path,
+            "无法写入 SVG 缩略图缓存",
+        )?;
         let output_metadata =
             fs::metadata(&output_path).map_err(|error| format!("无法读取缩略图缓存：{error}"))?;
         let (_, width, height) = image_dimensions(&source_path);
@@ -2120,22 +2506,33 @@ fn generate_thumbnail_file(
         });
     }
 
-    let decoded = image::open(&source_path).map_err(|error| format!("图片解码失败：{error}"))?;
+    let reader = ImageReader::open(&source_path)
+        .and_then(ImageReader::with_guessed_format)
+        .map_err(|error| format!("图片解码失败：{error}"))?;
+    let detected_format = reader.format();
+    let decoded = reader
+        .decode()
+        .map_err(|error| format!("图片解码失败：{error}"))?;
     let source_width = decoded.width();
     let source_height = decoded.height();
     let passthrough = if source_width <= preset.max_edge
         && source_height <= preset.max_edge
         && metadata.len() <= preset.passthrough_limit_bytes
     {
-        source_passthrough_format(&source_path)
+        source_passthrough_format(&source_path, detected_format)
     } else {
         None
     };
 
     if let Some((extension, format)) = passthrough {
         let output_path = cache_dir.join(format!("{hash}.{extension}"));
-        fs::copy(&source_path, &output_path)
-            .map_err(|error| format!("无法写入缩略图缓存：{error}"))?;
+        copy_thumbnail_file(
+            &source_path,
+            &cache_dir,
+            &hash,
+            &output_path,
+            "无法写入缩略图缓存",
+        )?;
         let output_metadata =
             fs::metadata(&output_path).map_err(|error| format!("无法读取缩略图缓存：{error}"))?;
 
@@ -2159,15 +2556,19 @@ fn generate_thumbnail_file(
     let format = if alpha { "png" } else { "jpeg" };
 
     let output_path = cache_dir.join(format!("{hash}.{extension}"));
-    let temp_path = cache_dir.join(format!("{hash}.tmp"));
+    let temp_path = thumbnail_temp_path(&cache_dir, &hash);
 
-    if alpha {
-        write_png(&temp_path, &thumbnail)?;
+    let encoded = if alpha {
+        write_png(&temp_path, &thumbnail)
     } else {
-        write_jpeg(&temp_path, &thumbnail, preset.jpeg_quality)?;
+        write_jpeg(&temp_path, &thumbnail, preset.jpeg_quality)
+    };
+    if let Err(error) = encoded {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
 
-    fs::rename(&temp_path, &output_path).map_err(|error| format!("无法写入缩略图缓存：{error}"))?;
+    commit_thumbnail_temp(&temp_path, &output_path)?;
 
     let output_metadata =
         fs::metadata(&output_path).map_err(|error| format!("无法读取缩略图缓存：{error}"))?;
@@ -2206,9 +2607,10 @@ fn generate_thumbnail_result_with_force(
     quality: &str,
     force: bool,
 ) -> Result<ThumbnailResult, String> {
-    let result = generate_thumbnail_file(root, source, quality, force)?;
-    remove_other_thumbnail_variants(root, source, &result.path);
-    Ok(result)
+    // Do not remove the file currently displayed by the frontend here. Batch
+    // jobs clean older variants only after all successful updates are emitted;
+    // one-off jobs leave them for the capacity pruner.
+    generate_thumbnail_file(root, source, quality, force)
 }
 
 fn generate_thumbnail_result(
@@ -2219,19 +2621,115 @@ fn generate_thumbnail_result(
     generate_thumbnail_result_with_force(root, source, quality, false)
 }
 
-fn is_thumbnail_job_active(active_job_id: &Arc<Mutex<Option<String>>>, job_id: &str) -> bool {
-    active_job_id
+fn patch_catalog_thumbnail_results(
+    root: &Path,
+    quality: &str,
+    successful: &[SuccessfulThumbnailResult],
+) -> Result<(), String> {
+    if successful.is_empty() {
+        return Ok(());
+    }
+
+    let mut updates_by_id = HashMap::<&str, &ThumbnailUpdatePayload>::new();
+    for result in successful {
+        let Some(path) = result.update.path.as_deref() else {
+            continue;
+        };
+        if Path::new(path).is_file() {
+            updates_by_id.insert(result.update.asset_id.as_str(), &result.update);
+        }
+    }
+    if updates_by_id.is_empty() {
+        return Ok(());
+    }
+
+    let mut catalog_assets = read_catalog_assets(root);
+    if catalog_assets.is_empty() {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    for asset in &mut catalog_assets {
+        let Some(update) = updates_by_id.get(asset.id.as_str()) else {
+            continue;
+        };
+
+        asset.thumbnail_format = update.format.clone();
+        asset.thumbnail_height = update.height;
+        asset.thumbnail_path = update.path.clone();
+        asset.thumbnail_quality = Some(quality.to_string());
+        asset.thumbnail_ready = true;
+        asset.thumbnail_size_kb = update.size_kb;
+        asset.thumbnail_width = update.width;
+        changed = true;
+    }
+
+    if changed {
+        write_catalog_assets(root, &catalog_assets)?;
+    }
+    Ok(())
+}
+
+fn is_thumbnail_job_active(
+    active_job: &Arc<Mutex<Option<ActiveThumbnailJob>>>,
+    job_id: &str,
+) -> bool {
+    active_job
         .lock()
-        .map(|active| active.as_deref() == Some(job_id))
+        .map(|active| active.as_ref().map(|active| active.id.as_str()) == Some(job_id))
         .unwrap_or(false)
 }
 
-fn clear_thumbnail_job_if_active(active_job_id: &Arc<Mutex<Option<String>>>, job_id: &str) {
-    if let Ok(mut active) = active_job_id.lock() {
-        if active.as_deref() == Some(job_id) {
+fn clear_thumbnail_job_if_active(
+    active_job: &Arc<Mutex<Option<ActiveThumbnailJob>>>,
+    job_id: &str,
+) {
+    if let Ok(mut active) = active_job.lock() {
+        if active.as_ref().map(|active| active.id.as_str()) == Some(job_id) {
             *active = None;
         }
     }
+}
+
+fn cancel_thumbnail_job(
+    active_job: &Arc<Mutex<Option<ActiveThumbnailJob>>>,
+    job_id: Option<&str>,
+) -> Result<(), String> {
+    let mut active = active_job
+        .lock()
+        .map_err(|_| "缩略图任务状态不可用".to_string())?;
+
+    if job_id
+        .map(|id| active.as_ref().map(|active| active.id.as_str()) == Some(id))
+        .unwrap_or(true)
+    {
+        *active = None;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn prioritize_thumbnail_generation(
+    state: State<ThumbnailJobState>,
+    job_id: String,
+    asset_ids: Vec<String>,
+) -> Result<usize, String> {
+    let queue = {
+        let active = state
+            .active_job
+            .lock()
+            .map_err(|_| "缩略图任务状态不可用".to_string())?;
+        let Some(active) = active.as_ref() else {
+            return Ok(0);
+        };
+        if active.id != job_id {
+            return Ok(0);
+        }
+        active.queue.clone()
+    };
+
+    queue.prioritize(&asset_ids)
 }
 
 fn thumbnail_worker_count(total: usize) -> usize {
@@ -2279,11 +2777,37 @@ fn thumbnail_update_from_result(
     }
 }
 
+fn emit_thumbnail_batch(
+    app: &AppHandle,
+    job_id: &str,
+    total: usize,
+    completed: usize,
+    failed: usize,
+    current_name: &Option<String>,
+    updates: &mut Vec<ThumbnailUpdatePayload>,
+) -> bool {
+    if updates.is_empty() {
+        return true;
+    }
+
+    app.emit(
+        THUMBNAIL_BATCH_EVENT,
+        ThumbnailBatchPayload {
+            completed,
+            current_name: current_name.clone(),
+            failed,
+            job_id: job_id.to_string(),
+            total,
+            updates: std::mem::take(updates),
+        },
+    )
+    .is_ok()
+}
+
 #[tauri::command]
 fn generate_thumbnails_stream(
     app: AppHandle,
     state: State<ThumbnailJobState>,
-    cache_limit_bytes: u64,
     force: bool,
     library_root: String,
     sources: Vec<ThumbnailSource>,
@@ -2297,13 +2821,18 @@ fn generate_thumbnails_stream(
     allow_library_asset_scope(&app, &root)?;
 
     let total = sources.len();
-    let active_job_id = state.active_job_id.clone();
+    let sources = Arc::new(sources);
+    let queue = Arc::new(ThumbnailWorkQueue::new(sources.as_slice()));
+    let active_job = state.active_job.clone();
 
     {
-        let mut active = active_job_id
+        let mut active = active_job
             .lock()
             .map_err(|_| "缩略图任务状态不可用".to_string())?;
-        *active = Some(job_id.clone());
+        *active = Some(ActiveThumbnailJob {
+            id: job_id.clone(),
+            queue: queue.clone(),
+        });
     }
 
     let thread_job_id = job_id.clone();
@@ -2314,29 +2843,31 @@ fn generate_thumbnails_stream(
         let mut completed = 0usize;
         let mut failed = 0usize;
         let mut last_current_name: Option<String> = None;
+        let mut successful_thumbnails = Vec::<SuccessfulThumbnailResult>::new();
+        let mut updates_emitted = true;
 
         if worker_count > 0 {
-            let sources = Arc::new(sources);
-            let next_index = Arc::new(AtomicUsize::new(0));
             let (result_tx, result_rx) = mpsc::channel::<ThumbnailWorkerResult>();
 
             for _ in 0..worker_count {
-                let active_job_id = active_job_id.clone();
+                let active_job = active_job.clone();
                 let result_tx = result_tx.clone();
                 let root = root.clone();
                 let quality = quality.clone();
                 let force = force;
+                let queue = queue.clone();
                 let sources = sources.clone();
-                let next_index = next_index.clone();
                 let worker_job_id = thread_job_id.clone();
 
                 thread::spawn(move || loop {
-                    if !is_thumbnail_job_active(&active_job_id, &worker_job_id) {
+                    if !is_thumbnail_job_active(&active_job, &worker_job_id) {
                         break;
                     }
 
-                    let index = next_index.fetch_add(1, Ordering::Relaxed);
-                    if index >= sources.len() {
+                    let Some(index) = queue.pop_front() else {
+                        break;
+                    };
+                    if !is_thumbnail_job_active(&active_job, &worker_job_id) {
                         break;
                     }
 
@@ -2354,6 +2885,7 @@ fn generate_thumbnails_stream(
                         .send(ThumbnailWorkerResult {
                             current_name,
                             is_failed,
+                            source_index: index,
                             update,
                         })
                         .is_err()
@@ -2365,50 +2897,117 @@ fn generate_thumbnails_stream(
 
             drop(result_tx);
 
-            for result in result_rx {
-                completed += 1;
-                if result.is_failed {
-                    failed += 1;
-                }
-                last_current_name = result.current_name.clone();
-                updates.push(result.update);
+            let flush_interval = Duration::from_millis(THUMBNAIL_BATCH_FLUSH_MS);
+            let mut pending_since = None::<Instant>;
+            loop {
+                let receive_timeout = pending_since
+                    .map(|started| flush_interval.saturating_sub(started.elapsed()))
+                    .unwrap_or(flush_interval);
 
-                if updates.len() >= THUMBNAIL_BATCH_SIZE {
-                    let _ = app.emit(
-                        THUMBNAIL_BATCH_EVENT,
-                        ThumbnailBatchPayload {
-                            completed,
-                            current_name: last_current_name.clone(),
-                            failed,
-                            job_id: thread_job_id.clone(),
+                match result_rx.recv_timeout(receive_timeout) {
+                    Ok(result) => {
+                        completed += 1;
+                        if result.is_failed {
+                            failed += 1;
+                        } else if result.update.path.is_some() {
+                            successful_thumbnails.push(SuccessfulThumbnailResult {
+                                source_index: result.source_index,
+                                update: result.update.clone(),
+                            });
+                        }
+                        last_current_name = result.current_name;
+                        updates.push(result.update);
+                        if pending_since.is_none() {
+                            pending_since = Some(Instant::now());
+                        }
+
+                        if updates.len() >= THUMBNAIL_BATCH_SIZE {
+                            if !emit_thumbnail_batch(
+                                &app,
+                                &thread_job_id,
+                                total,
+                                completed,
+                                failed,
+                                &last_current_name,
+                                &mut updates,
+                            ) {
+                                updates_emitted = false;
+                            }
+                            pending_since = None;
+                            thread::yield_now();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !emit_thumbnail_batch(
+                            &app,
+                            &thread_job_id,
                             total,
-                            updates: std::mem::take(&mut updates),
-                        },
-                    );
-                    thread::yield_now();
+                            completed,
+                            failed,
+                            &last_current_name,
+                            &mut updates,
+                        ) {
+                            updates_emitted = false;
+                        }
+                        pending_since = None;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
 
-        if !updates.is_empty() {
-            let _ = app.emit(
-                THUMBNAIL_BATCH_EVENT,
-                ThumbnailBatchPayload {
-                    completed,
-                    current_name: last_current_name,
-                    failed,
-                    job_id: thread_job_id.clone(),
-                    total,
-                    updates,
-                },
-            );
+        if !emit_thumbnail_batch(
+            &app,
+            &thread_job_id,
+            total,
+            completed,
+            failed,
+            &last_current_name,
+            &mut updates,
+        ) {
+            updates_emitted = false;
         }
 
-        let cancelled =
-            completed < total && !is_thumbnail_job_active(&active_job_id, &thread_job_id);
-        let cache_result = prune_thumbnail_cache(&root, cache_limit_bytes);
+        if completed > 0
+            && completed == total
+            && updates_emitted
+            && is_thumbnail_job_active(&active_job, &thread_job_id)
+        {
+            // Event delivery is not a frontend render acknowledgement. Give
+            // the UI time to commit the final URL batch before reclaiming the
+            // stale files it may still be displaying.
+            thread::sleep(Duration::from_millis(THUMBNAIL_CLEANUP_GRACE_MS));
+        }
 
-        clear_thumbnail_job_if_active(&active_job_id, &thread_job_id);
+        // A newer generation may have started during the grace period. Never
+        // let an older job remove variants owned by that job.
+        let still_active = is_thumbnail_job_active(&active_job, &thread_job_id);
+        let cache_result = if completed == total && still_active && updates_emitted {
+            for result in &successful_thumbnails {
+                if let Some(keep_path) = result.update.path.as_deref() {
+                    remove_other_thumbnail_variants(
+                        &root,
+                        &sources[result.source_index],
+                        keep_path,
+                    );
+                }
+            }
+            thumbnail_cache_result(&root)
+        } else if still_active {
+            // Preserve stale-while-revalidate files if an update could not be
+            // delivered; preserve its stale-while-revalidate files safely.
+            thumbnail_cache_result(&root)
+        } else {
+            ThumbnailCacheResult::default()
+        };
+
+        let still_active_after_cleanup = is_thumbnail_job_active(&active_job, &thread_job_id);
+        let cancelled = completed < total || !still_active_after_cleanup || !updates_emitted;
+        if !cancelled && is_thumbnail_job_active(&active_job, &thread_job_id) {
+            let _ = patch_catalog_thumbnail_results(&root, &quality, &successful_thumbnails);
+        }
+
+        clear_thumbnail_job_if_active(&active_job, &thread_job_id);
 
         let _ = app.emit(
             THUMBNAIL_FINISHED_EVENT,
@@ -2433,60 +3032,41 @@ fn cancel_thumbnail_generation(
     state: State<ThumbnailJobState>,
     job_id: Option<String>,
 ) -> Result<(), String> {
-    let mut active = state
-        .active_job_id
-        .lock()
-        .map_err(|_| "缩略图任务状态不可用".to_string())?;
-
-    if job_id
-        .as_deref()
-        .map(|id| active.as_deref() == Some(id))
-        .unwrap_or(true)
-    {
-        *active = None;
-    }
-
-    Ok(())
+    cancel_thumbnail_job(&state.active_job, job_id.as_deref())
 }
 
 #[tauri::command]
-fn get_thumbnail_cache_stats(library_root: String) -> Result<ThumbnailCacheResult, String> {
-    let root = PathBuf::from(&library_root);
-    if !root.is_dir() {
-        return Err("资源目录无效".to_string());
-    }
-    Ok(thumbnail_cache_result(&root))
+async fn get_thumbnail_cache_stats(library_root: String) -> Result<ThumbnailCacheResult, String> {
+    run_blocking("缩略图缓存统计", move || {
+        let root = PathBuf::from(&library_root);
+        if !root.is_dir() {
+            return Err("资源目录无效".to_string());
+        }
+        Ok(thumbnail_cache_result(&root))
+    })
+    .await
 }
 
 #[tauri::command]
-fn apply_thumbnail_cache_limit(
-    library_root: String,
-    max_bytes: u64,
-) -> Result<ThumbnailCacheResult, String> {
-    let root = PathBuf::from(&library_root);
-    if !root.is_dir() {
-        return Err("资源目录无效".to_string());
-    }
-    Ok(prune_thumbnail_cache(&root, max_bytes))
-}
+async fn clear_thumbnail_cache(app: AppHandle, library_root: String) -> Result<(), String> {
+    let active_job = app.state::<ThumbnailJobState>().active_job.clone();
+    cancel_thumbnail_job(&active_job, None)?;
 
-#[tauri::command]
-fn clear_thumbnail_cache(
-    state: State<ThumbnailJobState>,
-    library_root: String,
-) -> Result<(), String> {
-    let _ = cancel_thumbnail_generation(state, None);
-    let root = PathBuf::from(&library_root);
-    if !root.is_dir() {
-        return Err("资源目录无效".to_string());
-    }
+    run_blocking("缩略图缓存清空", move || {
+        let root = PathBuf::from(&library_root);
+        if !root.is_dir() {
+            return Err("资源目录无效".to_string());
+        }
 
-    let cache_dir = root.join(".picman").join("cache").join("thumbnails");
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir).map_err(|error| format!("无法清理缩略图缓存：{error}"))?;
-    }
+        let cache_dir = root.join(".picman").join("cache").join("thumbnails");
+        if cache_dir.exists() {
+            fs::remove_dir_all(&cache_dir)
+                .map_err(|error| format!("无法清理缩略图缓存：{error}"))?;
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2506,7 +3086,6 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            apply_thumbnail_cache_limit,
             batch_process_images,
             cancel_thumbnail_generation,
             clear_thumbnail_cache,
@@ -2515,6 +3094,7 @@ pub fn run() {
             copy_image_to_clipboard,
             empty_trash,
             move_assets,
+            prioritize_thumbnail_generation,
             rename_asset,
             rename_folder,
             rotate_images,
@@ -2530,6 +3110,7 @@ pub fn run() {
             reveal_app_settings_file,
             restore_from_trash,
             reveal_in_finder,
+            share_files,
             scan_library_folder,
             scan_library_folder_stream,
             stop_library_watch,
@@ -2603,6 +3184,50 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_work_queue_prioritizes_only_pending_assets_in_requested_order() {
+        let sources = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(|id| ThumbnailSource {
+                id: id.to_string(),
+                kind: "png".to_string(),
+                relative_path: format!("{id}.png"),
+                source_path: format!("/tmp/{id}.png"),
+            })
+            .collect::<Vec<_>>();
+        let queue = ThumbnailWorkQueue::new(&sources);
+
+        assert_eq!(queue.pop_front(), Some(0));
+        assert_eq!(queue.remaining(), 4);
+        assert_eq!(
+            queue
+                .prioritize(&["d".to_string(), "c".to_string()])
+                .unwrap(),
+            2
+        );
+        assert_eq!(queue.remaining(), 4);
+        assert_eq!(queue.pop_front(), Some(3));
+        assert_eq!(queue.remaining(), 3);
+        assert_eq!(
+            queue
+                .prioritize(&[
+                    "e".to_string(),
+                    "b".to_string(),
+                    "a".to_string(),
+                    "missing".to_string(),
+                    "e".to_string(),
+                ])
+                .unwrap(),
+            2
+        );
+        assert_eq!(queue.remaining(), 3);
+        assert_eq!(queue.pop_front(), Some(4));
+        assert_eq!(queue.pop_front(), Some(1));
+        assert_eq!(queue.pop_front(), Some(2));
+        assert_eq!(queue.pop_front(), None);
+        assert_eq!(queue.remaining(), 0);
+    }
+
+    #[test]
     #[ignore = "需要先生成 25000 素材压力库"]
     fn stress_library_scan_from_env() {
         let root = std::env::var("PICMAN_STRESS_LIBRARY")
@@ -2639,6 +3264,32 @@ mod tests {
         assert_eq!(result.width, 240);
         assert!(Path::new(&result.path).exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thumbnail_detection_uses_file_content_when_extension_is_wrong() {
+        let root = test_root("mismatched-extension");
+        let source_path = root.join("phone-screen.jpeg");
+        let pixels = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_fn(96, 64, |x, y| {
+            image::Rgba([(x * 2) as u8, (y * 3) as u8, 140, 255])
+        });
+        image::DynamicImage::ImageRgba8(pixels)
+            .save_with_format(&source_path, ImageFormat::Png)
+            .unwrap();
+        let source = ThumbnailSource {
+            id: "asset-mismatched-extension".to_string(),
+            kind: "jpg".to_string(),
+            relative_path: "phone-screen.jpeg".to_string(),
+            source_path: normalize_path(&source_path),
+        };
+
+        assert_eq!(image_dimensions(&source_path).0, "96 x 64");
+        let result = generate_thumbnail_result(&root, &source, "standard").unwrap();
+
+        assert_eq!(result.format, "jpeg");
+        assert_eq!((result.width, result.height), (96, 64));
+        assert!(Path::new(&result.path).is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2753,6 +3404,106 @@ mod tests {
         );
         assert_eq!(scanned.thumbnail_quality.as_deref(), Some("standard"));
         assert_eq!(scanned.thumbnail_width, Some(240));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_quality_survives_generation_until_cleanup_and_scan_restores_new_quality() {
+        let root = test_root("quality-handoff");
+        let source_path = root.join("quality-handoff.png");
+        write_rgba_png(&source_path, 512, 384, false);
+        let mut metadata_cache = FolderMetadataCache::default();
+        let initial_scan = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
+        write_catalog_assets(&root, std::slice::from_ref(&initial_scan)).unwrap();
+        let source = ThumbnailSource {
+            id: initial_scan.id,
+            kind: initial_scan.kind,
+            relative_path: initial_scan.relative_path,
+            source_path: initial_scan.source_path,
+        };
+
+        let standard = generate_thumbnail_result(&root, &source, "standard").unwrap();
+        let compact = generate_thumbnail_result(&root, &source, "compact").unwrap();
+
+        assert!(Path::new(&standard.path).is_file());
+        assert!(Path::new(&compact.path).is_file());
+        assert_eq!(thumbnail_cache_result(&root).file_count, 2);
+
+        let mut metadata_cache = FolderMetadataCache::default();
+        let restored_before_cleanup = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            restored_before_cleanup.thumbnail_quality.as_deref(),
+            Some("compact")
+        );
+        assert_eq!(
+            restored_before_cleanup.thumbnail_path.as_deref(),
+            Some(compact.path.as_str())
+        );
+
+        remove_other_thumbnail_variants(&root, &source, &compact.path);
+
+        assert!(!Path::new(&standard.path).exists());
+        assert!(Path::new(&compact.path).is_file());
+        assert_eq!(thumbnail_cache_result(&root).file_count, 1);
+
+        patch_catalog_thumbnail_results(
+            &root,
+            "compact",
+            &[SuccessfulThumbnailResult {
+                source_index: 0,
+                update: ThumbnailUpdatePayload {
+                    asset_id: source.id.clone(),
+                    error: None,
+                    format: Some(compact.format.clone()),
+                    height: Some(compact.height),
+                    path: Some(compact.path.clone()),
+                    size_kb: Some(compact.size_kb),
+                    width: Some(compact.width),
+                },
+            }],
+        )
+        .unwrap();
+        let catalog_assets = read_catalog_assets(&root);
+        assert_eq!(catalog_assets.len(), 1);
+        assert!(catalog_assets[0].thumbnail_ready);
+        assert_eq!(
+            catalog_assets[0].thumbnail_quality.as_deref(),
+            Some("compact")
+        );
+        assert_eq!(
+            catalog_assets[0].thumbnail_path.as_deref(),
+            Some(compact.path.as_str())
+        );
+
+        let mut metadata_cache = FolderMetadataCache::default();
+        let restored = scanned_asset_from_path(
+            &root,
+            &source_path,
+            0,
+            &mut metadata_cache,
+            &ThumbnailCacheProbe::new(&root),
+        )
+        .unwrap();
+        assert_eq!(restored.thumbnail_quality.as_deref(), Some("compact"));
+        assert_eq!(
+            restored.thumbnail_path.as_deref(),
+            Some(compact.path.as_str())
+        );
 
         let _ = fs::remove_dir_all(root);
     }

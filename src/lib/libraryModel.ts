@@ -10,7 +10,6 @@ import type {
   SortDir,
   SortField,
   ThemePref,
-  ThumbnailQuality,
   ThumbnailState,
 } from '../types/library'
 
@@ -27,10 +26,12 @@ type NativeThumbnailSource = {
 
 type RefreshMergeResult = {
   added: number
+  addedAssets: Asset[]
   assets: Asset[]
   idSet: Set<string>
   removed: number
   removedAssets: Asset[]
+  thumbnailGenerationAssets: Asset[]
 }
 
 type LibraryCatalogState = {
@@ -179,14 +180,30 @@ export function applyAssetUpdatesToArray(
   return next ?? assets
 }
 
+function assetLayoutRatio(asset: Asset) {
+  if (asset.width && asset.height) return asset.width / asset.height
+  if (asset.thumbnailWidth && asset.thumbnailHeight) return asset.thumbnailWidth / asset.thumbnailHeight
+
+  const match = asset.dimensions.match(/(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)/i)
+  if (!match) return 16 / 10
+
+  const width = Number(match[1])
+  const height = Number(match[2])
+  return width > 0 && height > 0 ? width / height : 16 / 10
+}
+
 export function assetUpdateAffectsLayout(asset: Asset, update: Partial<Asset>) {
-  return (
-    (update.dimensions !== undefined && update.dimensions !== asset.dimensions) ||
-    (update.height !== undefined && update.height !== asset.height) ||
-    (update.thumbnailHeight !== undefined && update.thumbnailHeight !== asset.thumbnailHeight) ||
-    (update.thumbnailWidth !== undefined && update.thumbnailWidth !== asset.thumbnailWidth) ||
-    (update.width !== undefined && update.width !== asset.width)
-  )
+  if (
+    update.dimensions === undefined &&
+    update.height === undefined &&
+    update.thumbnailHeight === undefined &&
+    update.thumbnailWidth === undefined &&
+    update.width === undefined
+  ) {
+    return false
+  }
+
+  return Math.abs(assetLayoutRatio(asset) - assetLayoutRatio({ ...asset, ...update })) > 0.0001
 }
 
 export function sameTags(a: string[], b: string[]) {
@@ -257,6 +274,20 @@ export function prepareThumbnailClearPatch(assets: Iterable<Asset>) {
   return { metrics, updates }
 }
 
+export function revokeUncommittedThumbnailBlobUrls(
+  updates: Iterable<[string, Partial<Asset>]>,
+  currentAssets: ReadonlyMap<string, Asset>,
+) {
+  let revokedCount = 0
+  for (const [assetId, update] of updates) {
+    const url = update.thumbnailUrl
+    if (!url?.startsWith('blob:') || currentAssets.get(assetId)?.thumbnailUrl === url) continue
+    URL.revokeObjectURL(url)
+    revokedCount += 1
+  }
+  return revokedCount
+}
+
 export function getLiveAssets(sourceAssets: Asset[], assetById: Map<string, Asset>) {
   const liveAssets = new Array<Asset>(sourceAssets.length)
   for (let index = 0; index < sourceAssets.length; index += 1) {
@@ -323,10 +354,6 @@ export function prefSelectionKeyAxis(value: unknown): SelectionKeyAxis {
 
 export function prefTheme(value: unknown): ThemePref {
   return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
-}
-
-export function prefThumbnailQuality(value: unknown): ThumbnailQuality {
-  return value === 'compact' || value === 'high' || value === 'standard' ? value : 'standard'
 }
 
 export function prefSortDir(value: unknown): SortDir {
@@ -396,19 +423,32 @@ export function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Ass
   const scannedSourcePaths = new Set<string>()
   const idSet = new Set<string>()
   const assets = new Array<Asset>(scannedAssets.length)
+  const addedAssets = new Array<Asset>(scannedAssets.length)
+  const thumbnailGenerationAssets = new Array<Asset>(scannedAssets.length)
   let added = 0
+  let addedAssetCount = 0
+  let thumbnailGenerationAssetCount = 0
 
   for (let index = 0; index < scannedAssets.length; index += 1) {
     const asset = scannedAssets[index]
+    let isAdded = false
     idSet.add(asset.id)
     if (asset.sourcePath) {
       scannedSourcePaths.add(asset.sourcePath)
-      if (!previousSourcePaths.has(asset.sourcePath)) added += 1
+      if (!previousSourcePaths.has(asset.sourcePath)) {
+        added += 1
+        isAdded = true
+      }
     }
 
     const previous = previousById.get(asset.id)
 
-    if (previous?.thumbnailReady) {
+    if (asset.thumbnailReady) {
+      assets[index] = {
+        ...asset,
+        previewUrl: previous?.previewUrl,
+      }
+    } else if (previous?.thumbnailReady) {
       assets[index] = {
         ...asset,
         previewUrl: previous.previewUrl,
@@ -426,7 +466,18 @@ export function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Ass
     } else {
       assets[index] = asset
     }
+
+    if (isAdded) {
+      addedAssets[addedAssetCount] = assets[index]
+      addedAssetCount += 1
+    }
+    if (!assets[index].thumbnailReady && (!previous || previous.thumbnailError)) {
+      thumbnailGenerationAssets[thumbnailGenerationAssetCount] = assets[index]
+      thumbnailGenerationAssetCount += 1
+    }
   }
+  addedAssets.length = addedAssetCount
+  thumbnailGenerationAssets.length = thumbnailGenerationAssetCount
 
   const removedAssets: Asset[] = []
   for (const asset of previousAssets) {
@@ -435,11 +486,64 @@ export function mergeRefreshedAssets(scannedAssets: Asset[], previousAssets: Ass
 
   return {
     added,
+    addedAssets,
     assets,
     idSet,
     removed: removedAssets.length,
     removedAssets,
+    thumbnailGenerationAssets,
   }
+}
+
+export function reconcilePendingThumbnailAssets(
+  pending: Map<string, Asset>,
+  assets: Asset[],
+  idSet: Set<string>,
+  candidates: Asset[],
+) {
+  for (const asset of candidates) pending.set(asset.id, asset)
+  if (pending.size === 0) return
+
+  for (const assetId of pending.keys()) {
+    if (!idSet.has(assetId)) pending.delete(assetId)
+  }
+  for (const asset of assets) {
+    if (!pending.has(asset.id)) continue
+    if (asset.thumbnailReady) pending.delete(asset.id)
+    else pending.set(asset.id, asset)
+  }
+}
+
+export function pendingThumbnailTargets(pending: Map<string, Asset>, currentAssets: ReadonlyMap<string, Asset>) {
+  const targets = new Array<Asset>(pending.size)
+  let targetCount = 0
+  for (const [assetId, pendingAsset] of pending) {
+    const asset = currentAssets.get(assetId) ?? pendingAsset
+    if (asset.thumbnailReady) {
+      pending.delete(assetId)
+      continue
+    }
+    targets[targetCount] = asset
+    targetCount += 1
+  }
+  targets.length = targetCount
+  return targets
+}
+
+export function enqueueVisiblePendingThumbnails(
+  pending: Map<string, Asset>,
+  visibleAssetIds: string[],
+  currentAssets: ReadonlyMap<string, Asset>,
+) {
+  let queued = 0
+  for (const assetId of visibleAssetIds) {
+    if (pending.has(assetId)) continue
+    const asset = currentAssets.get(assetId)
+    if (!asset || asset.thumbnailReady || asset.thumbnailError || !asset.sourcePath) continue
+    pending.set(assetId, asset)
+    queued += 1
+  }
+  return queued
 }
 
 export function libraryNameFromPath(path: string) {
@@ -708,6 +812,45 @@ export function subtractThumbnailMetrics(a: ThumbnailMetrics, b: ThumbnailMetric
   return {
     cacheSize: Math.max(0, a.cacheSize - b.cacheSize),
     generatedCount: Math.max(0, a.generatedCount - b.generatedCount),
+  }
+}
+
+/**
+ * Reconciles one background-generation result with the thumbnail currently on
+ * screen. Failed generation deliberately keeps the last usable thumbnail so a
+ * refresh never turns an image grid back into placeholders.
+ */
+export function prepareThumbnailGenerationUpdate(previous: Asset, candidate: Partial<Asset>) {
+  const update: Partial<Asset> =
+    candidate.thumbnailReady === true
+      ? candidate
+      : previous.thumbnailReady
+        ? { thumbnailError: candidate.thumbnailError }
+        : candidate
+  const asset = { ...previous, ...update }
+  const previousSize = previous.thumbnailReady ? (previous.thumbnailSizeKb ?? 0) : 0
+  const nextSize = asset.thumbnailReady ? (asset.thumbnailSizeKb ?? 0) : 0
+
+  return {
+    asset,
+    metricsDelta: {
+      cacheSize: nextSize - previousSize,
+      generatedCount: Number(asset.thumbnailReady) - Number(previous.thumbnailReady),
+    } satisfies ThumbnailMetrics,
+    replacedBlobUrl:
+      candidate.thumbnailReady === true &&
+      previous.thumbnailUrl?.startsWith('blob:') &&
+      previous.thumbnailUrl !== asset.thumbnailUrl
+        ? previous.thumbnailUrl
+        : undefined,
+    update,
+  }
+}
+
+export function applyThumbnailMetricsDelta(current: ThumbnailMetrics, delta: ThumbnailMetrics): ThumbnailMetrics {
+  return {
+    cacheSize: Math.max(0, current.cacheSize + delta.cacheSize),
+    generatedCount: Math.max(0, current.generatedCount + delta.generatedCount),
   }
 }
 

@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { confirm as tauriConfirm, open } from '@tauri-apps/plugin-dialog'
@@ -30,6 +30,7 @@ import type { CollectPayload } from './lib/collect'
 import { formatMb } from './lib/format'
 import { folderName, revokePreviewUrls, scanFilesInBatches } from './lib/library'
 import { imageUrlToJpegDataUri, recognizeText } from './lib/ocr'
+import { revealAssetFile, shareAssetFiles } from './lib/nativeActions'
 import {
   flushAppPrefs,
   getAppSettingsPath,
@@ -54,6 +55,7 @@ import {
   applyAssetUpdatesToArray,
   applyAssetUpdatesToMap,
   applyFolderOrder,
+  applyThumbnailMetricsDelta,
   assetIdsFromAssets,
   assetMatchesVisibleFilters,
   assetsByIds,
@@ -76,28 +78,31 @@ import {
   deriveLibraryCatalogState,
   deriveThumbnailMetrics,
   dragSourcePathsForSelection,
+  enqueueVisiblePendingThumbnails,
   frontendAssetsFromNative,
   getLiveAssets,
   lastIdInSet,
   libraryNameFromPath,
   mergeRefreshedAssets,
   nativeAssetToFrontend,
+  pendingThumbnailTargets,
   prefSelectionKeyAxis,
   prefSortDir,
   prefSortField,
   prefTheme,
-  prefThumbnailQuality,
   prefViewMode,
   prependItems,
   prepareThumbnailClearPatch,
+  prepareThumbnailGenerationUpdate,
   pushItems,
   removeIdsFromSet,
   removeItemsById,
   renameLibraryCatalogState,
+  reconcilePendingThumbnailAssets,
   replaceAssetStore,
   retainIdsInSet,
+  revokeUncommittedThumbnailBlobUrls,
   subtractThumbnailMetrics,
-  thumbnailMetricsFromUpdates,
   updateAssetStore,
   updateCatalogTagsForAssetMetadata,
 } from './lib/libraryModel'
@@ -141,7 +146,9 @@ const THUMBNAIL_BATCH_EVENT = 'picman-thumbnail-batch'
 const THUMBNAIL_FINISHED_EVENT = 'picman-thumbnail-finished'
 const THUMBNAIL_UPDATE_FLUSH_MS = 180
 const THUMBNAIL_UPDATE_FLUSH_THRESHOLD = 256
+const THUMBNAIL_PRIORITY_UPDATE_MS = 90
 const SCROLL_POSITION_SAVE_MS = 320
+const STANDARD_THUMBNAIL_QUALITY: ThumbnailQuality = 'standard'
 
 type EncodedThumbnail = {
   format: ThumbnailFormat
@@ -270,10 +277,13 @@ type NativeThumbnailProgressSnapshot = {
 type ActiveNativeThumbnailJob = {
   flushTimer?: number
   id: string
+  pendingMetricsDelta: ThumbnailMetrics
   pendingUpdates: Map<string, Partial<Asset>>
   progress: NativeThumbnailProgressSnapshot
   quality: ThumbnailQuality
   scopeLabel: string
+  started: boolean
+  thumbnailStateById: Map<string, Asset>
   total: number
 }
 
@@ -443,6 +453,21 @@ function createThumbnailJobId(runId: number) {
   return `thumb_${runId}_${Date.now()}_${Math.random().toString(36).slice(2)}`
 }
 
+function thumbnailUpdateFromAsset(asset: Asset): Partial<Asset> {
+  return {
+    thumbnailError: asset.thumbnailError,
+    thumbnailFormat: asset.thumbnailFormat,
+    thumbnailHeight: asset.thumbnailHeight,
+    thumbnailPath: asset.thumbnailPath,
+    thumbnailQuality: asset.thumbnailQuality,
+    thumbnailReady: asset.thumbnailReady,
+    thumbnailSizeKb: asset.thumbnailSizeKb,
+    thumbnailUrl: asset.thumbnailUrl,
+    thumbnailVersion: asset.thumbnailVersion,
+    thumbnailWidth: asset.thumbnailWidth,
+  }
+}
+
 async function encodeOptimizedThumbnail(canvas: HTMLCanvasElement, asset: Asset, quality: ThumbnailQuality) {
   const preset = THUMBNAIL_PRESETS[quality]
   const candidates = ['image/webp', asset.kind === 'jpg' ? 'image/jpeg' : 'image/png']
@@ -514,6 +539,11 @@ export default function App({ initialPrefs }: AppProps) {
   const activeBrowserScanRef = useRef<string | null>(null)
   const activeNativeScanRef = useRef<ActiveNativeScan | null>(null)
   const activeNativeThumbnailJobRef = useRef<ActiveNativeThumbnailJob | null>(null)
+  const pendingAutoThumbnailAssetsRef = useRef<Map<string, Asset>>(new Map())
+  const generatePendingAutoThumbnailsRef = useRef<() => void>(() => undefined)
+  const viewportAssetIdsRef = useRef<string[]>([])
+  const thumbnailPriorityTimerRef = useRef<number | undefined>(undefined)
+  const lastThumbnailPriorityKeyRef = useRef('')
   const libraryAssetsRef = useRef<Asset[]>(sampleAssets)
   const assetByIdRef = useRef<Map<string, Asset>>(createAssetMap(sampleAssets))
   const libraryAssetIndexByIdRef = useRef<Map<string, number>>(createAssetIndexMap(sampleAssets))
@@ -530,15 +560,13 @@ export default function App({ initialPrefs }: AppProps) {
   const libraryScanStatusRef = useRef<LibraryScanStatus>('idle')
   const refreshLibraryRef = useRef<() => void>(() => undefined)
   const watchRefreshTimerRef = useRef<number | undefined>(undefined)
-  const persistedPrefsRef = useRef<PicmanAppPrefs>(initialPrefs)
   const restoreLastLibraryAttemptedRef = useRef(false)
-  const scrollPositionsRef = useRef<Record<string, number>>(persistedPrefsRef.current.scrollPositions ?? {})
+  const scrollPositionsRef = useRef<Record<string, number>>(initialPrefs.scrollPositions ?? {})
   const scrollSaveTimerRef = useRef<number | undefined>(undefined)
-  const persistedPrefs = persistedPrefsRef.current
+  const persistedPrefs = initialPrefs
 
   const [activeFolder, setActiveFolder] = useState(persistedPrefs.activeFolder ?? '/')
   const [activeTag, setActiveTag] = useState(persistedPrefs.activeTag ?? 'all')
-  const [cacheLimit, setCacheLimit] = useState(() => clampedPrefNumber(persistedPrefs.cacheLimitGb, 5, 1, 20))
   const [collectorEnabled, setCollectorEnabled] = useState(persistedPrefs.collectorEnabled ?? true)
   const [collectPending, setCollectPending] = useState<{ payload: CollectPayload; previewUrl: string } | null>(null)
   const [lastCollectFolder, setLastCollectFolder] = useState(persistedPrefs.lastCollectFolder ?? '/Inbox')
@@ -611,9 +639,6 @@ export default function App({ initialPrefs }: AppProps) {
     status: 'idle',
     total: 0,
   })
-  const [thumbnailQuality, setThumbnailQuality] = useState<ThumbnailQuality>(() =>
-    prefThumbnailQuality(persistedPrefs.thumbnailQuality),
-  )
   const [thumbnailState, setThumbnailState] = useState<ThumbnailState>('all')
   const [thumbSize, setThumbSize] = useState(() => clampedPrefNumber(persistedPrefs.thumbSize, 150, 90, 240))
   const [typeFilter, setTypeFilter] = useState<'all' | AssetKind>('all')
@@ -622,6 +647,7 @@ export default function App({ initialPrefs }: AppProps) {
     status: 'idle',
   })
   const [viewMode, setViewMode] = useState<AssetViewMode>(() => prefViewMode(persistedPrefs.viewMode))
+  const [restoredScrollTop, setRestoredScrollTop] = useState(0)
   const appSettingsPath = getAppSettingsPath()
   const deferredQuery = useDeferredValue(query)
   const assetById = assetStore.byId
@@ -629,7 +655,17 @@ export default function App({ initialPrefs }: AppProps) {
   const orderedFolders = useMemo(() => applyFolderOrder(folders, folderOrder), [folders, folderOrder])
   const { cacheSize, generatedCount } = thumbnailMetrics
   const totalAssetCount = libraryAssetIds.length
-  const pendingCount = Math.max(0, totalAssetCount - generatedCount)
+  const thumbnailFailures = useMemo(() => {
+    if (!settingsOpen) return []
+    const failures: Asset[] = []
+    for (const id of libraryAssetIds) {
+      const asset = assetById.get(id)
+      if (asset?.thumbnailError) failures.push(asset)
+    }
+    return failures
+  }, [assetById, libraryAssetIds, settingsOpen])
+  const unresolvedThumbnailFailureCount = thumbnailFailures.reduce((count, asset) => count + Number(!asset.thumbnailReady), 0)
+  const pendingCount = Math.max(0, totalAssetCount - generatedCount - unresolvedThumbnailFailureCount)
   const thumbnailFilterVersion = thumbnailState === 'all' ? 0 : assetStore.version
   const normalizedQuery = useMemo(() => normalizeSearchText(deferredQuery).trim(), [deferredQuery])
   const hasVisibleFilters =
@@ -759,7 +795,7 @@ export default function App({ initialPrefs }: AppProps) {
       assetMatchesVisibleFilters(primaryCandidate, activeFolder, activeTag, typeFilter, thumbnailState, normalizedQuery))
       ? primaryCandidate
       : undefined
-  const lightboxIndex = lightboxOpen && primaryId ? getVisibleAssetIndex(primaryId) : -1
+  const lightboxIndex = lightboxOpen && primaryId ? visibleAssetIds.findIndex((id) => id === primaryId) : -1
   const activeFilterCount =
     Number(activeTag !== 'all') +
     Number(typeFilter !== 'all') +
@@ -781,7 +817,7 @@ export default function App({ initialPrefs }: AppProps) {
       ),
     [activeFolder, activeTag, libraryRootPath, sortDir, sortField, thumbnailState, typeFilter, viewMode],
   )
-  const restoredScrollTop = scrollPositionsRef.current[scrollRestoreKey] ?? 0
+  useLayoutEffect(() => setRestoredScrollTop(scrollPositionsRef.current[scrollRestoreKey] ?? 0), [scrollRestoreKey])
 
   useEffect(() => {
     libraryAssetsRef.current = libraryAssets
@@ -812,7 +848,6 @@ export default function App({ initialPrefs }: AppProps) {
       ...readAppPrefs(),
       activeFolder,
       activeTag,
-      cacheLimitGb: cacheLimit,
       collectorEnabled,
       deleteShortcut,
       folderPaneHeight,
@@ -827,7 +862,6 @@ export default function App({ initialPrefs }: AppProps) {
       sortField,
       themePref,
       thumbSize,
-      thumbnailQuality,
       viewMode,
     }
     if (libraryRootPath) nextPrefs.lastLibraryRootPath = libraryRootPath
@@ -835,7 +869,6 @@ export default function App({ initialPrefs }: AppProps) {
   }, [
     activeFolder,
     activeTag,
-    cacheLimit,
     collectorEnabled,
     deleteShortcut,
     folderPaneHeight,
@@ -850,25 +883,8 @@ export default function App({ initialPrefs }: AppProps) {
     sortField,
     themePref,
     thumbSize,
-    thumbnailQuality,
     viewMode,
   ])
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return
-    if (restoreLastLibraryAttemptedRef.current) return
-    restoreLastLibraryAttemptedRef.current = true
-
-    const lastLibraryRootPath = persistedPrefsRef.current.lastLibraryRootPath
-    if (!lastLibraryRootPath) return
-
-    void handleNativeFolderSelection(lastLibraryRootPath, {
-      activeFolder: persistedPrefsRef.current.activeFolder,
-      activeTag: persistedPrefsRef.current.activeTag,
-    })
-    // Run only once on app startup; the restore target comes from persisted prefs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
 
   useEffect(() => {
     return () => revokePreviewUrls(libraryAssetsRef.current)
@@ -1000,6 +1016,9 @@ export default function App({ initialPrefs }: AppProps) {
     revokePreviewUrls(merged.removedAssets)
     libraryAssetIndexByIdRef.current = createAssetIndexMap(merged.assets)
 
+    const pendingAutoThumbnails = pendingAutoThumbnailAssetsRef.current
+    reconcilePendingThumbnailAssets(pendingAutoThumbnails, merged.assets, merged.idSet, merged.thumbnailGenerationAssets)
+
     startTransition(() => {
       setAssetStore((current) => replaceAssetStore(current, merged.assets))
       setLibraryCatalog(deriveLibraryCatalogState(payload.libraryName, merged.assets))
@@ -1025,44 +1044,115 @@ export default function App({ initialPrefs }: AppProps) {
         ? `已刷新 · ${merged.assets.length} 个素材`
         : `已刷新 · ${merged.assets.length} 个素材（新增 ${merged.added} · 移除 ${merged.removed}）`
     setStatusMessage(summary)
+    if (pendingAutoThumbnails.size > 0) {
+      window.requestAnimationFrame(() => generatePendingAutoThumbnailsRef.current())
+    }
   }, [])
+
+  const prioritizeVisibleThumbnails = useCallback(() => {
+    thumbnailPriorityTimerRef.current = undefined
+    const job = activeNativeThumbnailJobRef.current
+    const assetIds = viewportAssetIdsRef.current
+    if (!job?.started || assetIds.length === 0) return
+
+    const priorityKey = `${job.id}\u0000${assetIds.join('\u0000')}`
+    if (priorityKey === lastThumbnailPriorityKeyRef.current) return
+    lastThumbnailPriorityKeyRef.current = priorityKey
+    void invoke('prioritize_thumbnail_generation', { assetIds, jobId: job.id }).catch(() => {
+      if (lastThumbnailPriorityKeyRef.current === priorityKey) lastThumbnailPriorityKeyRef.current = ''
+    })
+  }, [])
+
+  const scheduleVisibleThumbnailPriority = useCallback(
+    (immediate = false) => {
+      if (immediate) {
+        if (thumbnailPriorityTimerRef.current) window.clearTimeout(thumbnailPriorityTimerRef.current)
+        prioritizeVisibleThumbnails()
+        return
+      }
+      if (thumbnailPriorityTimerRef.current || !activeNativeThumbnailJobRef.current?.started) return
+      thumbnailPriorityTimerRef.current = window.setTimeout(
+        prioritizeVisibleThumbnails,
+        THUMBNAIL_PRIORITY_UPDATE_MS,
+      )
+    },
+    [prioritizeVisibleThumbnails],
+  )
+
+  const handleViewportAssetIdsChange = useCallback(
+    (assetIds: string[]) => {
+      viewportAssetIdsRef.current = assetIds
+      scheduleVisibleThumbnailPriority()
+      if (!libraryRootPath) return
+      const queued = enqueueVisiblePendingThumbnails(pendingAutoThumbnailAssetsRef.current, assetIds, assetById)
+      if (queued > 0 && !activeNativeThumbnailJobRef.current) {
+        window.requestAnimationFrame(() => generatePendingAutoThumbnailsRef.current())
+      }
+    },
+    [assetById, libraryRootPath, scheduleVisibleThumbnailPriority],
+  )
+
+  useEffect(
+    () => () => {
+      if (thumbnailPriorityTimerRef.current) window.clearTimeout(thumbnailPriorityTimerRef.current)
+    },
+    [],
+  )
 
   const cancelNativeThumbnailGeneration = useCallback((jobId?: string | null) => {
     const activeJobId = jobId ?? activeNativeThumbnailJobRef.current?.id ?? null
     const activeJob = activeNativeThumbnailJobRef.current
     if (activeJob?.flushTimer) window.clearTimeout(activeJob.flushTimer)
+    if (thumbnailPriorityTimerRef.current) window.clearTimeout(thumbnailPriorityTimerRef.current)
+    thumbnailPriorityTimerRef.current = undefined
+    lastThumbnailPriorityKeyRef.current = ''
     activeNativeThumbnailJobRef.current = null
     void invoke('cancel_thumbnail_generation', { jobId: activeJobId }).catch(() => undefined)
   }, [])
 
-  const applyNativeThumbnailCacheResult = useCallback((result: NativeThumbnailCacheResult) => {
-    const cacheSize = Math.ceil(result.sizeBytes / 1024)
-    if (result.removedPaths.length === 0) {
-      setThumbnailMetrics((current) => ({ ...current, cacheSize }))
-      return
-    }
+  const applyNativeThumbnailCacheResult = useCallback(
+    (result: NativeThumbnailCacheResult, thumbnailSnapshot?: ReadonlyMap<string, Asset>) => {
+      const cacheSize = Math.ceil(result.sizeBytes / 1024)
+      if (result.removedPaths.length === 0) {
+        setThumbnailMetrics((current) => ({ ...current, cacheSize }))
+        return
+      }
 
-    const removedPaths = new Set(result.removedPaths)
-    window.requestAnimationFrame(() => {
-      const updates = new Map<string, Partial<Asset>>()
-      let removedGeneratedCount = 0
-      for (const asset of assetByIdRef.current.values()) {
-        if (!asset.thumbnailPath || !removedPaths.has(asset.thumbnailPath)) continue
-        if (asset.thumbnailUrl?.startsWith('blob:')) URL.revokeObjectURL(asset.thumbnailUrl)
-        if (asset.thumbnailReady) removedGeneratedCount += 1
-        updates.set(asset.id, clearThumbnailUpdate())
+      const removedPaths = new Set(result.removedPaths)
+      const reconcileRemovedThumbnails = () => {
+        const updates = new Map<string, Partial<Asset>>()
+        let removedGeneratedCount = 0
+
+        const collectRemovedAssets = (assets: Iterable<Asset>) => {
+          for (const asset of assets) {
+            if (updates.has(asset.id) || !asset.thumbnailPath || !removedPaths.has(asset.thumbnailPath)) continue
+            if (asset.thumbnailUrl?.startsWith('blob:')) URL.revokeObjectURL(asset.thumbnailUrl)
+            if (asset.thumbnailReady) removedGeneratedCount += 1
+            updates.set(asset.id, clearThumbnailUpdate())
+          }
+        }
+
+        if (thumbnailSnapshot) collectRemovedAssets(thumbnailSnapshot.values())
+        collectRemovedAssets(assetByIdRef.current.values())
+        if (updates.size > 0) {
+          setAssetStore((current) =>
+            updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+          )
+        }
+        setThumbnailMetrics((current) => ({
+          cacheSize,
+          generatedCount: Math.max(0, current.generatedCount - removedGeneratedCount),
+        }))
       }
-      if (updates.size > 0) {
-        setAssetStore((current) =>
-          updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
-        )
-      }
-      setThumbnailMetrics((current) => ({
-        cacheSize,
-        generatedCount: Math.max(0, current.generatedCount - removedGeneratedCount),
-      }))
-    })
-  }, [])
+
+      // Job completion already carries an optimistic map containing every
+      // generated result. Reconcile it before another job can start; generic
+      // cache-stat refreshes stay deferred to avoid blocking unrelated input.
+      if (thumbnailSnapshot) reconcileRemovedThumbnails()
+      else window.requestAnimationFrame(reconcileRemovedThumbnails)
+    },
+    [],
+  )
 
   const refreshThumbnailCacheStats = useCallback(
     (rootPath: string) => {
@@ -1074,23 +1164,10 @@ export default function App({ initialPrefs }: AppProps) {
   )
 
   useEffect(() => {
-    if (!libraryRootPath || !isTauriRuntime()) return
-    const timer = window.setTimeout(() => {
-      void invoke<NativeThumbnailCacheResult>('apply_thumbnail_cache_limit', {
-        libraryRoot: libraryRootPath,
-        maxBytes: Math.round(cacheLimit * 1024 * 1024 * 1024),
-      })
-        .then(applyNativeThumbnailCacheResult)
-        .catch(() => undefined)
-    }, 450)
-    return () => window.clearTimeout(timer)
-  }, [applyNativeThumbnailCacheResult, cacheLimit, libraryRootPath])
-
-  useEffect(() => {
     if (settingsOpen && libraryRootPath) refreshLibraryIndexStats(libraryRootPath)
   }, [libraryRootPath, refreshLibraryIndexStats, settingsOpen])
 
-  const flushNativeThumbnailUpdates = useCallback((jobId: string) => {
+  const flushNativeThumbnailUpdates = useCallback((jobId: string, urgent = false) => {
     const job = activeNativeThumbnailJobRef.current
     if (!job || job.id !== jobId) return
 
@@ -1101,17 +1178,20 @@ export default function App({ initialPrefs }: AppProps) {
 
     const updates = new Map(job.pendingUpdates)
     job.pendingUpdates.clear()
+    const metricsDelta = job.pendingMetricsDelta
+    job.pendingMetricsDelta = { cacheSize: 0, generatedCount: 0 }
 
     if (updates.size > 0) {
-      const generated = thumbnailMetricsFromUpdates(updates.values())
-      startTransition(() => {
+      const applyUpdates = () => {
         setAssetStore((current) =>
           updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
         )
-        if (generated.generatedCount > 0 || generated.cacheSize > 0) {
-          setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
-        }
-      })
+      }
+      if (urgent) applyUpdates()
+      else startTransition(applyUpdates)
+      if (metricsDelta.generatedCount !== 0 || metricsDelta.cacheSize !== 0) {
+        setThumbnailMetrics((current) => applyThumbnailMetricsDelta(current, metricsDelta))
+      }
     }
 
     setThumbnailGeneration({
@@ -1136,26 +1216,38 @@ export default function App({ initialPrefs }: AppProps) {
       }
 
       for (const update of payload.updates) {
+        pendingAutoThumbnailAssetsRef.current.delete(update.assetId)
         const thumbnailPath = update.path ?? undefined
         const thumbnailUrl = thumbnailPath
           ? withCacheToken(convertFileSrc(thumbnailPath), `${payload.jobId}-${payload.completed}-${update.assetId}`)
           : undefined
+        const previous = job.thumbnailStateById.get(update.assetId) ?? assetByIdRef.current.get(update.assetId)
+        if (!previous) continue
 
-        job.pendingUpdates.set(
-          update.assetId,
-          {
-            thumbnailError: update.error ?? undefined,
-            thumbnailFormat: update.format ?? undefined,
-            thumbnailHeight: update.height ?? undefined,
-            thumbnailPath,
-            thumbnailQuality: job.quality,
-            thumbnailReady: Boolean(thumbnailPath && !update.error),
-            thumbnailSizeKb: update.sizeKb ?? undefined,
-            thumbnailUrl,
-            thumbnailVersion: thumbnailPath ? `${payload.jobId}-${payload.completed}` : undefined,
-            thumbnailWidth: update.width ?? undefined,
-          } satisfies Partial<Asset>,
-        )
+        const prepared = prepareThumbnailGenerationUpdate(previous, {
+          thumbnailError: update.error ?? undefined,
+          thumbnailFormat: update.format ?? undefined,
+          thumbnailHeight: update.height ?? undefined,
+          thumbnailPath,
+          thumbnailQuality: job.quality,
+          thumbnailReady: Boolean(thumbnailPath && !update.error),
+          thumbnailSizeKb: update.sizeKb ?? undefined,
+          thumbnailUrl,
+          thumbnailVersion: thumbnailPath ? `${payload.jobId}-${payload.completed}` : undefined,
+          thumbnailWidth: update.width ?? undefined,
+        })
+        job.thumbnailStateById.set(update.assetId, prepared.asset)
+        job.pendingUpdates.set(update.assetId, {
+          ...job.pendingUpdates.get(update.assetId),
+          ...prepared.update,
+        })
+        job.pendingMetricsDelta.cacheSize += prepared.metricsDelta.cacheSize
+        job.pendingMetricsDelta.generatedCount += prepared.metricsDelta.generatedCount
+      }
+
+      if (payload.completed >= payload.total) {
+        flushNativeThumbnailUpdates(job.id, true)
+        return
       }
 
       if (job.pendingUpdates.size >= THUMBNAIL_UPDATE_FLUSH_THRESHOLD) {
@@ -1190,6 +1282,30 @@ export default function App({ initialPrefs }: AppProps) {
         const reconcileCatalog = event.payload.usedCatalog && event.payload.phase === 'scan'
         if (scan.mode === 'refresh' || reconcileCatalog) {
           pushItems(scan.collectedAssets, incoming)
+          if (reconcileCatalog) {
+            const updates = new Map<string, Partial<Asset>>()
+            const metricsDelta: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }
+            for (const scannedAsset of incoming) {
+              if (!scannedAsset.thumbnailReady) continue
+              const previous = assetByIdRef.current.get(scannedAsset.id)
+              if (!previous || (previous.thumbnailReady && previous.thumbnailPath === scannedAsset.thumbnailPath)) {
+                continue
+              }
+
+              const prepared = prepareThumbnailGenerationUpdate(previous, thumbnailUpdateFromAsset(scannedAsset))
+              updates.set(scannedAsset.id, prepared.update)
+              metricsDelta.cacheSize += prepared.metricsDelta.cacheSize
+              metricsDelta.generatedCount += prepared.metricsDelta.generatedCount
+            }
+            if (updates.size > 0) {
+              startTransition(() => {
+                setAssetStore((current) =>
+                  updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
+                )
+              })
+              setThumbnailMetrics((current) => applyThumbnailMetricsDelta(current, metricsDelta))
+            }
+          }
           if (shouldUpdateStatus) {
             const action = scan.mode === 'refresh' ? '正在后台刷新' : '正在后台校验'
             setStatusMessage(`${scan.libraryName} · ${action} ${event.payload.total} 个素材`)
@@ -1343,13 +1459,19 @@ export default function App({ initialPrefs }: AppProps) {
         const job = activeNativeThumbnailJobRef.current
         if (!job || job.id !== event.payload.jobId) return
 
-        flushNativeThumbnailUpdates(job.id)
-        applyNativeThumbnailCacheResult({
-          fileCount: event.payload.cacheFileCount,
-          removedPaths: event.payload.prunedPaths,
-          sizeBytes: event.payload.cacheSizeBytes,
-        })
+        flushNativeThumbnailUpdates(job.id, true)
+        applyNativeThumbnailCacheResult(
+          {
+            fileCount: event.payload.cacheFileCount,
+            removedPaths: event.payload.prunedPaths,
+            sizeBytes: event.payload.cacheSizeBytes,
+          },
+          job.thumbnailStateById,
+        )
         activeNativeThumbnailJobRef.current = null
+        if (pendingAutoThumbnailAssetsRef.current.size > 0) {
+          window.requestAnimationFrame(() => generatePendingAutoThumbnailsRef.current())
+        }
 
         if (event.payload.cancelled) {
           setThumbnailGeneration({
@@ -1673,6 +1795,7 @@ export default function App({ initialPrefs }: AppProps) {
 
     activeBrowserScanRef.current = null
     disposeActiveNativeScan()
+    pendingAutoThumbnailAssetsRef.current.clear()
     cancelNativeThumbnailGeneration()
     activeNativeScanRef.current = {
       collectedAssets: [],
@@ -1710,7 +1833,7 @@ export default function App({ initialPrefs }: AppProps) {
     setThumbnailGeneration({
       completed: 0,
       failed: 0,
-      quality: thumbnailQuality,
+      quality: STANDARD_THUMBNAIL_QUALITY,
       scopeLabel: '',
       status: 'idle',
       total: 0,
@@ -1762,6 +1885,23 @@ export default function App({ initialPrefs }: AppProps) {
     }
   }
 
+  useEffect(() => {
+    if (!isTauriRuntime()) return
+    if (restoreLastLibraryAttemptedRef.current) return
+    restoreLastLibraryAttemptedRef.current = true
+
+    const lastLibraryRootPath = initialPrefs.lastLibraryRootPath
+    if (!lastLibraryRootPath) return
+
+    void Promise.resolve().then(() =>
+      handleNativeFolderSelection(lastLibraryRootPath, {
+        activeFolder: initialPrefs.activeFolder,
+        activeTag: initialPrefs.activeTag,
+      }),
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   async function openLibraryFolder() {
     try {
       const selected = await open({
@@ -1791,6 +1931,7 @@ export default function App({ initialPrefs }: AppProps) {
     activeWatchIdRef.current = null
     void invoke('stop_library_watch').catch(() => undefined)
     disposeActiveNativeScan()
+    pendingAutoThumbnailAssetsRef.current.clear()
     cancelNativeThumbnailGeneration()
     thumbnailRunRef.current += 1
     setLibraryScanStatus('open')
@@ -1814,7 +1955,7 @@ export default function App({ initialPrefs }: AppProps) {
     setThumbnailGeneration({
       completed: 0,
       failed: 0,
-      quality: thumbnailQuality,
+      quality: STANDARD_THUMBNAIL_QUALITY,
       scopeLabel: '',
       status: 'idle',
       total: 0,
@@ -1918,7 +2059,6 @@ export default function App({ initialPrefs }: AppProps) {
   async function generateThumbnailAssets(
     targetAssets: Asset[],
     scopeLabel: string,
-    quality: ThumbnailQuality = thumbnailQuality,
     force = true,
   ) {
     if (targetAssets.length === 0) {
@@ -1926,18 +2066,24 @@ export default function App({ initialPrefs }: AppProps) {
       return
     }
 
+    const quality = STANDARD_THUMBNAIL_QUALITY
     const runId = thumbnailRunRef.current + 1
     thumbnailRunRef.current = runId
-    const thumbnailClear = prepareThumbnailClearPatch(targetAssets)
     const firstName = targetAssets[0]?.name
     const pendingAssetUpdates = new Map<string, Partial<Asset>>()
+    const thumbnailStateById = createAssetMap(targetAssets)
+    const retiredBlobUrls = new Set<string>()
+    let pendingMetricsDelta: ThumbnailMetrics = { cacheSize: 0, generatedCount: 0 }
+    let retiredBlobCleanupTimer: number | undefined
     let failedCount = 0
     let lastProgressAt = 0
 
-    setThumbnailMetrics((current) => subtractThumbnailMetrics(current, thumbnailClear.metrics))
-    setAssetStore((current) =>
-      updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, thumbnailClear.updates)),
-    )
+    const revokeUncommittedBlobUrls = () => {
+      revokeUncommittedThumbnailBlobUrls(pendingAssetUpdates, assetByIdRef.current)
+      pendingAssetUpdates.clear()
+      pendingMetricsDelta = { cacheSize: 0, generatedCount: 0 }
+    }
+
     setThumbnailGeneration({
       completed: 0,
       currentName: firstName,
@@ -1954,6 +2100,7 @@ export default function App({ initialPrefs }: AppProps) {
       const jobId = createThumbnailJobId(runId)
       activeNativeThumbnailJobRef.current = {
         id: jobId,
+        pendingMetricsDelta: { cacheSize: 0, generatedCount: 0 },
         pendingUpdates: new Map(),
         progress: {
           completed: 0,
@@ -1963,12 +2110,13 @@ export default function App({ initialPrefs }: AppProps) {
         },
         quality,
         scopeLabel,
+        started: false,
+        thumbnailStateById,
         total: targetAssets.length,
       }
 
       try {
         const started = await invoke<NativeThumbnailJobStartResponse>('generate_thumbnails_stream', {
-          cacheLimitBytes: Math.round(cacheLimit * 1024 * 1024 * 1024),
           force,
           jobId,
           libraryRoot: libraryRootPath,
@@ -1980,6 +2128,9 @@ export default function App({ initialPrefs }: AppProps) {
         if (!activeJob || activeJob.id !== jobId) return
 
         activeJob.total = started.total
+        activeJob.started = true
+        lastThumbnailPriorityKeyRef.current = ''
+        scheduleVisibleThumbnailPriority(true)
         setThumbnailGeneration({
           completed: 0,
           currentName: firstName,
@@ -2014,12 +2165,20 @@ export default function App({ initialPrefs }: AppProps) {
 
       const updates = new Map(pendingAssetUpdates)
       pendingAssetUpdates.clear()
-      const generated = thumbnailMetricsFromUpdates(updates.values())
+      const metricsDelta = pendingMetricsDelta
+      pendingMetricsDelta = { cacheSize: 0, generatedCount: 0 }
       setAssetStore((current) =>
         updateAssetStore(current, (assetMap) => applyAssetUpdatesToMap(assetMap, updates)),
       )
-      if (generated.generatedCount > 0 || generated.cacheSize > 0) {
-        setThumbnailMetrics((current) => addThumbnailMetrics(current, generated))
+      if (metricsDelta.generatedCount !== 0 || metricsDelta.cacheSize !== 0) {
+        setThumbnailMetrics((current) => applyThumbnailMetricsDelta(current, metricsDelta))
+      }
+      if (retiredBlobUrls.size > 0 && !retiredBlobCleanupTimer) {
+        retiredBlobCleanupTimer = window.setTimeout(() => {
+          for (const url of retiredBlobUrls) URL.revokeObjectURL(url)
+          retiredBlobUrls.clear()
+          retiredBlobCleanupTimer = undefined
+        }, 2_000)
       }
     }
 
@@ -2057,10 +2216,12 @@ export default function App({ initialPrefs }: AppProps) {
 
       if (thumbnailRunRef.current !== runId) {
         if (thumbnail?.url.startsWith('blob:')) URL.revokeObjectURL(thumbnail.url)
+        revokeUncommittedBlobUrls()
         return
       }
 
-      pendingAssetUpdates.set(asset.id, {
+      const previous = thumbnailStateById.get(asset.id) ?? asset
+      const prepared = prepareThumbnailGenerationUpdate(previous, {
         thumbnailError,
         thumbnailFormat: thumbnail?.format,
         thumbnailHeight: thumbnail?.height,
@@ -2072,11 +2233,22 @@ export default function App({ initialPrefs }: AppProps) {
         thumbnailVersion: thumbnail ? `${runId}-${index}` : undefined,
         thumbnailWidth: thumbnail?.width,
       })
+      thumbnailStateById.set(asset.id, prepared.asset)
+      if (prepared.replacedBlobUrl) retiredBlobUrls.add(prepared.replacedBlobUrl)
+      pendingAssetUpdates.set(asset.id, {
+        ...pendingAssetUpdates.get(asset.id),
+        ...prepared.update,
+      })
+      pendingMetricsDelta.cacheSize += prepared.metricsDelta.cacheSize
+      pendingMetricsDelta.generatedCount += prepared.metricsDelta.generatedCount
       if (pendingAssetUpdates.size >= 80) flushAssetUpdates()
       updateGenerationProgress(index, asset, index === targetAssets.length - 1)
     }
 
-    if (thumbnailRunRef.current !== runId) return
+    if (thumbnailRunRef.current !== runId) {
+      revokeUncommittedBlobUrls()
+      return
+    }
 
     flushAssetUpdates()
     setThumbnailGeneration({
@@ -2094,17 +2266,22 @@ export default function App({ initialPrefs }: AppProps) {
     )
   }
 
+  useEffect(() => {
+    generatePendingAutoThumbnailsRef.current = () => {
+      if (!libraryRootPathRef.current || activeNativeThumbnailJobRef.current) return
+
+      const pending = pendingAutoThumbnailAssetsRef.current
+      const targetAssets = pendingThumbnailTargets(pending, assetByIdRef.current)
+      const targetCount = targetAssets.length
+      if (targetCount === 0) return
+
+      const label = targetCount === 1 ? '自动生成新增素材' : `自动生成 ${targetCount} 张新增素材`
+      void generateThumbnailAssets(targetAssets, label, false)
+    }
+  })
+
   function generateAllThumbnails() {
     void generateThumbnailAssets(getLiveAssets(libraryAssetsRef.current, assetByIdRef.current), '全部素材')
-  }
-
-  function compressThumbnailCache() {
-    const generatedAssets: Asset[] = []
-    for (const asset of libraryAssetsRef.current) {
-      const liveAsset = assetByIdRef.current.get(asset.id) ?? asset
-      if (liveAsset.thumbnailReady) generatedAssets.push(liveAsset)
-    }
-    void generateThumbnailAssets(generatedAssets, '压缩已有缓存', 'compact', true)
   }
 
   function generateFolderThumbnails(folderPaths: string[]) {
@@ -2130,6 +2307,7 @@ export default function App({ initialPrefs }: AppProps) {
 
   function clearThumbnailCache() {
     thumbnailRunRef.current += 1
+    pendingAutoThumbnailAssetsRef.current.clear()
     cancelNativeThumbnailGeneration()
     const liveAssets = getLiveAssets(libraryAssetsRef.current, assetByIdRef.current)
     const thumbnailClear = prepareThumbnailClearPatch(liveAssets)
@@ -2143,7 +2321,7 @@ export default function App({ initialPrefs }: AppProps) {
     setThumbnailGeneration({
       completed: 0,
       failed: 0,
-      quality: thumbnailQuality,
+      quality: STANDARD_THUMBNAIL_QUALITY,
       scopeLabel: '',
       status: 'idle',
       total: 0,
@@ -2269,7 +2447,7 @@ export default function App({ initialPrefs }: AppProps) {
     try {
       const result = await invoke<NativeThumbnailResult>('generate_thumbnail', {
         libraryRoot: libraryRootPath,
-        quality: thumbnailQuality,
+        quality: STANDARD_THUMBNAIL_QUALITY,
         source: {
           id: asset.id,
           kind: asset.kind,
@@ -2286,7 +2464,7 @@ export default function App({ initialPrefs }: AppProps) {
             thumbnailFormat: result.format,
             thumbnailHeight: result.height,
             thumbnailPath: result.path,
-            thumbnailQuality,
+            thumbnailQuality: STANDARD_THUMBNAIL_QUALITY,
             thumbnailReady: true,
             thumbnailSizeKb: result.sizeKb,
             thumbnailUrl: withCacheToken(convertFileSrc(result.path), token),
@@ -2301,12 +2479,6 @@ export default function App({ initialPrefs }: AppProps) {
       setThumbnailMetrics((current) =>
         addThumbnailMetrics(current, { cacheSize: result.sizeKb, generatedCount: 1 }),
       )
-      void invoke<NativeThumbnailCacheResult>('apply_thumbnail_cache_limit', {
-        libraryRoot: libraryRootPath,
-        maxBytes: Math.round(cacheLimit * 1024 * 1024 * 1024),
-      })
-        .then(applyNativeThumbnailCacheResult)
-        .catch(() => undefined)
     } catch {
       // Leave the placeholder; the file is collected and can be generated later.
     }
@@ -3044,6 +3216,24 @@ export default function App({ initialPrefs }: AppProps) {
     }
     return assets
   }
+
+  function shareAssets(assets: Asset[]) {
+    void shareAssetFiles(assets).catch((error) => {
+      const message = error instanceof Error ? error.message : '无法打开系统分享菜单'
+      setStatusMessage(`分享失败：${message}`)
+    })
+  }
+
+  function shareSelectedAssets() { shareAssets(getVisibleSelectedAssets()) }
+
+  function retryFailedThumbnails() { void generateThumbnailAssets(thumbnailFailures, '重新生成失败项') }
+
+  function revealThumbnailFailure(assetId: string) {
+    void revealAssetFile(assetByIdRef.current.get(assetId)).catch((error) => {
+      const message = error instanceof Error ? error.message : '无法打开 Finder'
+      setStatusMessage(`无法定位失败素材：${message}`)
+    })
+  }
   const assetMenuItems: ContextMenuItem[] = [
     ...(assetMenuSingle
       ? [
@@ -3158,11 +3348,14 @@ export default function App({ initialPrefs }: AppProps) {
             onAssetDoubleClick={handleAssetDoubleClick}
             onAssetDragStart={handleAssetDragStart}
             onOpenFolder={openLibraryFolder}
+            onViewportAssetIdsChange={handleViewportAssetIdsChange}
             onRefresh={refreshLibrary}
             onRemoveAssetTag={removeAssetTag}
             onOcr={runOcr}
             onRotate={(asset, quarterTurns) => rotateAssets([asset], quarterTurns)}
             onRotateSelected={(quarterTurns) => rotateAssets(getVisibleSelectedAssets(), quarterTurns)}
+            onShare={(asset) => shareAssets([asset])}
+            onShareSelected={shareSelectedAssets}
             onDeleteSelected={deleteSelectedToTrash}
             onOpenBatch={() => setBatchOpen(true)}
             onSetActiveTag={selectTag}
@@ -3186,7 +3379,6 @@ export default function App({ initialPrefs }: AppProps) {
       {settingsOpen && (
         <SettingsPanel
           appSettingsPath={appSettingsPath}
-          cacheLimit={cacheLimit}
           cacheSize={cacheSize}
           collectorEnabled={collectorEnabled}
           deleteShortcut={deleteShortcut}
@@ -3206,26 +3398,25 @@ export default function App({ initialPrefs }: AppProps) {
           sourceSize={sourceSize}
           themePref={themePref}
           thumbnailGeneration={thumbnailGeneration}
-          thumbnailQuality={thumbnailQuality}
+          thumbnailFailures={thumbnailFailures}
           updateState={updateState}
           onCheckForUpdate={checkAndInstallUpdate}
           onClearLibraryIndex={() => void clearLibraryIndex()}
           onClose={() => setSettingsOpen(false)}
           onClearThumbnailCache={clearThumbnailCache}
-          onCompressThumbnailCache={compressThumbnailCache}
           onGenerateAllThumbnails={generateAllThumbnails}
           onGenerateFolderThumbnails={generateFolderThumbnails}
           onOpenFolder={openLibraryFolder}
           onRebuildLibraryIndex={rebuildLibraryIndex}
           onRevealAppSettings={revealSettingsFile}
-          onSetCacheLimit={setCacheLimit}
+          onRetryFailedThumbnails={retryFailedThumbnails}
+          onRevealThumbnailFailure={revealThumbnailFailure}
           onSetCollectorEnabled={setCollectorEnabled}
           onSetDeleteShortcut={setDeleteShortcut}
           onSetOcrApiKey={setOcrApiKey}
           onSetOcrLanguage={setOcrLanguage}
           onSetSelectionKeyAxis={setSelectionKeyAxis}
           onSetThemePref={setThemePref}
-          onSetThumbnailQuality={setThumbnailQuality}
         />
       )}
 
@@ -3299,6 +3490,7 @@ export default function App({ initialPrefs }: AppProps) {
           onClose={() => setLightboxOpen(false)}
           onNext={() => navigateLightbox('next')}
           onPrev={() => navigateLightbox('prev')}
+          onShare={(asset) => shareAssets([asset])}
         />
       )}
     </div>
